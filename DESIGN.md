@@ -18,7 +18,9 @@ toolchain removes an entire tier lean-tea had to hand-write.
 | `examples/counter` — shared Counter app | **built, green** |
 | `lib/tea_persist` — Irmin versioned model store | **built, green; test passes** |
 | `test/persist_test` — apply/history/undo end-to-end | **passes** |
-| `lib/tea_server` — Dream wiring | designed (§6), not yet built |
+| `lib/tea_server` — Dream wiring (SSR + form-post path) | **built, green** (WS live view still designed, §7) |
+| `test/server_test` — Dream tier end-to-end (sessions, CSRF, undo) | **passes** (confirmed by mutation) |
+| `examples/counter/server` — native Counter server binary | **built** |
 | `lib/tea_client` — vdom + js_of_ocaml | designed (§7), not yet built |
 | `lib/tea_rpc` — GADT endpoint contract | designed (§8), not yet built |
 | `lib/tea_safe` — the 9 security primitives | designed (§9), stubs pending |
@@ -77,8 +79,11 @@ lib/tea_core/     (deps: repr)          — pure, IO-agnostic, compiles to nativ
   loop.ml           IO signature + Loop(IO)(APP): fuel-bounded Cmd interpreter
 lib/tea_persist/  (deps: tea_core irmin irmin.mem irmin.unix lwt)
   store.ml          Store(APP): session branches, apply=commit, history, undo, merge_into
-examples/counter/ Counter_app.App (shared) + [pending] server/ and client/ mains
-test/             persist_test (Lwt)
+lib/tea_server/   (deps: tea_core tea_persist dream lwt lwt.unix)
+  tea_server.ml     Make(APP): Dream session -> hex Session_id -> branch; Loop over Lwt;
+                    formify: On_click sites -> CSRF-protected <form> posts of the Repr-JSON Msg
+examples/counter/ Counter_app.App (shared) + server/main.ml (Dream) + [pending] client/
+test/             persist_test, server_test (Dream.test, no socket)
 ```
 
 Design conventions honored throughout: exhaustive matches (no `_ ->` on finite
@@ -120,6 +125,18 @@ record whose handlers close over the branch) → commit → `Render_static.to_st
 `Dream.websocket`. Dream supplies HTTP/1.1(+TLS), RFC6455 WS, sessions, CSRF, and
 typed forms — deleting lean-tea's hand-written HTTP/WS/OAuth stack. The `X-Model`
 header is gone: state is the branch head.
+
+**Status: built** for the SSR + form-post path (`Tea_server.Make`). The server
+rewrites every `On_click` site of the shared view into a same-origin `<form>`
+carrying the Repr-JSON Msg and Dream's CSRF token, so any APP is fully usable
+with zero client JS (progressive enhancement: the client tier later re-attaches
+live handlers to the same view). A `Navigate` Cmd becomes the post-update
+redirect target; undo is served at `/undo`. The WS live view (`S.watch`) remains
+designed, not built. Two documented invariants: an element keeps at most one
+`On_click` (first wins, enforced by `Html.elt`, so both tiers agree), and click
+handlers belong on leaf controls (an `On_click` ancestor of another `On_click`
+would render as nested forms, which is invalid HTML; id-based form association
+arrives with the client tier).
 
 ## 7. Client (vdom + js_of_ocaml) — designed
 
@@ -182,7 +199,7 @@ Each lean-tea private-constructor primitive → an OCaml `.mli` boundary:
 ## 11. Roadmap
 
 1. **Server MVP** — `tea_server` + Counter served over Dream (SSR + form-post
-   update path), no WS yet.
+   update path), no WS yet. **Done** (`tea_server.ml`, `server_test`).
 2. **Client MVP** — `tea_client` + `Html.t → vdom`, Counter in the browser off
    the same `Counter_app`.
 3. **Live view** — `Sub.Store_watch` ⇒ `S.watch` ⇒ WebSocket ⇒ `Vdom_blit.process`.

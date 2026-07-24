@@ -18,11 +18,18 @@ roadmap.
   fuel-bounded `Loop`). Depends only on `repr`, so it compiles to native *and* JS.
 - `lib/tea_persist` — the Irmin-backed versioned model store: session branches,
   `apply` = one commit, `history`, `undo`, and `merge_into`.
-- `examples/counter` — the shared Counter app.
+- `lib/tea_server` — the Dream tier: per-session Irmin branches behind Dream
+  sessions, one commit per posted Msg, and SSR that rewrites every `On_click`
+  site of the shared view into a CSRF-protected form post (the app works with
+  zero client JS). Undo is served at `/undo`.
+- `examples/counter` — the shared Counter app, plus `server/` (a native Dream
+  binary: `PORT=8080 dune exec examples/counter/server/main.exe`).
 - `test/persist_test` — proves the store end-to-end.
+- `test/server_test` — proves the Dream tier end-to-end with `Dream.test`
+  (sessions, branch isolation, CSRF, undo), no socket needed.
 
-Server (Dream) and client (js_of_ocaml + ocaml-vdom) tiers are designed in
-DESIGN.md and are the next milestones.
+The client tier (js_of_ocaml + ocaml-vdom) and the WebSocket live view are
+designed in DESIGN.md and are the next milestones.
 
 ## Build & test
 

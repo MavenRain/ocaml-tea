@@ -13,6 +13,8 @@ module Make (A : App.APP) = struct
     | Ok m -> Ok m
     | Error (`Msg e) -> Error (Decode_failed e)
 
+  let msg_to_json (m : A.msg) : string = Repr.to_json_string A.msg_t m
+
   let msg_of_json (s : string) : (A.msg, err) result =
     match Repr.of_json_string A.msg_t s with
     | Ok m -> Ok m

@@ -15,7 +15,12 @@ type 'msg t = private
   | Text of Prim.Text.t  (** escaped at render time *)
   | Element of Prim.Tag.t * 'msg attr list * 'msg t list
 
-(** {2 Nodes} *)
+(** {2 Nodes}
+
+    An element keeps at most one [On_click] (the first listed; extras are
+    dropped at construction). This is DOM [onclick] semantics, and it is the
+    invariant the server tier's form-post rewrite relies on: one Msg per click
+    site, identically in both tiers. *)
 
 val text : string -> 'msg t
 val elt : string -> ?attrs:'msg attr list -> 'msg t list -> 'msg t
@@ -35,6 +40,14 @@ val id_ : string -> 'msg attr
 val type_ : string -> 'msg attr
 val value_ : string -> 'msg attr
 val placeholder : string -> 'msg attr
+
+(** Trusted form-wiring attributes, used by the server tier to render
+    [On_click] sites as form posts (values are still escaped at render). *)
+
+val name_ : string -> 'msg attr
+
+val action_ : string -> 'msg attr
+val method_ : string -> 'msg attr
 
 (** Untrusted attribute name: [None] if the name is empty or an [on*] handler. *)
 val attr : string -> string -> 'msg attr option

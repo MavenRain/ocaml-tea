@@ -8,7 +8,21 @@ type 'msg t =
   | Element of Prim.Tag.t * 'msg attr list * 'msg t list
 
 let text s = Text (Prim.Text.v s)
-let elt name ?(attrs = []) children = Element (Prim.Tag.v name, attrs, children)
+
+(* An element carries at most one click handler (the first listed): DOM
+   [onclick] semantics, and the invariant the server's form-post SSR relies on
+   (one Msg per click site, identically in both tiers). *)
+let first_click_only attrs =
+  let keep (seen, acc) a =
+    match a with
+    | On_click _ -> if seen then (seen, acc) else (true, a :: acc)
+    | Attr _ -> (seen, a :: acc)
+    | On_input _ -> (seen, a :: acc)
+  in
+  attrs |> List.fold_left keep (false, []) |> snd |> List.rev
+
+let elt name ?(attrs = []) children =
+  Element (Prim.Tag.v name, first_click_only attrs, children)
 let div ?attrs children = elt "div" ?attrs children
 let span ?attrs children = elt "span" ?attrs children
 let p ?attrs children = elt "p" ?attrs children
@@ -25,6 +39,9 @@ let id_ v = known "id" v
 let type_ v = known "type" v
 let value_ v = known "value" v
 let placeholder v = known "placeholder" v
+let name_ v = known "name" v
+let action_ v = known "action" v
+let method_ v = known "method" v
 
 (* Untrusted attribute names must pass the [on*] filter. *)
 let attr name value =
