@@ -1,0 +1,23 @@
+# Build
+_build/
+*.install
+*.merlin
+
+# Local opam switch / setup
+_opam/
+.setup*.log
+.setup*.install.log
+
+# Irmin on-disk stores (dev)
+/var/
+*.irmin/
+_irmin/
+
+# js_of_ocaml output
+*.bc.js
+*.js.map
+
+# Editor / OS
+.DS_Store
+*~
+.#*

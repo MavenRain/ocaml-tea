@@ -1,0 +1,3 @@
+(library
+ (name tea_persist)
+ (libraries tea_core repr irmin irmin.mem irmin.unix lwt))

@@ -1,0 +1,3 @@
+(test
+ (name persist_test)
+ (libraries tea_core tea_persist counter_app lwt lwt.unix))

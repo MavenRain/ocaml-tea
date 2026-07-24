@@ -1,0 +1,193 @@
+# ocaml-tea — an OCaml + Irmin full-stack TEA framework
+
+*Working name.* A port of the ideas in [lean-tea](https://github.com/Verilean/lean-tea)
+(a pure-Lean 4 full-stack framework built on **The Elm Architecture**) to **OCaml**,
+replacing lean-tea's vendored **SQLite** with **[Irmin](https://irmin.org)** — a
+Git-like versioned, branchable, mergeable store.
+
+The swap is not cosmetic. Irmin changes the persistence *model*, and OCaml's
+toolchain removes an entire tier lean-tea had to hand-write.
+
+---
+
+## 1. Status (what is real vs. designed)
+
+| Layer | State |
+|---|---|
+| `lib/tea_core` — APP signature, `Cmd`/`Sub`, `Html` + SSR, `Merge_spec`, `Codec`, `Loop` | **built, green** (`repr` only) |
+| `examples/counter` — shared Counter app | **built, green** |
+| `lib/tea_persist` — Irmin versioned model store | **built, green; test passes** |
+| `test/persist_test` — apply/history/undo end-to-end | **passes** |
+| `lib/tea_server` — Dream wiring | designed (§6), not yet built |
+| `lib/tea_client` — vdom + js_of_ocaml | designed (§7), not yet built |
+| `lib/tea_rpc` — GADT endpoint contract | designed (§8), not yet built |
+| `lib/tea_safe` — the 9 security primitives | designed (§9), stubs pending |
+
+Toolchain: OCaml 5.3.0, dune 3.24, a dedicated opam switch (`irmin-tea` locally) with
+`irmin 3.11`, `dream 1.0.0~alpha8`, `repr 0.8`, `vdom 0.3`, `js_of_ocaml 6.4`.
+
+> **Caveat on the risk register (§10):** the design workflow's adversarial
+> *verify* pass did not run (weekly usage limit). The risks below are
+> finder-reported and **not independently verified** — treat them as leads.
+
+---
+
+## 2. lean-tea → ocaml-tea mapping
+
+| lean-tea | ocaml-tea | note |
+|---|---|---|
+| `WebApp {init,update,view,encode/decodeModel,decodeMsg}` | `module type APP` (`app.ml`) | `Repr.t` reprs replace the three hand-written codecs |
+| Pure `update`, no effects | `update : msg -> model -> model * msg Cmd.t` | we **add** Elm-style managed effects (as data) |
+| Model shipped in the `X-Model` header | Model lives in Irmin, keyed by session branch | **T1** — see §5 |
+| SQLite `Entity`/`Repo`, typed SQL | Irmin tree + `Merge_spec` | no query language; indexes are tree paths (§5) |
+| Hand-written LeanJs compiler | `js_of_ocaml` + `ocaml-vdom` | **T3** — the whole tier disappears |
+| Servant-style `Endpoint` record + generated JS | GADT `('req,'resp) api` | **stronger** no-drift: both tiers type-check one definition |
+| 9 private-constructor security primitives | OCaml abstract/private/phantom types | **T4** — §9 |
+| Pure-Lean HTTP/1.1 + RFC6455 WS + OAuth | Dream | §6 |
+
+## 3. The four theses
+
+- **T1 — Irmin replaces SQLite *and* the `X-Model` header.** The server model is
+  a per-session Irmin branch; each `update` is one commit; history gives
+  undo/redo/time-travel/audit for free. **Proven** (`test/persist_test`).
+- **T2 — branch-per-session + 3-way merge = built-in collaboration.** Concurrent
+  sessions reconcile via Irmin's tree merge, dispatching to the app's
+  `Merge_spec`. **Partially proven** (merge lifting compiles; `merge_into` wired).
+  Honest limit: merge quality equals the user-supplied 3-way function; this is
+  *not* a CRDT.
+- **T3 — one Model/Msg/update source, compiled to native + JS.** The shared core
+  depends only on `repr` (= `Irmin.Type`), so one wire codec serves both tiers
+  with zero schema drift. **Core proven** (builds); client tier pending.
+- **T4 — security primitives are module boundaries.** `private`/abstract/phantom
+  types make illegal states uncompilable. **Demonstrated** in `Prim`/`Html`
+  (`on*` attribute names rejected; every boundary value is a validating newtype).
+
+## 4. Module layout
+
+```
+lib/tea_core/     (deps: repr)          — pure, IO-agnostic, compiles to native AND js
+  prim.mli/ml       newtypes: Title, Url, Tag, Attr_name(!on*), Fuel, Session_id, Branch_name, ...
+  cmd.mli/ml        private effect-as-data variant + smart ctors + map
+  sub.mli/ml        private subscription variant (timers; Store_watch = §7)
+  html.mli/ml       private view type; safety hooks in constructors
+  render_static     Html.t -> escaped HTML string (server SSR), exhaustive fold
+  merge_spec        pure 3-way merge policy (LWW | Three_way f)
+  app.ml            module type APP (the WebApp mirror)
+  codec.ml          Codec(APP): Repr JSON + commit-message labels
+  loop.ml           IO signature + Loop(IO)(APP): fuel-bounded Cmd interpreter
+lib/tea_persist/  (deps: tea_core irmin irmin.mem irmin.unix lwt)
+  store.ml          Store(APP): session branches, apply=commit, history, undo, merge_into
+examples/counter/ Counter_app.App (shared) + [pending] server/ and client/ mains
+test/             persist_test (Lwt)
+```
+
+Design conventions honored throughout: exhaustive matches (no `_ ->` on finite
+sums), combinators over loops, newtypes over primitives, safety encoded in `.mli`
+boundaries, `result`/`option` over exceptions in the public surface.
+
+## 5. Persistence (the crux)
+
+**Layout.** Today the model is a single Contents blob at `["model"]` on a branch
+named `session-<id>` (`main` for the shared/default branch). The commit *message*
+is the serialized `Msg` (`Codec.msg_to_label`), so `git log` on the store reads as
+the event log. `apply` = load → `update` → `set_exn` (one commit).
+
+**Undo / time-travel.** `undo` walks `S.Commit.parents` and `S.Head.set`s to the
+parent — no bespoke undo stack. `history` returns the first-parent chain.
+
+**Merge (T2).** `Merge_spec` lifts into `Contents.merge`:
+`Last_write_wins → Irmin.Merge.(option (default model_t))`;
+`Three_way f → Irmin.Merge.(option (v model_t merge_f))` where `merge_f` forces
+the ancestor promise and maps conflicts to `` `Conflict ``. Irmin only calls it
+when both branches touched the same path.
+
+**Planned refinements** (from the design, not yet built):
+- *Exploded tree* — one path per model field / entity / index row, so merges are
+  per-field and "queries" become index-tree lookups (lean-tea's `Entity`/`Repo`
+  patterns → maintained secondary-index subtrees, since Irmin has no SQL).
+- *Backends* — `irmin.mem` (tests, today) → `irmin-git` (durable, inspectable) →
+  `irmin-pack` (scale + GC).
+- *History-growth control* — debounce/coalesce chatty Msgs into one commit;
+  squash session branches on checkpoint; `irmin-pack` GC behind a retained
+  checkpoint. (See risks R1/R6.)
+
+## 6. Server (Dream) — designed
+
+`Tea_server.Make (A : APP)` produces a Dream app. Per request: resolve the
+Dream session → Irmin branch → `Store.load` → `A.update` (via `Loop` with an `fx`
+record whose handlers close over the branch) → commit → `Render_static.to_string
+(A.view model')`. Live view: `S.watch` on the session branch fanned out over
+`Dream.websocket`. Dream supplies HTTP/1.1(+TLS), RFC6455 WS, sessions, CSRF, and
+typed forms — deleting lean-tea's hand-written HTTP/WS/OAuth stack. The `X-Model`
+header is gone: state is the branch head.
+
+## 7. Client (vdom + js_of_ocaml) — designed
+
+`Tea_client.Make (A : APP)` links the *same* library as the server and renders with
+`ocaml-vdom` (a faithful Elm-architecture impl): `Vdom.app ~init ~update ~view`,
+mounted via `Vdom_blit`. `Html.t → 'msg Vdom.vdom` and `Cmd.t → 'msg Vdom.Cmd.t`
+are total translations. Transport is a Dream WebSocket carrying Repr-JSON `Msg`
+frames up and committed-head announcements down; the client runs `update`
+optimistically and rebases pending msgs on each server head (browser mirror of
+Irmin branch semantics). **Lwt is banned client-side** — vdom's callback-based Cmd
+handlers sidestep the known `js_of_ocaml-lwt` rough edges.
+
+## 8. Shared RPC contract — designed
+
+A two-parameter GADT `('req,'resp) api` enumerating endpoints, over a single
+shared library both tiers link, with `Repr` (not `ppx_deriving_yojson`) as the
+wire codec so RPC payloads and Irmin Contents share one codec. Dispatch is a
+total, wildcard-free match — forgetting an endpoint's route/codec/handler is a
+compile error.
+
+## 9. Security primitives (T4) — mapping
+
+Each lean-tea private-constructor primitive → an OCaml `.mli` boundary:
+
+| Primitive | OCaml technique | status |
+|---|---|---|
+| `Proof c` capability | phantom-typed abstract token, minted only in the auth module | designed |
+| SafeAttr / XSS | `Attr_name.of_string` rejects `on*`; values escaped at render | **in `Prim`/`Html`** |
+| SafePath (traversal) | `private string` smart-ctor rejecting `..`/NUL | designed |
+| **SafeQuery → SafeKey** | Irmin has no SQL: `private string` path step, no separator smuggling / namespace escape | designed (smaller surface) |
+| SafeCmd | args as `string list` newtype, never a shell string | designed |
+| Header injection | typed response-header builders | designed |
+| Open redirect | `Url.of_string` = relative-only (**in `Prim`**) + allowlist newtype | **partial** |
+| Clickjacking / CSP | finite sum policy builders (unsafe option is *not a constructor*) | designed |
+
+## 10. Risk register (finder-reported, **unverified** — verify pass did not run)
+
+- **R1 (high) — commit-per-Msg volume / unbounded history.** Chatty UIs make
+  millions of commits. Mitigation: debounce/coalesce, squash, `irmin-pack` GC
+  with an explicit retention knob.
+- **R2 (high) — 3-way merge of arbitrary models is unsound by default.** A naive
+  last-writer-wins silently drops concurrent edits. Mitigation: default to
+  `Irmin.Merge.conflict` (surface a 409 + reconcile Msg, don't guess); ship a
+  merge-combinator library (lww/counter/set-union/record-fieldwise); QCheck the
+  merge laws.
+- **R3 (med) — branch/Lwt lifecycle leaks.** Abandoned session branches pin
+  history. Mitigation: a reaper keyed to Dream session expiry; order undo writes
+  so a crash strands a harmless redo pointer, never a lost head.
+- **R4 (med) — Irmin watch latency on the git FS backend.** Live view may lag.
+  Mitigation: `irmin-pack` or an in-process pub/sub over `S.watch`.
+- **R5 (med) — Repr must behave identically under js_of_ocaml.** Shared-codec
+  correctness (T3) depends on it. Mitigation: a native-vs-jsoo round-trip
+  conformance test in CI.
+- **R6 (med) — optimistic client replay can diverge from server merge.**
+  Mitigation: treat server head as authority; reconcile Msg on divergence.
+- **R7 (med) — security boundary bypass via direct Dream/Irmin/Unix calls, and
+  Proof tokens must never be serialized.** Mitigation: keep `Proof` out of every
+  `Repr.t`; lint for raw sinks.
+
+## 11. Roadmap
+
+1. **Server MVP** — `tea_server` + Counter served over Dream (SSR + form-post
+   update path), no WS yet.
+2. **Client MVP** — `tea_client` + `Html.t → vdom`, Counter in the browser off
+   the same `Counter_app`.
+3. **Live view** — `Sub.Store_watch` ⇒ `S.watch` ⇒ WebSocket ⇒ `Vdom_blit.process`.
+4. **Collaboration demo** — a two-session shared doc proving T2 with a real
+   `Three_way` merge + the combinator library (R2).
+5. **`tea_safe`** — land the 9 primitives as enforced `.mli` boundaries (R7).
+6. **History hygiene** — coalescing + `irmin-pack` + GC retention (R1).
+7. **RPC GADT** + a typed endpoint example.
