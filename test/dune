@@ -1,5 +1,5 @@
 (tests
- (names persist_test server_test client_test)
+ (names persist_test server_test client_test merge_test collab_test)
  (libraries
   tea_core
   tea_persist
@@ -7,6 +7,7 @@
   tea_client
   vdom.base
   counter_app
+  shared_doc_app
   dream
   lwt
   lwt.unix))

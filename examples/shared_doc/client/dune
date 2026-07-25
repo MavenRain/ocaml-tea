@@ -1,0 +1,10 @@
+(executable
+ (name main)
+ (modes js)
+ (libraries tea_client_run shared_doc_app))
+
+; Pull the page and the compiled app into _build together so
+; _build/default/examples/shared_doc/client/index.html opens as-is.
+(alias
+ (name default)
+ (deps index.html main.bc.js))

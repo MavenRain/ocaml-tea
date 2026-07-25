@@ -65,6 +65,31 @@ module Make (A : Tea_core.App.APP) = struct
     let* branch = S.main repo in
     Lwt.return { repo; branch }
 
+  (** Fork a fresh session branch off another session's current head, so the
+      two branches share that commit as their single common ancestor. This is
+      the "open the shared document in a new session" primitive behind the
+      collaboration demo (T2): each collaborator forks the shared doc, edits on
+      their own branch, and reconciles via {!merge_into} against a well-defined
+      base. An empty source yields an empty session (nothing to fork yet).
+
+      Forking initialises a {i fresh} destination only: if the [sid]'s branch
+      already holds committed work it is returned unchanged, so a reused or
+      double-forked [sid] can never silently lose history to a forced head move
+      (R3-adjacent). Re-seeding a diverged session is a {!merge_into}, not a
+      fork. *)
+  let fork (repo : t) ~(from : session) (sid : Tea_core.Prim.Session_id.t) : session Lwt.t =
+    let* dst = session repo sid in
+    let* dst_head = S.Head.find dst.branch in
+    match dst_head with
+    | Some _ -> Lwt.return dst
+    | None -> (
+      let* head = S.Head.find from.branch in
+      match head with
+      | None -> Lwt.return dst
+      | Some c ->
+        let* () = S.Head.set dst.branch c in
+        Lwt.return dst)
+
   let load (s : session) : A.model Lwt.t =
     let* v = S.find s.branch model_path in
     match v with

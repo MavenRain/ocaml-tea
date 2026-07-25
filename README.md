@@ -5,7 +5,7 @@ A full-stack OCaml web framework on **The Elm Architecture**, backed by
 An OCaml + Irmin reimagining of [lean-tea](https://github.com/Verilean/lean-tea).
 
 The idea in one line: **your app's `Model` lives in Irmin, and every `update` is a
-commit** — so undo/redo, time-travel, an audit log, and collaborative merge come
+commit** - so undo/redo, time-travel, an audit log, and collaborative merge come
 from the store, not from framework code.
 
 See [DESIGN.md](./DESIGN.md) for the architecture, the lean-tea mapping, and the
@@ -13,23 +13,36 @@ roadmap.
 
 ## What builds today
 
-- `lib/tea_core` — the pure TEA core (`APP` signature, effects-as-data `Cmd`/`Sub`,
-  a `private` `Html` type with server-side rendering, `Merge_spec`, `Codec`, and a
-  fuel-bounded `Loop`). Depends only on `repr`, so it compiles to native *and* JS.
-- `lib/tea_persist` — the Irmin-backed versioned model store: session branches,
-  `apply` = one commit, `history`, `undo`, and `merge_into`.
-- `lib/tea_server` — the Dream tier: per-session Irmin branches behind Dream
+- `lib/tea_core` - the pure TEA core (`APP` signature, effects-as-data `Cmd`/`Sub`,
+  a `private` `Html` type with server-side rendering, `Merge_spec`, the `Merge`
+  three-way combinator library, `Codec`, and a fuel-bounded `Loop`). Depends only
+  on `repr`, so it compiles to native *and* JS.
+- `lib/tea_persist` - the Irmin-backed versioned model store: session branches,
+  `apply` = one commit, `history`, `undo`, `merge_into`, and `fork` (branch a
+  session off another's head to share a clean merge ancestor).
+- `lib/tea_server` - the Dream tier: per-session Irmin branches behind Dream
   sessions, one commit per posted Msg, and SSR that rewrites every `On_click`
   site of the shared view into a CSRF-protected form post (the app works with
   zero client JS). Undo is served at `/undo`.
-- `examples/counter` — the shared Counter app, plus `server/` (a native Dream
-  binary: `PORT=8080 dune exec examples/counter/server/main.exe`).
-- `test/persist_test` — proves the store end-to-end.
-- `test/server_test` — proves the Dream tier end-to-end with `Dream.test`
-  (sessions, branch isolation, CSRF, undo), no socket needed.
+- `lib/tea_client` + `lib/tea_client_run` - the js_of_ocaml + ocaml-vdom client
+  tier: the *same* `APP` in the browser, with a WebSocket live view driven by
+  `Sub.Store_watch`.
+- `examples/counter` - the shared Counter app, plus `server/` (a native Dream
+  binary: `PORT=8080 dune exec examples/counter/server/main.exe`) and a browser
+  `client/`.
+- `examples/shared_doc` - a collaboratively-edited document whose fields merge
+  structurally (a summed like counter, a unioned tag set, and free-text that
+  *conflicts* rather than clobbering): the worked example of the `Merge`
+  combinators and thesis T2.
+- `test/persist_test`, `test/server_test`, `test/client_test` - the store, the
+  Dream tier (sessions, branch isolation, CSRF, undo, live pump), and the client
+  translations, end-to-end.
+- `test/merge_test`, `test/collab_test` - the merge-combinator laws, and two
+  sessions reconciling a shared document (T2 proven end-to-end).
 
-The client tier (js_of_ocaml + ocaml-vdom) and the WebSocket live view are
-designed in DESIGN.md and are the next milestones.
+The core, the Dream server, the js_of_ocaml client, the WebSocket live view, and
+the collaborative three-way merge all build and are green; `tea_safe` (security
+primitives) and history hygiene are the next milestones in DESIGN.md.
 
 ## Build & test
 

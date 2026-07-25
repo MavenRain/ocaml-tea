@@ -1,0 +1,3 @@
+(library
+ (name shared_doc_app)
+ (libraries tea_core repr))
