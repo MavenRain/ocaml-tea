@@ -129,6 +129,34 @@ module Make (A : Tea_core.App.APP) = struct
           let* model = load s in
           Lwt.return (Some model)))
 
+  (** The model as of one specific commit rather than the branch head: watch
+      notifications read the tree they were notified about, so a burst of
+      commits yields one frame per commit instead of n reads of whatever the
+      final head happens to be. *)
+  let model_at (c : S.commit) : A.model Lwt.t =
+    let* at = S.of_commit c in
+    let* v = S.find at model_path in
+    match v with
+    | Some m -> Lwt.return m
+    | None -> Lwt.return (fst A.init)
+
+  type watch = S.watch
+
+  (** Invoke [k] with the committed model after every head change of [s]'s
+      branch — the server half of {!Tea_core.Sub.Store_watch}. Registration
+      anchors at the current head ([?init]), so only changes after this call
+      fire; a deleted head delivers the app's initial model, mirroring
+      {!load} on an empty branch. Callers must {!unwatch} (R3). *)
+  let watch (s : session) (k : A.model -> unit Lwt.t) : watch Lwt.t =
+    let* head = S.Head.find s.branch in
+    S.watch s.branch ?init:head (fun (diff : S.commit Irmin.Diff.t) ->
+        match diff with
+        | `Added c -> Lwt.bind (model_at c) k
+        | `Updated (_, c) -> Lwt.bind (model_at c) k
+        | `Removed _ -> k (fst A.init))
+
+  let unwatch (w : watch) : unit Lwt.t = S.unwatch w
+
   (** Three-way merge [src]'s branch into [dst]'s, invoking the app's merge on
       conflicting paths. This is the collaborative-editing (T2) primitive. *)
   let merge_into ~(src : session) ~(dst : session) : (unit, string) result Lwt.t =

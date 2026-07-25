@@ -14,7 +14,7 @@ module type APP = sig
   val init : model * msg Cmd.t
   val update : msg -> model -> model * msg Cmd.t
   val view : model -> msg Html.t
-  val subscriptions : model -> msg Sub.t
+  val subscriptions : model -> (model, msg) Sub.t
 
   (** How two concurrently-diverged models on different session branches
       reconcile; lifted to [Irmin.Merge] by the persistence layer. *)

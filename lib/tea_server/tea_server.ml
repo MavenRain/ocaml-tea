@@ -9,8 +9,13 @@
     The no-JS update path is form posts: {!page} rewrites every [On_click msg]
     site of the {i shared} view into a same-origin [<form>] POSTing the
     Repr-JSON Msg plus Dream's CSRF token — progressive enhancement, since the
-    client tier will later re-attach live handlers to the same view. No
-    WebSocket yet (that is roadmap step 3). *)
+    client tier re-attaches live handlers to the same view.
+
+    The live-view path is the {!Tea_core.Wire.ws_path} WebSocket (roadmap
+    step 3, DESIGN §7): Msg frames travel up and are driven through the same
+    {!step}; every commit on the session branch — whether born from this
+    socket, a form post, or another tab — comes back down as a full Repr-JSON
+    model frame via the Irmin watch. *)
 
 module Make (A : Tea_core.App.APP) = struct
   module Prim = Tea_core.Prim
@@ -98,6 +103,80 @@ module Make (A : Tea_core.App.APP) = struct
         let* () = Store.commit s ~label:(Codec.msg_to_label msg) model' in
         Lwt.return (Ok { model = model'; redirect = !redirect }))
       ~error:(fun (e : Loop.err) -> Lwt.return (Error e))
+
+  (* --- Live view over WebSocket (roadmap step 3, DESIGN §7) -------------- *)
+
+  let ws_path = Tea_core.Wire.ws_path
+
+  (** The two effects a live session needs from its socket, abstracted so the
+      pump logic is testable without a WebSocket handshake: [server_test]
+      drives it with in-memory queues, the same seam discipline as
+      {!Tea_core.Loop}'s IO. *)
+  type live_transport =
+    { send_frame : string -> unit Lwt.t
+    ; receive_frame : unit -> string option Lwt.t
+    }
+
+  (** One live session: register the store watch, announce the current model,
+      then pump incoming Msg frames through {!step} until the peer closes or
+      breaks protocol (an undecodable frame or an exhausted loop ends the
+      session — the socket close is the error signal). Every down-frame,
+      including the reply to an accepted Msg, travels commit → watch → the
+      single [Lwt_stream] writer, so ordering has one source and sends never
+      interleave. A [Navigate] effect has no WS surface and is dropped here:
+      the client's own optimistic run of the same Msg performs it locally.
+      Transient reordering right after connect is possible (the initial
+      announcement races frames for commits landing during registration); the
+      stream converges on the newest head because later commits always fire
+      later watch callbacks. *)
+  let live_session (s : Store.session) (t : live_transport) : unit Lwt.t =
+    let frames, push = Lwt_stream.create () in
+    let* w =
+      Store.watch s (fun m ->
+          push (Some (Codec.model_to_json m));
+          Lwt.return_unit)
+    in
+    let* model0 = Store.load s in
+    push (Some (Codec.model_to_json model0));
+    let rec pump () =
+      let* frame = t.receive_frame () in
+      match frame with
+      | None -> Lwt.return_unit
+      | Some json ->
+        Result.fold (Codec.msg_of_json json)
+          ~ok:(fun msg ->
+            let* stepped = step s msg in
+            Result.fold stepped
+              ~ok:(fun (_ : step_outcome) -> pump ())
+              ~error:(fun (Loop.Fuel_exhausted : Loop.err) -> Lwt.return_unit))
+          ~error:(fun (Codec.Decode_failed (_ : string)) -> Lwt.return_unit)
+    in
+    Lwt.finalize
+      (fun () -> Lwt.pick [ Lwt_stream.iter_s t.send_frame frames; pump () ])
+      (fun () -> Store.unwatch w)
+
+  (* [Dream.origin_referrer_check] exempts GET, but a WebSocket handshake IS
+     a GET with side effects, and browsers do not enforce same-origin on
+     WebSocket connections (cross-site WebSocket hijacking). Browsers always
+     send [Origin] on the handshake, so require it to name this host;
+     non-browser clients must supply it. *)
+  let same_origin (request : Dream.request) : bool =
+    match (Dream.header request "Origin", Dream.header request "Host") with
+    | Some origin, Some host ->
+      String.equal origin ("http://" ^ host) || String.equal origin ("https://" ^ host)
+    | Some _, None -> false
+    | None, Some _ -> false
+    | None, None -> false
+
+  let handle_ws (repo : Store.t) (request : Dream.request) : Dream.response Lwt.t =
+    if same_origin request then
+      with_session repo request (fun s ->
+          Dream.websocket (fun ws ->
+              live_session s
+                { send_frame = Dream.send ws
+                ; receive_frame = (fun () -> Dream.receive ws)
+                }))
+    else Dream.respond ~status:`Forbidden "cross-origin websocket rejected"
 
   (* --- SSR: the shared view rendered as a no-JS form-post page ---------- *)
 
@@ -192,19 +271,33 @@ module Make (A : Tea_core.App.APP) = struct
 
   (* --- Assembly ----------------------------------------------------------- *)
 
-  let router (repo : Store.t) : Dream.handler =
+  (* [?client_dir]: also serve a compiled js_of_ocaml client bundle (the
+     [/app] pages), so the SSR tier, the live client, and the WebSocket share
+     one origin — which is precisely what {!same_origin} and the shared Dream
+     session cookie require. *)
+  let router ?(client_dir : string option) (repo : Store.t) : Dream.handler =
+    let client_routes =
+      Option.fold client_dir ~none:[]
+        ~some:(fun dir ->
+          [ Dream.get "/app" (fun request -> Dream.redirect request "/app/index.html")
+          ; Dream.get "/app/**" (Dream.static dir)
+          ])
+    in
     Dream.router
-      [ Dream.get "/" (handle_root repo)
-      ; Dream.post msg_path (handle_msg repo)
-      ; Dream.post undo_path (handle_undo repo)
-      ]
+      ([ Dream.get "/" (handle_root repo)
+       ; Dream.post msg_path (handle_msg repo)
+       ; Dream.post undo_path (handle_undo repo)
+       ; Dream.get ws_path (handle_ws repo)
+       ]
+      @ client_routes)
 
   (** The full request pipeline: session middleware over the router. Exposed
       so tests can drive it with [Dream.test] against an in-memory repo. *)
-  let handler (repo : Store.t) : Dream.handler = Dream.memory_sessions (router repo)
+  let handler ?client_dir (repo : Store.t) : Dream.handler =
+    Dream.memory_sessions (router ?client_dir repo)
 
   (** Blocking entry point for a native server binary. *)
-  let serve ?(interface = "localhost") ?(port = 8080) () : unit =
+  let serve ?(interface = "localhost") ?(port = 8080) ?client_dir () : unit =
     let repo = Lwt_main.run (Store.create ()) in
-    Dream.run ~interface ~port (Dream.logger (handler repo))
+    Dream.run ~interface ~port (Dream.logger (handler ?client_dir repo))
 end

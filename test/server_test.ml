@@ -1,7 +1,9 @@
 (** End-to-end proof of the Dream tier (roadmap step 1): drive the Counter
     over HTTP with [Dream.test] — no socket. Checks SSR, the On_click →
     form-post rewrite, per-session branch isolation, CSRF enforcement, undo,
-    and the two client-error paths. *)
+    and the two client-error paths. Roadmap step 3 is proven the same way:
+    [live_session] is driven over an in-memory [live_transport] — no
+    WebSocket handshake — and [same_origin] over constructed requests. *)
 
 module Server = Tea_server.Make (Counter_app.App)
 module Codec = Tea_core.Codec.Make (Counter_app.App)
@@ -128,3 +130,99 @@ let () =
   check "a missing msg field is rejected (400)" (status missing = 400);
 
   Printf.printf "\nThe Dream tier serves the shared app end-to-end (roadmap step 1).\n%!"
+
+(* --- same_origin: the WebSocket handshake guard (roadmap step 3) ---------- *)
+
+(* Browsers do not enforce same-origin on WebSocket connections, so the
+   handshake guard is load-bearing; [Dream.request ~headers] carries Host as a
+   plain header, which is exactly where [Dream.header] reads it back. *)
+let origin_request headers =
+  Dream.request ~method_:`GET ~target:Server.ws_path ~headers ""
+
+let () =
+  check "same_origin accepts a matching http origin"
+    (Server.same_origin
+       (origin_request [ ("Origin", "http://example.com"); ("Host", "example.com") ]));
+  check "same_origin accepts a matching https origin"
+    (Server.same_origin
+       (origin_request [ ("Origin", "https://example.com"); ("Host", "example.com") ]));
+  check "same_origin rejects a mismatched origin"
+    (not
+       (Server.same_origin
+          (origin_request [ ("Origin", "http://evil.example"); ("Host", "example.com") ])));
+  check "same_origin rejects a missing Origin header"
+    (not (Server.same_origin (origin_request [ ("Host", "example.com") ])))
+
+(* --- live_session over a mock transport (roadmap step 3, no socket) ------- *)
+
+let await = Test_util.await
+
+(* [live_session] must return on peer close; bound the wait so a regression
+   hangs the check, not the suite. *)
+let closes_within session =
+  let open Lwt.Syntax in
+  Lwt.pick
+    [ (let* () = session in
+       Lwt.return true)
+    ; (let* () = Lwt_unix.sleep 2.0 in
+       Lwt.return false)
+    ]
+
+let () =
+  Lwt_main.run
+    (let open Lwt.Syntax in
+     let* repo = Server.Store.create () in
+     let* s = Server.Store.main_session repo in
+     let incoming, push = Lwt_stream.create () in
+     let sent = ref [] in
+     let transport =
+       { Server.send_frame =
+           (fun f ->
+             sent := f :: !sent;
+             Lwt.return_unit)
+       ; receive_frame = (fun () -> Lwt_stream.get incoming)
+       }
+     in
+     let session = Server.live_session s transport in
+     let frames () = List.rev !sent in
+     (* (a) The session opens by announcing the current model. *)
+     let* announced = await (fun () -> !sent <> []) in
+     check "live_session announces the current model first"
+       (announced
+       && frames () = [ Codec.model_to_json { Counter_app.App.count = 0 } ]);
+     (* (b) A Msg frame up is stepped, committed, and echoed down via the
+        store watch as a full model frame. *)
+     push (Some (Codec.msg_to_json Counter_app.App.Increment));
+     let* stepped =
+       await (fun () ->
+           List.mem (Codec.model_to_json { Counter_app.App.count = 1 }) (frames ()))
+     in
+     check "a Msg frame up yields the committed model frame down" stepped;
+     (* (c) Peer close ends the session. *)
+     push None;
+     let* closed = closes_within session in
+     check "peer close (None) ends the live session" closed;
+     (* (d) An undecodable frame ends the session — and commits nothing.
+        On its own branch: [Irmin_mem.config ()] shares one in-process heap,
+        so a fresh repo's main still sees the commit from (b). *)
+     let sid2 = Option.get (Tea_core.Prim.Session_id.of_string "garbagesession") in
+     let* s2 = Server.Store.session repo sid2 in
+     let incoming2, push2 = Lwt_stream.create () in
+     let sent2 = ref [] in
+     let transport2 =
+       { Server.send_frame =
+           (fun f ->
+             sent2 := f :: !sent2;
+             Lwt.return_unit)
+       ; receive_frame = (fun () -> Lwt_stream.get incoming2)
+       }
+     in
+     push2 (Some "not json");
+     let* closed2 = closes_within (Server.live_session s2 transport2) in
+     check "an undecodable frame ends the live session" closed2;
+     let* hist2 = Server.Store.history s2 in
+     let* after2 = Server.Store.load s2 in
+     check "a garbage frame commits nothing"
+       (hist2 = [] && after2.Counter_app.App.count = 0);
+     Printf.printf "\nThe live-view pump serves roadmap step 3, no socket needed.\n%!";
+     Lwt.return_unit)

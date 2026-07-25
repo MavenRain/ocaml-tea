@@ -14,15 +14,15 @@ toolchain removes an entire tier lean-tea had to hand-write.
 
 | Layer | State |
 |---|---|
-| `lib/tea_core` — APP signature, `Cmd`/`Sub`, `Html` + SSR, `Merge_spec`, `Codec`, `Loop` | **built, green** (`repr` only) |
+| `lib/tea_core` — APP signature, `Cmd`/`Sub`, `Html` + SSR, `Merge_spec`, `Codec`, `Loop`, `Wire` | **built, green** (`repr` only) |
 | `examples/counter` — shared Counter app | **built, green** |
 | `lib/tea_persist` — Irmin versioned model store | **built, green; test passes** |
 | `test/persist_test` — apply/history/undo end-to-end | **passes** |
-| `lib/tea_server` — Dream wiring (SSR + form-post path) | **built, green** (WS live view still designed, §7) |
-| `test/server_test` — Dream tier end-to-end (sessions, CSRF, undo) | **passes** (confirmed by mutation) |
-| `examples/counter/server` — native Counter server binary | **built** |
-| `lib/tea_client` — pure `Html.t → vdom` / `Cmd.t → Vdom.Cmd.t` translations | **built, green** (`tea_core` + `vdom.base` only, links natively) |
-| `lib/tea_client_run` — jsoo runtime: mount, `After`/`Navigate` handlers, popstate | **built** (WS live view still designed, §7; `Sub` timers not yet interpreted client-side) |
+| `lib/tea_server` — Dream wiring (SSR + form-post + `/ws` live view) | **built, green** (`live_session` pump over a testable transport seam) |
+| `test/server_test` — Dream tier end-to-end (sessions, CSRF, undo, live pump) | **passes** (confirmed by mutation) |
+| `examples/counter/server` — native Counter server binary (serves `/app` bundle) | **built** |
+| `lib/tea_client` — pure `Html.t → vdom` / `Cmd.t → Vdom.Cmd.t` translations + `Subs` planning | **built, green** (`tea_core` + `vdom.base` only, links natively) |
+| `lib/tea_client_run` — jsoo runtime: mount, `After`/`Navigate`, popstate, `Sub` interpreter (`Every` ⇒ `setInterval`, `Store_watch` ⇒ WebSocket) | **built** |
 | `test/client_test` — translation fidelity via native decoder evaluation | **passes** (confirmed by mutation) |
 | `examples/counter/client` — Counter in the browser (js_of_ocaml) | **built** (`main.bc.js` + `index.html`) |
 | `lib/tea_rpc` — GADT endpoint contract | designed (§8), not yet built |
@@ -134,8 +134,27 @@ rewrites every `On_click` site of the shared view into a same-origin `<form>`
 carrying the Repr-JSON Msg and Dream's CSRF token, so any APP is fully usable
 with zero client JS (progressive enhancement: the client tier later re-attaches
 live handlers to the same view). A `Navigate` Cmd becomes the post-update
-redirect target; undo is served at `/undo`. The WS live view (`S.watch`) remains
-designed, not built. Two documented invariants: an element keeps at most one
+redirect target; undo is served at `/undo`.
+
+**Live view: built** (roadmap step 3). `Wire.ws_path` (`/ws`) accepts Msg
+frames up, drives them through the same `step` (Loop + commit), and answers
+every commit on the session branch — from this socket, a form post, or another
+tab — with a full Repr-JSON model frame, produced by `Store.watch` (Irmin
+`S.watch` anchored at the current head, reading the model *at the notified
+commit*). All down-frames funnel through one `Lwt_stream` writer, so sends
+never interleave; the pump is written against a `live_transport` record
+(send/receive functions), the same seam discipline as `Loop`'s IO, so
+`server_test` drives it with in-memory queues and no handshake. Protocol
+errors are fail-stop: an undecodable frame or exhausted fuel closes the
+socket. Because `Dream.origin_referrer_check` exempts GET and a WS handshake
+is a GET, `/ws` carries its own same-origin gate (`Origin` must name `Host`;
+CSWSH defense). A `Navigate` effect has no WS surface (dropped server-side;
+the client's optimistic run of the same Msg performs it). Known residuals:
+frames for commits landing during watch registration can transiently reorder
+around the initial announcement (converges — later commits fire later
+callbacks); an optional `?client_dir` serves the compiled jsoo bundle at
+`/app` so SSR page, live client, and socket share one origin and one Dream
+session. Two documented invariants: an element keeps at most one
 `On_click` (first wins, enforced by `Html.elt`, so both tiers agree), and click
 handlers belong on leaf controls (an `On_click` ancestor of another `On_click`
 would render as nested forms, which is invalid HTML; id-based form association
@@ -163,12 +182,30 @@ the two command extensions (`After` ⇒ `setTimeout`, `Navigate` ⇒
 dispatches `msg_of_url` at load and on `popstate`. One deliberate asymmetry:
 `value` crosses as the DOM *property* (a controlled input must track the
 model on redraw); every other attribute crosses verbatim, as `Render_static`
-prints it. Not yet built: the WS transport + optimistic rebase above (roadmap
-step 3), and a client interpreter for `Sub` timers — an APP using `Sub.every`
-renders but does not tick in the browser until step 3's subscription plumbing.
-`After` timers are fire-and-forget (one mount per page life, no dispose path;
-a future dispose must track and clear them). Lwt-free holds: neither client
-library links `lwt`.
+prints it. `After` timers are fire-and-forget (one mount per page life, no
+dispose path; a future dispose must track and clear them). Lwt-free holds:
+neither client library links `lwt`.
+
+**Subscriptions: built** (roadmap step 3). The pure half lives in
+`Tea_client.Subs` (natively tested): flatten the `Sub` tree into specs, key
+them by runtime resource (`Key_every ms` / `Key_store` — callbacks are
+deliberately not part of the key), and `plan` the wanted-vs-active diff. The
+effectful half lives in `Start`: after mount and after every `update` the
+subscriptions of the new model are re-planned — `Every` runs on
+`setInterval`, `Store_watch` opens the `Wire.ws_path` WebSocket. Handlers are
+looked up from the *current* model's subscriptions at fire time
+(`Vdom_blit.get`), so resources never hold stale callbacks. When the socket
+is open, every locally-born msg is mirrored up it (the optimistic path:
+local `update` applies immediately, the server commits the same Msg, and the
+committed head returns as a `Store_watch` frame); remote-born msgs are fenced
+by an `applying_remote` flag — sound because `Vdom_blit.process` runs
+`update` synchronously — so a pushed head can never echo back up the socket.
+The server head is the authority (R6): a frame overwrites optimistic local
+state; there is no rebase buffer for in-flight msgs yet (step 4 territory).
+Residuals: no auto-reconnect (socket close logs to the console); msgs born
+while the socket is still `Connecting` apply locally only, audibly; timer- and
+`After`-born msgs are mirrored like any other, so a chatty `Sub.every` app
+commits on every tick (R1 — coalescing is roadmap step 6).
 
 ## 8. Shared RPC contract — designed
 
@@ -224,7 +261,10 @@ Each lean-tea private-constructor primitive → an OCaml `.mli` boundary:
 2. **Client MVP** — `tea_client` + `Html.t → vdom`, Counter in the browser off
    the same `Counter_app`. **Done** (`tea_client`, `tea_client_run`,
    `client_test`, `examples/counter/client`).
-3. **Live view** — `Sub.Store_watch` ⇒ `S.watch` ⇒ WebSocket ⇒ `Vdom_blit.process`.
+3. **Live view** — `Sub.Store_watch` ⇒ `S.watch` ⇒ WebSocket ⇒
+   `Vdom_blit.process`. **Done** (`Wire`, `Store.watch`, `live_session` +
+   same-origin gate, `Tea_client.Subs`, the `Start` sub interpreter, counter
+   `Sync`); no client rebase buffer yet (→ step 4), no auto-reconnect.
 4. **Collaboration demo** — a two-session shared doc proving T2 with a real
    `Three_way` merge + the combinator library (R2).
 5. **`tea_safe`** — land the 9 primitives as enforced `.mli` boundaries (R7).

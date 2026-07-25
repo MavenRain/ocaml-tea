@@ -36,6 +36,47 @@ let rec cmd_to_vdom = function
   | Cmd.After (delay, msg) -> After (Prim.Delay.to_ms delay, msg)
   | Cmd.Navigate url -> Navigate (Prim.Url.to_string url)
 
+module Subs = struct
+  type ('model, 'msg) spec =
+    | Spec_every of int * (int -> 'msg)
+    | Spec_store of ('model -> 'msg)
+
+  let rec specs_of (s : ('model, 'msg) Tea_core.Sub.t) : ('model, 'msg) spec list =
+    match s with
+    | Tea_core.Sub.None_ -> []
+    | Tea_core.Sub.Batch xs -> List.concat_map specs_of xs
+    | Tea_core.Sub.Every (i, f) -> [ Spec_every (Prim.Interval.to_ms i, f) ]
+    | Tea_core.Sub.Store_watch f -> [ Spec_store f ]
+
+  type key =
+    | Key_every of int
+    | Key_store
+
+  let key_of_spec (s : ('model, 'msg) spec) : key =
+    match s with
+    | Spec_every (ms, (_ : int -> 'msg)) -> Key_every ms
+    | Spec_store (_ : 'model -> 'msg) -> Key_store
+
+  let equal_key (a : key) (b : key) : bool =
+    match (a, b) with
+    | Key_every x, Key_every y -> Int.equal x y
+    | Key_store, Key_store -> true
+    | Key_every (_ : int), Key_store -> false
+    | Key_store, Key_every (_ : int) -> false
+
+  let keys_of (specs : ('model, 'msg) spec list) : key list =
+    List.fold_left
+      (fun acc s ->
+        let k = key_of_spec s in
+        if List.exists (equal_key k) acc then acc else k :: acc)
+      [] specs
+    |> List.rev
+
+  let plan ~(active : key list) ~(wanted : key list) : key list * key list =
+    ( List.filter (fun k -> not (List.exists (equal_key k) active)) wanted
+    , List.filter (fun k -> not (List.exists (equal_key k) wanted)) active )
+end
+
 module Make (A : Tea_core.App.APP) = struct
   let app =
     let model, cmd = A.init in

@@ -270,4 +270,93 @@ let () =
   check "Make's view renders through the translation"
     (Option.bind (dig [ 1; 0 ] (Client.app.Vdom.view model2)) text_of = Some "2")
 
+(* --- Subs: the pure subscription planner (roadmap step 3) ----------------- *)
+
+module Subs = Tea_client.Subs
+module Sub = Tea_core.Sub
+
+(* Test-side [Interval] construction: [of_ms] rejects only non-positive input,
+   so unwrapping the literals below is safe. *)
+let interval ms = Option.get (Prim.Interval.of_ms ms)
+
+(* Spec classifiers, one exhaustive match each; the callbacks are checked by
+   {e applying} them, the same off-browser discipline as the decoders above. *)
+let spec_interval = function
+  | Subs.Spec_every (ms, _) -> Some ms
+  | Subs.Spec_store _ -> None
+
+let every_msg tick = function
+  | Subs.Spec_every (_, f) -> Some (f tick)
+  | Subs.Spec_store _ -> None
+
+let store_msg model = function
+  | Subs.Spec_store g -> Some (g model)
+  | Subs.Spec_every (_, _) -> None
+
+let specs =
+  Subs.specs_of
+    (Sub.batch
+       [ Sub.none
+       ; Sub.every (interval 1000) (fun tick -> App.Sync tick)
+       ; Sub.batch
+           [ Sub.store_watch (fun (m : App.model) -> App.Sync m.count); Sub.none ]
+       ; Sub.every (interval 250) (fun _tick -> App.Reset)
+       ])
+
+let () =
+  check "specs_of flattens None_/Batch, preserving leaf order"
+    (List.length specs = 3 && List.filter_map spec_interval specs = [ 1000; 250 ]);
+  check "the Store_watch leaf sits between the two timers"
+    (Option.bind (List.nth_opt specs 1) (store_msg { App.count = 9 })
+    = Some (App.Sync 9));
+  check "Spec_every callbacks cross intact (applied to a tick)"
+    (List.filter_map (every_msg 7) specs = [ App.Sync 7; App.Reset ]);
+  check "the Counter subscribes to the store, reconciling via Sync"
+    (List.filter_map (store_msg { App.count = 5 })
+       (Subs.specs_of (App.subscriptions { App.count = 0 }))
+    = [ App.Sync 5 ])
+
+(* Functor fidelity again: [Sub.map] must reach under [Store_watch]. *)
+let () =
+  let mapped =
+    Sub.map
+      (fun m -> Wrapped m)
+      (Sub.store_watch (fun (m : App.model) -> App.Sync m.count))
+  in
+  check "Sub.map composes under Store_watch"
+    (List.filter_map (store_msg { App.count = 4 }) (Subs.specs_of mapped)
+    = [ Wrapped (App.Sync 4) ])
+
+let () =
+  check "key_of_spec keys timers by period and any watch as the one socket"
+    (List.map Subs.key_of_spec specs
+     = [ Subs.Key_every 1000; Subs.Key_store; Subs.Key_every 250 ]
+    && Subs.equal_key Subs.Key_store Subs.Key_store
+    && not (Subs.equal_key (Subs.Key_every 1000) (Subs.Key_every 250))
+    && not (Subs.equal_key (Subs.Key_every 1000) Subs.Key_store));
+  check "keys_of dedups by resource, first-occurrence order"
+    (Subs.keys_of
+       (Subs.specs_of
+          (Sub.batch
+             [ Sub.every (interval 500) (fun tick -> App.Sync tick)
+             ; Sub.every (interval 500) (fun _tick -> App.Reset)
+             ; Sub.store_watch (fun (m : App.model) -> App.Sync m.count)
+             ; Sub.every (interval 250) (fun _tick -> App.Increment)
+             ; Sub.store_watch (fun (m : App.model) -> App.Sync (m.count + 1))
+             ]))
+    = [ Subs.Key_every 500; Subs.Key_store; Subs.Key_every 250 ])
+
+let () =
+  let to_start, to_stop =
+    Subs.plan
+      ~active:[ Subs.Key_every 1000; Subs.Key_store ]
+      ~wanted:[ Subs.Key_store; Subs.Key_every 250 ]
+  in
+  check "plan diffs both ways, preserving input order"
+    (to_start = [ Subs.Key_every 250 ] && to_stop = [ Subs.Key_every 1000 ]);
+  check "plan from nothing starts the wanted key"
+    (Subs.plan ~active:[] ~wanted:[ Subs.Key_store ] = ([ Subs.Key_store ], []));
+  check "plan to nothing stops the active key"
+    (Subs.plan ~active:[ Subs.Key_store ] ~wanted:[] = ([], [ Subs.Key_store ]))
+
 let () = print_endline "client_test: all checks passed"

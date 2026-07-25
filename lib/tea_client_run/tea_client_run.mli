@@ -19,7 +19,16 @@ module Start (A : Tea_core.App.APP) : sig
   (** Set the document title, mount the app onto [document.body], dispatch
       [A.msg_of_url] for the current location, and re-dispatch it on
       back/forward ([popstate]) — the client mirror of lean-tea's [urlToMsg].
-      Call it from the page's [onload] (or use {!boot}). *)
+
+      Also the client half of {!Tea_core.Sub} (roadmap step 3): after mount
+      and after every [update], the app's subscriptions are re-planned
+      ({!Tea_client.Subs}) — [Every] runs on [setInterval]; [Store_watch]
+      opens the {!Tea_core.Wire.ws_path} WebSocket, mirrors every
+      locally-born msg up it, and turns each model frame pushed down into
+      msgs via the subscription's own mapping. The server head is the
+      authority (R6): a frame overwrites optimistic local state; there is no
+      auto-reconnect (a closed socket logs to the console; reload to
+      reconnect). Call it from the page's [onload] (or use {!boot}). *)
   val main : unit -> unit
 
   (** [boot () = onload := main]: the one-liner for a client executable. *)
