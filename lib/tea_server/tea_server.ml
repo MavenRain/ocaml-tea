@@ -155,28 +155,30 @@ module Make (A : Tea_core.App.APP) = struct
       (fun () -> Lwt.pick [ Lwt_stream.iter_s t.send_frame frames; pump () ])
       (fun () -> Store.unwatch w)
 
-  (* [Dream.origin_referrer_check] exempts GET, but a WebSocket handshake IS
-     a GET with side effects, and browsers do not enforce same-origin on
-     WebSocket connections (cross-site WebSocket hijacking). Browsers always
-     send [Origin] on the handshake, so require it to name this host;
-     non-browser clients must supply it. *)
-  let same_origin (request : Dream.request) : bool =
-    match (Dream.header request "Origin", Dream.header request "Host") with
-    | Some origin, Some host ->
-      String.equal origin ("http://" ^ host) || String.equal origin ("https://" ^ host)
-    | Some _, None -> false
-    | None, Some _ -> false
-    | None, None -> false
+  (* Cross-site WebSocket hijacking gate. The full CSWSH rationale now lives on
+     [Tea_safe.Origin_gate]'s doc in tea_safe.mli; [accept_ws] is the only
+     function that names [Dream.websocket], and it demands the proof that
+     [Origin_gate.check] mints, so a socket accepted without the same-origin
+     check cannot be expressed here. *)
+  let accept_ws (_ : Tea_safe.Origin_gate.same_origin Tea_safe.Proof.t) (repo : Store.t)
+      (request : Dream.request) : Dream.response Lwt.t =
+    with_session repo request (fun s ->
+        Dream.websocket (fun ws ->
+            live_session s
+              { send_frame = Dream.send ws
+              ; receive_frame = (fun () -> Dream.receive ws)
+              }))
 
   let handle_ws (repo : Store.t) (request : Dream.request) : Dream.response Lwt.t =
-    if same_origin request then
-      with_session repo request (fun s ->
-          Dream.websocket (fun ws ->
-              live_session s
-                { send_frame = Dream.send ws
-                ; receive_frame = (fun () -> Dream.receive ws)
-                }))
-    else Dream.respond ~status:`Forbidden "cross-origin websocket rejected"
+    Tea_safe.Origin_gate.check
+      ~origin:(Dream.header request "Origin")
+      ~host:(Dream.header request "Host")
+    |> Result.fold
+         ~ok:(fun proof -> accept_ws proof repo request)
+         ~error:(fun (d : Tea_safe.Origin_gate.denial) ->
+           match d with
+           | Origin_missing | Host_missing | Both_missing | Origin_mismatch ->
+             Dream.respond ~status:`Forbidden "cross-origin websocket rejected")
 
   (* --- SSR: the shared view rendered as a no-JS form-post page ---------- *)
 
@@ -252,7 +254,11 @@ module Make (A : Tea_core.App.APP) = struct
           ~error:(fun (Loop.Fuel_exhausted : Loop.err) ->
             Dream.respond ~status:`Internal_Server_Error "command loop exhausted its fuel"))
       ~error:(fun (Codec.Decode_failed reason) ->
-        Dream.respond ~status:`Bad_Request ("undecodable msg: " ^ reason))
+        (* Pin text/plain so the attacker-derived reason can never be sniffed as
+           HTML (defense in depth beside the nosniff header). *)
+        Dream.respond ~status:`Bad_Request
+          ~headers:[ ("Content-Type", "text/plain; charset=utf-8") ]
+          ("undecodable msg: " ^ reason))
 
   let handle_msg (repo : Store.t) (request : Dream.request) : Dream.response Lwt.t =
     with_session repo request (fun s ->
@@ -291,10 +297,21 @@ module Make (A : Tea_core.App.APP) = struct
        ]
       @ client_routes)
 
-  (** The full request pipeline: session middleware over the router. Exposed
-      so tests can drive it with [Dream.test] against an in-memory repo. *)
+  (* Append the strict security headers to every response (CSP, X-Frame-Options,
+     X-Content-Type-Options). Outermost so even error and 403 responses carry
+     them; [Tea_safe.Security_headers] proves the values are control-byte free. *)
+  let secure_headers (inner : Dream.handler) : Dream.handler =
+   fun request ->
+    let* response = inner request in
+    Tea_safe.Security_headers.(to_headers strict)
+    |> List.iter (fun h -> Dream.set_header response (Tea_safe.Header.name h) (Tea_safe.Header.value h));
+    Lwt.return response
+
+  (** The full request pipeline: session middleware over the security-headers
+      middleware over the router. Exposed so tests can drive it with
+      [Dream.test] against an in-memory repo. *)
   let handler ?client_dir (repo : Store.t) : Dream.handler =
-    Dream.memory_sessions (router ?client_dir repo)
+    Dream.memory_sessions (secure_headers (router ?client_dir repo))
 
   (** Blocking entry point for a native server binary. *)
   let serve ?(interface = "localhost") ?(port = 8080) ?client_dir () : unit =

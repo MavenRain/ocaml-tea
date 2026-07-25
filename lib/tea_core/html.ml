@@ -49,6 +49,7 @@ let attr name value =
   | Ok n -> Some (Attr (n, Prim.Attr_value.v value))
   | Error Prim.Attr_name.Empty -> None
   | Error Prim.Attr_name.Event_handler -> None
+  | Error (Prim.Attr_name.Invalid_char _) -> None
 
 let on_click msg = On_click msg
 let on_input f = On_input (fun it -> f (Prim.Input_text.to_string it))

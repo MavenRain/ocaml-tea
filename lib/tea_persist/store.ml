@@ -51,7 +51,11 @@ module Make (A : Tea_core.App.APP) = struct
     ; branch : S.t
     }
 
-  let model_path = [ "model" ]
+  (* Typed store key: a compile-time-literal step, dropped to Irmin's raw
+     string-list path at the one bridge. Byte-identical to the former
+     [\[ "model" \]]; the byte-compat pin lives in [test/safe_test]. *)
+  let model_path = Tea_safe.Safe_key.(root (Step.v "model"))
+  let model_path_raw = Tea_safe.Safe_key.to_steps model_path
   let info label = Info.v ~author:"ocaml-tea" "%s" label
 
   let create () : t Lwt.t = S.Repo.v (Irmin_mem.config ())
@@ -91,13 +95,13 @@ module Make (A : Tea_core.App.APP) = struct
         Lwt.return dst)
 
   let load (s : session) : A.model Lwt.t =
-    let* v = S.find s.branch model_path in
+    let* v = S.find s.branch model_path_raw in
     match v with
     | Some m -> Lwt.return m
     | None -> Lwt.return (fst A.init)
 
   let commit (s : session) ~(label : string) (model : A.model) : unit Lwt.t =
-    S.set_exn s.branch model_path model ~info:(info label)
+    S.set_exn s.branch model_path_raw model ~info:(info label)
 
   (** One TEA step, persisted as one commit. (Cmd effects are the server
       runtime's job; here we persist the model transition and label the commit
@@ -160,7 +164,7 @@ module Make (A : Tea_core.App.APP) = struct
       final head happens to be. *)
   let model_at (c : S.commit) : A.model Lwt.t =
     let* at = S.of_commit c in
-    let* v = S.find at model_path in
+    let* v = S.find at model_path_raw in
     match v with
     | Some m -> Lwt.return m
     | None -> Lwt.return (fst A.init)

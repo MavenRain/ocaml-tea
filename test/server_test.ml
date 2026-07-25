@@ -47,6 +47,20 @@ let cookie_of response =
 let body response = Lwt_main.run (Dream.body response)
 let status response = Dream.status_to_int (Dream.status response)
 
+(* The exact policy [Tea_safe.Security_headers.strict] serialises to; pinned
+   here so a drift in the compiled-in CSP string is a test failure, not a silent
+   loosening. *)
+let pinned_csp =
+  "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'self'; \
+   form-action 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'"
+
+(* The [secure_headers] middleware is outermost, so every response, error and
+   403 responses included, must carry the strict header set. *)
+let has_security_headers response =
+  Dream.header response "Content-Security-Policy" = Some pinned_csp
+  && Dream.header response "X-Frame-Options" = Some "DENY"
+  && Dream.header response "X-Content-Type-Options" = Some "nosniff"
+
 let get handle ~cookie path =
   handle (Dream.request ~method_:`GET ~target:path ~headers:[ ("Cookie", cookie) ] "")
 
@@ -91,6 +105,12 @@ let () =
   (* First visit: session established, SSR of the init model. *)
   let r0 = handle (Dream.request ~method_:`GET ~target:"/" "") in
   check "GET / responds 200" (status r0 = 200);
+  check "GET / carries the pinned Content-Security-Policy"
+    (Dream.header r0 "Content-Security-Policy" = Some pinned_csp);
+  check "GET / denies framing (X-Frame-Options: DENY)"
+    (Dream.header r0 "X-Frame-Options" = Some "DENY");
+  check "GET / sends X-Content-Type-Options: nosniff"
+    (Dream.header r0 "X-Content-Type-Options" = Some "nosniff");
   let cookie = cookie_of r0 in
   check "GET / establishes a session cookie" (cookie <> "");
   let b0 = body r0 in
@@ -124,34 +144,41 @@ let () =
   (* Rejection paths. *)
   let forged = post handle ~cookie ~token:"forged" ~path:"/msg" [ ("msg", inc) ] in
   check "a forged csrf token is rejected (403)" (status forged = 403);
+  check "the 403 response still carries the security headers (middleware outermost)"
+    (has_security_headers forged);
   let bad = post handle ~cookie ~token:(csrf_of b3) ~path:"/msg" [ ("msg", "not-a-msg") ] in
   check "an undecodable msg is rejected (400)" (status bad = 400);
+  check "the undecodable msg is served as text/plain (unsniffable)"
+    (Dream.header bad "Content-Type" = Some "text/plain; charset=utf-8");
+  check "the undecodable-msg response also carries the security headers"
+    (has_security_headers bad);
   let missing = post handle ~cookie ~token:(csrf_of b3) ~path:"/msg" [] in
   check "a missing msg field is rejected (400)" (status missing = 400);
 
   Printf.printf "\nThe Dream tier serves the shared app end-to-end (roadmap step 1).\n%!"
 
-(* --- same_origin: the WebSocket handshake guard (roadmap step 3) ---------- *)
+(* --- The WebSocket handshake gate, driven through the full handler --------- *)
 
 (* Browsers do not enforce same-origin on WebSocket connections, so the
-   handshake guard is load-bearing; [Dream.request ~headers] carries Host as a
-   plain header, which is exactly where [Dream.header] reads it back. *)
-let origin_request headers =
-  Dream.request ~method_:`GET ~target:Server.ws_path ~headers ""
-
+   handshake guard is load-bearing. Driving it through [Server.handler] (rather
+   than the old exported bool) proves the whole Proof path: a mismatch or a
+   missing Origin is a 403, and a same-origin handshake reaches [accept_ws] and
+   upgrades (101). [Dream.request ~headers] carries Origin and Host exactly
+   where [Origin_gate.check] reads them back. *)
 let () =
-  check "same_origin accepts a matching http origin"
-    (Server.same_origin
-       (origin_request [ ("Origin", "http://example.com"); ("Host", "example.com") ]));
-  check "same_origin accepts a matching https origin"
-    (Server.same_origin
-       (origin_request [ ("Origin", "https://example.com"); ("Host", "example.com") ]));
-  check "same_origin rejects a mismatched origin"
-    (not
-       (Server.same_origin
-          (origin_request [ ("Origin", "http://evil.example"); ("Host", "example.com") ])));
-  check "same_origin rejects a missing Origin header"
-    (not (Server.same_origin (origin_request [ ("Host", "example.com") ])))
+  let repo = Lwt_main.run (Server.Store.create ()) in
+  let handle = Dream.test (Server.handler repo) in
+  let ws headers = handle (Dream.request ~method_:`GET ~target:Server.ws_path ~headers "") in
+  let cross = ws [ ("Origin", "http://evil.example"); ("Host", "example.com") ] in
+  check "a cross-origin WS handshake is rejected (403)" (status cross = 403);
+  check "the cross-origin WS rejection still carries the security headers"
+    (has_security_headers cross);
+  check "a WS handshake with no Origin is rejected (403)"
+    (status (ws [ ("Host", "example.com") ]) = 403);
+  check "a same-origin http WS handshake upgrades through the Proof path (101)"
+    (status (ws [ ("Origin", "http://example.com"); ("Host", "example.com") ]) = 101);
+  check "a same-origin https WS handshake upgrades through the Proof path (101)"
+    (status (ws [ ("Origin", "https://example.com"); ("Host", "example.com") ]) = 101)
 
 (* --- live_session over a mock transport (roadmap step 3, no socket) ------- *)
 

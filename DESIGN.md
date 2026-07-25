@@ -69,8 +69,13 @@ Toolchain: OCaml 5.3.0, dune 3.24, a dedicated opam switch (`irmin-tea` locally)
   depends only on `repr` (= `Irmin.Type`), so one wire codec serves both tiers
   with zero schema drift. **Core proven** (builds); client tier pending.
 - **T4 - security primitives are module boundaries.** `private`/abstract/phantom
-  types make illegal states uncompilable. **Demonstrated** in `Prim`/`Html`
-  (`on*` attribute names rejected; every boundary value is a validating newtype).
+  types make illegal states uncompilable. **Realized** as `lib/tea_safe` (roadmap
+  step 5, R7): the nine primitives are `.mli` boundaries, the `Proof` capability
+  is a phantom token in a `repr`-free library (unserializable by construction),
+  and the live sinks are wired so a WebSocket accepted without the same-origin
+  check, or a raw store path, does not typecheck. Every boundary value is a
+  validating newtype, `on*` and off-charset attribute names are rejected, and the
+  new rejections are confirmed by mutation.
 
 ## 4. Module layout
 
@@ -240,14 +245,14 @@ Each lean-tea private-constructor primitive → an OCaml `.mli` boundary:
 
 | Primitive | OCaml technique | status |
 |---|---|---|
-| `Proof c` capability | phantom-typed abstract token, minted only in the auth module | designed |
-| SafeAttr / XSS | `Attr_name.of_string` rejects `on*`; values escaped at render | **in `Prim`/`Html`** |
-| SafePath (traversal) | `private string` smart-ctor rejecting `..`/NUL | designed |
-| **SafeQuery → SafeKey** | Irmin has no SQL: `private string` path step, no separator smuggling / namespace escape | designed (smaller surface) |
-| SafeCmd | args as `string list` newtype, never a shell string | designed |
-| Header injection | typed response-header builders | designed |
-| Open redirect | `Url.of_string` = relative-only (**in `Prim`**) + allowlist newtype | **partial** |
-| Clickjacking / CSP | finite sum policy builders (unsafe option is *not a constructor*) | designed |
+| `Proof c` capability | phantom-typed abstract token from a generative mint, in a library that links no `repr` so it is unserializable by construction | **`Tea_safe.Proof`** (live: `Origin_gate`) |
+| SafeAttr / XSS | `Attr_name.of_string` rejects `on*` and now allowlists the name charset (names render unescaped); `Tag.of_string` guards the tag position; values escaped at render | **`Prim`/`Html`, hardened** |
+| SafePath (traversal) | abstract type whose segments provably carry no `..`/`.`/NUL/backslash, none absolute | **`Tea_safe.Safe_path`** (boundary) |
+| **SafeQuery → SafeKey** | Irmin has no SQL: abstract `Step` rejecting separator smuggling / namespace escape, nonempty key by construction | **`Tea_safe.Safe_key`** (wired into `Store`) |
+| SafeCmd | program + argv newtypes, never a shell string (no `to_shell_string` exists) | **`Tea_safe.Safe_cmd`** (boundary) |
+| Header injection | typed response-header builders, CRLF unrepresentable in a value | **`Tea_safe.Header`** |
+| Open redirect | `Url.of_string` = relative-only and now CRLF/backslash-free (Location-clean) + `Redirect` anchored allowlist | **`Prim` hardened + `Tea_safe.Redirect`** |
+| Clickjacking / CSP | finite sum policy builders (unsafe option is *not a constructor*), strict CSP on every response | **`Tea_safe.Security_headers`** (middleware) |
 
 ## 10. Risk register (finder-reported, **unverified** - verify pass did not run)
 
@@ -273,8 +278,15 @@ Each lean-tea private-constructor primitive → an OCaml `.mli` boundary:
 - **R6 (med) - optimistic client replay can diverge from server merge.**
   Mitigation: treat server head as authority; reconcile Msg on divergence.
 - **R7 (med) - security boundary bypass via direct Dream/Irmin/Unix calls, and
-  Proof tokens must never be serialized.** Mitigation: keep `Proof` out of every
-  `Repr.t`; lint for raw sinks.
+  Proof tokens must never be serialized.** **Mitigation shipped** (`lib/tea_safe`,
+  roadmap step 5): the nine primitives are enforced `.mli` boundaries. `Proof`
+  cannot be serialized because `tea_safe` links no `repr`, so no `Repr.t` witness
+  for the token is compilable in-library or derivable outside it. The live sinks
+  are wired: `Origin_gate` mints the capability the WebSocket `accept_ws` demands
+  (a socket accepted without the same-origin check is now uncompilable), `Store`
+  speaks only `Safe_key`, and a `Security_headers` middleware puts a strict CSP on
+  every response. The remaining direct-sink discipline (never call raw
+  Dream/Irmin/Unix past a boundary) stays a review convention.
 
 ## 11. Roadmap
 
@@ -290,6 +302,12 @@ Each lean-tea private-constructor primitive → an OCaml `.mli` boundary:
 4. **Collaboration demo** - a two-session shared doc proving T2 with a real
    `Three_way` merge + the combinator library (R2). **Done** (`lib/tea_core/merge`,
    `Store.fork`, `examples/shared_doc`, `test/merge_test`, `test/collab_test`).
-5. **`tea_safe`** - land the 9 primitives as enforced `.mli` boundaries (R7).
+5. **`tea_safe`** - the 9 security primitives as enforced `.mli` boundaries (R7).
+   **Done** (`lib/tea_safe`: `Proof` capability tokens + its `Origin_gate` live
+   instance, `Safe_key`, `Safe_path`, `Safe_cmd`, `Header`, `Redirect`,
+   `Security_headers`; in-place `Prim` hardening of `Attr_name`/`Tag`/`Url`/
+   `Branch_name` closing the survey's attribute-name-injection, raw-tag, and
+   Location-CRLF gaps; wired into `Store` and `Tea_server`; `test/safe_test`
+   plus extended `server_test`, every new check confirmed by mutation).
 6. **History hygiene** - coalescing + `irmin-pack` + GC retention (R1).
 7. **RPC GADT** + a typed endpoint example.

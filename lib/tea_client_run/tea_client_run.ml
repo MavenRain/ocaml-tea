@@ -197,6 +197,8 @@ module Start (A : Tea_core.App.APP) = struct
     let err_label = function
       | Prim.Url.Empty -> "empty"
       | Prim.Url.Not_relative -> "not relative"
+      | Prim.Url.Backslash -> "contains a backslash"
+      | Prim.Url.Control_char _ -> "contains a control byte"
     in
     Result.fold
       ~ok:(fun url -> A.msg_of_url url |> Option.iter (Vdom_blit.process app))
