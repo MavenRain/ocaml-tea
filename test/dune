@@ -1,3 +1,12 @@
 (tests
- (names persist_test server_test)
- (libraries tea_core tea_persist tea_server counter_app dream lwt lwt.unix))
+ (names persist_test server_test client_test)
+ (libraries
+  tea_core
+  tea_persist
+  tea_server
+  tea_client
+  vdom.base
+  counter_app
+  dream
+  lwt
+  lwt.unix))

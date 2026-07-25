@@ -1,0 +1,4 @@
+(library
+ (name tea_client_run)
+ (modes byte)
+ (libraries tea_client vdom ojs))

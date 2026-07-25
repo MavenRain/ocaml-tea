@@ -21,7 +21,10 @@ toolchain removes an entire tier lean-tea had to hand-write.
 | `lib/tea_server` — Dream wiring (SSR + form-post path) | **built, green** (WS live view still designed, §7) |
 | `test/server_test` — Dream tier end-to-end (sessions, CSRF, undo) | **passes** (confirmed by mutation) |
 | `examples/counter/server` — native Counter server binary | **built** |
-| `lib/tea_client` — vdom + js_of_ocaml | designed (§7), not yet built |
+| `lib/tea_client` — pure `Html.t → vdom` / `Cmd.t → Vdom.Cmd.t` translations | **built, green** (`tea_core` + `vdom.base` only, links natively) |
+| `lib/tea_client_run` — jsoo runtime: mount, `After`/`Navigate` handlers, popstate | **built** (WS live view still designed, §7; `Sub` timers not yet interpreted client-side) |
+| `test/client_test` — translation fidelity via native decoder evaluation | **passes** (confirmed by mutation) |
+| `examples/counter/client` — Counter in the browser (js_of_ocaml) | **built** (`main.bc.js` + `index.html`) |
 | `lib/tea_rpc` — GADT endpoint contract | designed (§8), not yet built |
 | `lib/tea_safe` — the 9 security primitives | designed (§9), stubs pending |
 
@@ -149,6 +152,24 @@ optimistically and rebases pending msgs on each server head (browser mirror of
 Irmin branch semantics). **Lwt is banned client-side** — vdom's callback-based Cmd
 handlers sidestep the known `js_of_ocaml-lwt` rough edges.
 
+**Status: built** for the local MVP (roadmap step 2). The tier is split along
+the native/JS boundary: `tea_client` holds the total translations plus `Make`
+and depends only on `tea_core` + `vdom.base`, so `test/client_test` proves
+translation fidelity *natively* — `On_click` deliberately translates to a
+`Decoder.const`-shaped handler, evaluable off the browser, so the exact Msg is
+recovered in tests without a DOM. `tea_client_run` (byte/js-only) interprets
+the two command extensions (`After` ⇒ `setTimeout`, `Navigate` ⇒
+`history.pushState`), sets the title, mounts onto `document.body`, and
+dispatches `msg_of_url` at load and on `popstate`. One deliberate asymmetry:
+`value` crosses as the DOM *property* (a controlled input must track the
+model on redraw); every other attribute crosses verbatim, as `Render_static`
+prints it. Not yet built: the WS transport + optimistic rebase above (roadmap
+step 3), and a client interpreter for `Sub` timers — an APP using `Sub.every`
+renders but does not tick in the browser until step 3's subscription plumbing.
+`After` timers are fire-and-forget (one mount per page life, no dispose path;
+a future dispose must track and clear them). Lwt-free holds: neither client
+library links `lwt`.
+
 ## 8. Shared RPC contract — designed
 
 A two-parameter GADT `('req,'resp) api` enumerating endpoints, over a single
@@ -201,7 +222,8 @@ Each lean-tea private-constructor primitive → an OCaml `.mli` boundary:
 1. **Server MVP** — `tea_server` + Counter served over Dream (SSR + form-post
    update path), no WS yet. **Done** (`tea_server.ml`, `server_test`).
 2. **Client MVP** — `tea_client` + `Html.t → vdom`, Counter in the browser off
-   the same `Counter_app`.
+   the same `Counter_app`. **Done** (`tea_client`, `tea_client_run`,
+   `client_test`, `examples/counter/client`).
 3. **Live view** — `Sub.Store_watch` ⇒ `S.watch` ⇒ WebSocket ⇒ `Vdom_blit.process`.
 4. **Collaboration demo** — a two-session shared doc proving T2 with a real
    `Three_way` merge + the combinator library (R2).

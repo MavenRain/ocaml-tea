@@ -1,0 +1,3 @@
+(library
+ (name tea_client)
+ (libraries tea_core vdom.base))
