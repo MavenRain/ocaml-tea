@@ -35,6 +35,7 @@ toolchain removes an entire tier lean-tea had to hand-write.
 | `lib/tea_client/reconnect` + `rebase` + `local_channel` - pure link state machine, outbox/rebase, client-local channel | **built, green** (roadmap step 8, D8/D9/D10-client) |
 | `lib/tea_core/local` - the `LOCAL` companion contract + the empty companion | **built, green** (roadmap step 8, D10) |
 | `test/client_reconnect_test`, `test/client_channel_test` - step-8 P6 suite | **passes** (confirmed by mutation) |
+| `test/browser/smoke.mjs` - Playwright end-to-end smoke over the real compiled server binaries | **passes, 8 ok / 1 xfail** (confirmed by mutation; roadmap step 8, D13) |
 
 Toolchain: OCaml 5.3.0, dune 3.24, a dedicated opam switch (`irmin-tea` locally) with
 `irmin 3.11`, `dream 1.0.0~alpha8`, `repr 0.8`, `vdom 0.3`, `js_of_ocaml 6.4`.
@@ -308,8 +309,57 @@ merely performs:
 The server head remains the authority (R6) wherever the app's merge policy has
 no way to keep both sides: `reconcile` under `Last_write_wins` is the incoming
 head unchanged, and a `Three_way` conflict yields to it. Under `Crdt_join`
-nothing is lost. Remaining client residual: the browser smoke test is still
-not run (roadmap step 8, P7).
+nothing is lost.
+
+- **D13, `test/browser/smoke.mjs`.** The browser smoke test (roadmap step 8,
+  P7), driving the real compiled server binaries with a real Chromium. It is
+  the only test that observes the tiers being *connected* rather than merely
+  correct: the jsoo bundle mounting, the socket dialling, a click reaching the
+  store, a commit streaming back into a second tab, an XHR decoding a typed
+  reply, and a browser attaching the `Origin` header D12 demands. Deliberately
+  outside `dune runtest` (node + a ~150MB Chromium + two ports would make the
+  OCaml suite fail on any machine with only the OCaml toolchain); run it with
+  `test/browser/run.sh`. Its assertion primitive samples the observable
+  *before* the action and refuses to pass if the wanted condition already held,
+  because a browser test is the easiest kind to write vacuously; each check is
+  confirmed by `test/browser/mutate.py`.
+
+> **D14 - the acting tab double-counts its own PN-counter dot. Found by D13 on
+> its first run; open.** A locally-born msg is applied twice under two
+> *different* CRDT replica ids: once optimistically on the client, whose `ctx`
+> mints under the constant id `"client"` (`tea_client.ml`), and once on the
+> server, which applies the very same forwarded msg under the session-branch
+> id. `Rebase.reconcile` then *joins* the two states, and a `Pn_counter` join
+> sums across replica slots. Characterized exactly: displayed = server truth +
+> that tab's own local dots, so an acting tab reads 2x an observer tab (1/2,
+> 2/4, 3/6 confirmed), and a reload - which discards the local dots - snaps it
+> back to the truth.
+>
+> The root cause is a category error, not a merge bug: **the client is not a
+> replica, it is a predictor of the server's replica.** Its wall source is
+> already `0` precisely so it can never win an LWW tie-break (§7, R6), which is
+> the same admission made halfway. `Lww` and `Or_set` survive the double-apply
+> (higher stamp wins; the set dedups by element), so `Pn_counter` - the one
+> CRDT whose op is not idempotent under re-application - is where it surfaces.
+> Note this also falsifies the safety claim in `rebase.mli`'s outbox doc, that
+> a re-delivered edit "joins idempotently rather than counting twice": state
+> join is idempotent, but *replaying an op* at a second replica is not. Today
+> that claim is carried by send-once actually holding, not by the CRDTs.
+>
+> Three candidate fixes, in the order they were considered:
+> 1. **Share the replica id.** The server tells the client the session-branch
+>    replica id, and the client mints under it - so the optimistic state is a
+>    prediction of the *same* slot and `join` becomes a per-slot `max`: no
+>    double count, and an unconfirmed local edit still survives (the client's
+>    slot is simply ahead). Principled, and the only option that keeps both
+>    properties. Costs a wire addition and a boot-order decision (what id
+>    edits made before the announcement use), which is why it is a phase and
+>    not a patch.
+> 2. **Drop local dots on an incoming head** (`reconcile` = `incoming` under
+>    `Crdt_join`). One line, but it re-opens exactly the clobber D9 exists to
+>    close: an in-flight edit flickers away until its own echo returns.
+> 3. **Don't apply forwarded msgs optimistically.** Correct, and it throws away
+>    the optimistic UI.
 
 ## 8. Shared RPC contract - built (roadmap step 7; hardened step 8, D11/D12)
 
@@ -580,4 +630,17 @@ Each lean-tea private-constructor primitive → an OCaml `.mli` boundary:
    `Tea_client_run.Start_local` and `Start = Start_local (A) (Local_none (A))`;
    `shared_doc`'s stats readout moved into a `Local` companion;
    `test/client_reconnect_test` + `test/client_channel_test`, every new check
-   confirmed by mutation. **P7 remaining**: the browser smoke test.
+   confirmed by mutation. **P7 done** - D13, the browser smoke test
+   (`test/browser/smoke.mjs` + `run.sh` + `mutate.py`): two scenarios over the
+   real compiled binaries and a real Chromium (counter live view across two
+   tabs on one session cookie; shared_doc `Doc_stats` over the jsoo XHR path
+   and a browser-issued same-origin `Append_tag` through the D12 gate), 8 ok /
+   1 xfail, all four mutations caught. Step 8 is **complete** as scoped.
+
+   P7 closes the oldest residual in this file, and it paid for itself on the
+   first run by finding **D14** (§7): the acting tab double-counts its own
+   PN-counter dot, because the client and the server apply one msg under two
+   different replica ids. Every in-process test passes, because no in-process
+   test can see both applications at once. That is the next phase, and the
+   smoke test pins the current behaviour as an `xfail` so the fix cannot land
+   without coming back through it.

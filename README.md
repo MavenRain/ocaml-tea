@@ -65,6 +65,26 @@ ok   - reload after undo -> count = 2
 All persistence invariants hold (T1 proven end-to-end).
 ```
 
+### The browser smoke test
+
+`dune runtest` is hermetic: it links the tiers and drives them in-process, which
+proves they are correct but not that they are *connected*. The end-to-end gate
+runs the real compiled server binaries against a real Chromium, and lives
+outside dune so the OCaml suite still passes on a machine without a browser
+toolchain:
+
+```sh
+(cd test/browser && npm install)   # once: playwright + its Chromium
+test/browser/run.sh                # dune build, then the smoke test
+python3 test/browser/mutate.py     # confirm each check by mutation
+```
+
+It opens two tabs on one session and asserts a click in one reaches the other
+purely over the live-view WebSocket, then round-trips a typed RPC through the
+compiled jsoo XHR path and a browser-issued same-origin mutating POST. One
+check is an `xfail` pinning a known bug (D14 in `DESIGN.md`, found by this
+test): the acting tab double-counts its own PN-counter dot.
+
 If you're setting up from scratch on a new machine, create a switch (e.g. `opam switch create ocaml-tea 5.3.0`); it needs the system
 libraries `pkgconf`, `libev`, `libffi` (`brew install pkgconf libev libffi`),
 then `opam install irmin irmin-git dream js_of_ocaml vdom`.
