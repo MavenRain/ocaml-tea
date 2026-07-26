@@ -32,6 +32,9 @@ toolchain removes an entire tier lean-tea had to hand-write.
 | `lib/tea_persist/clock` + `store_core` - monotonic commit clock, backend-generic store, coalescing, checkpoint | **built, green** (roadmap step 6) |
 | `lib/tea_persist_pack` - irmin-pack backend + GC behind a retained checkpoint | **built, green; `test/pack_test` passes** |
 | `test/clock_test`, `test/dedup_test`, `test/coalesce_test`, `test/pack_test` - step-6 suite | **passes** (confirmed by mutation) |
+| `lib/tea_client/reconnect` + `rebase` + `local_channel` - pure link state machine, outbox/rebase, client-local channel | **built, green** (roadmap step 8, D8/D9/D10-client) |
+| `lib/tea_core/local` - the `LOCAL` companion contract + the empty companion | **built, green** (roadmap step 8, D10) |
+| `test/client_reconnect_test`, `test/client_channel_test` - step-8 P6 suite | **passes** (confirmed by mutation) |
 
 Toolchain: OCaml 5.3.0, dune 3.24, a dedicated opam switch (`irmin-tea` locally) with
 `irmin 3.11`, `dream 1.0.0~alpha8`, `repr 0.8`, `vdom 0.3`, `js_of_ocaml 6.4`.
@@ -261,12 +264,52 @@ local `update` applies immediately, the server commits the same Msg, and the
 committed head returns as a `Store_watch` frame); remote-born msgs are fenced
 by an `applying_remote` flag - sound because `Vdom_blit.process` runs
 `update` synchronously - so a pushed head can never echo back up the socket.
-The server head is the authority (R6): a frame overwrites optimistic local
-state; there is no rebase buffer for in-flight msgs yet (step 4 territory).
-Residuals: no auto-reconnect (socket close logs to the console); msgs born
-while the socket is still `Connecting` apply locally only, audibly; timer- and
-`After`-born msgs are mirrored like any other, so a chatty `Sub.every` app
-commits on every tick (R1 - coalescing is roadmap step 6).
+Timer- and `After`-born msgs are mirrored like any other, so a chatty
+`Sub.every` app commits on every tick (R1 - coalescing is roadmap step 6).
+
+**Reconnect, rebase and the local channel: built** (roadmap step 8,
+D8/D9/D10-client). The three standing residuals of the paragraph above are
+closed, each by a pure module in `tea_client` that the js_of_ocaml runtime
+merely performs:
+
+- **D8, `Reconnect`.** `socket : WS.t option` became a four-state machine
+  `Down | Opening | Up | Waiting`, over *abstract* socket and timer types so
+  it links natively. A close reopens on an exponential ladder (500ms,
+  doubling, capped at 30s) carried in the `Opening`/`Waiting` states - it has
+  to ride `Opening` too, or the escalation is lost at exactly the
+  `Waiting -> Opening` step and a server that refuses every connection is
+  retried at 500ms forever. Reaching `Up` resets the ladder, because that is
+  the evidence the server is reachable. Every close is matched by **physical**
+  equality against the socket the machine holds: a superseded socket's close
+  event arrives *after* its replacement is already opening, and acting on it
+  would tear the healthy socket down and arm a second timer. `Waiting` counts
+  as active for `Subs.plan`, or a merely-pending reconnect would be torn down
+  and rebuilt on the next update.
+- **D9, `Rebase`.** A msg born while the link is not `Up` now waits in an
+  outbox and is replayed in order on reconnect, instead of applying locally
+  and being logged as lost. `Opening` deliberately does not count as sendable:
+  a `send` on a CONNECTING socket raises. Replay is send-once by construction
+  (a buffered msg is one the server never received) and idempotent anyway
+  under D1's joins. On the way in, a pushed head is `reconcile`d against the
+  model this tab holds, under the app's own `Merge_spec.t`, before the
+  `Store_watch` subscription ever sees it - the head does not contain the
+  outbox's edits, so handing it over raw was a clobber.
+- **D10 (client half), `Tea_core.Local` + `Local_channel`.** Per-client state
+  (an RPC reply, a UI toggle) gets a home that is not the replicated model. A
+  companion answers `Some` to claim a msg - local half only, and **not**
+  mirrored up the socket - or `None` to decline it to `App.update`. The
+  dispatch runs through `Result.fold` rather than `Option.fold` precisely
+  because the latter's `~none:` is a *value*: evaluating the declined branch
+  anyway would mint a CRDT dot for an edit the app never made, which is
+  invisible in the returned state and is therefore pinned by its own mutation.
+  `Start (A) = Start_local (A) (Local_none (A))`, so there is one mount path
+  rather than two that can drift.
+
+The server head remains the authority (R6) wherever the app's merge policy has
+no way to keep both sides: `reconcile` under `Last_write_wins` is the incoming
+head unchanged, and a `Three_way` conflict yields to it. Under `Crdt_join`
+nothing is lost. Remaining client residual: the browser smoke test is still
+not run (roadmap step 8, P7).
 
 ## 8. Shared RPC contract - built (roadmap step 7; hardened step 8, D11/D12)
 
@@ -412,7 +455,16 @@ Each lean-tea private-constructor primitive → an OCaml `.mli` boundary:
   correctness (T3) depends on it. Mitigation: a native-vs-jsoo round-trip
   conformance test in CI.
 - **R6 (med) - optimistic client replay can diverge from server merge.**
-  Mitigation: treat server head as authority; reconcile Msg on divergence.
+  **Mitigation shipped** (roadmap step 8, D9): an incoming head is no longer
+  applied raw. `Tea_client.Rebase.reconcile` folds it into the model the tab is
+  holding under the app's own `Merge_spec.t`, and edits made while the link was
+  down wait in an outbox and replay in order once it is back. Under `Crdt_join`
+  the fold is lossless *and* idempotent, so replaying a local edit onto a newer
+  head converges however the two interleave. The residual is now honest and
+  policy-shaped rather than runtime-shaped: under `Last_write_wins` there is no
+  operation that could keep both sides, so the server head still wins outright,
+  and a `Three_way` conflict yields to it rather than stranding the tab on a
+  divergent local state.
 - **R7 (med) - security boundary bypass via direct Dream/Irmin/Unix calls, and
   Proof tokens must never be serialized.** **Mitigation shipped** (`lib/tea_safe`,
   roadmap step 5): the nine primitives are enforced `.mli` boundaries. `Proof`
@@ -486,7 +538,8 @@ Each lean-tea private-constructor primitive → an OCaml `.mli` boundary:
 3. **Live view** - `Sub.Store_watch` ⇒ `S.watch` ⇒ WebSocket ⇒
    `Vdom_blit.process`. **Done** (`Wire`, `Store.watch`, `live_session` +
    same-origin gate, `Tea_client.Subs`, the `Start` sub interpreter, counter
-   `Sync`); no client rebase buffer yet (→ step 4), no auto-reconnect.
+   `Sync`); the rebase buffer and auto-reconnect it deferred landed in step 8
+   (D8/D9, §7).
 4. **Collaboration demo** - a two-session shared doc proving T2 with a real
    `Three_way` merge + the combinator library (R2). **Done** (`lib/tea_core/merge`,
    `Store.fork`, `examples/shared_doc`, `test/merge_test`, `test/collab_test`).
@@ -514,3 +567,17 @@ Each lean-tea private-constructor primitive → an OCaml `.mli` boundary:
    `examples/shared_doc` `History_count`/`Doc_stats`; `test/rpc_test` plus
    `server_test`/`client_test` additions, every new check confirmed by
    mutation).
+8. **Deferral backlog** - the twelve deferrals recorded by steps 1-7, worked in
+   phases. **P1-P5 done** (D1/D6/D10-shared CvRDT model + exploded tree;
+   D7/D2-D5 clock hoist, pack-backed serving, session reaper, retention ring,
+   archive GC; D11/D12 streaming body cap + Origin-gated mutating endpoints).
+   **P6 done** - the client tier's three residuals: `Tea_client.Reconnect`
+   (D8, four-state link + 500ms→30s backoff ladder + physical-equality stale
+   guard), `Tea_client.Rebase` (D9, FIFO outbox replayed on reconnect + an
+   incoming head reconciled under the app's own `Merge_spec.t`),
+   `Tea_core.Local` + `Tea_client.Local_channel` (D10 client half, the
+   per-client companion whose claimed msgs never cross the socket) with
+   `Tea_client_run.Start_local` and `Start = Start_local (A) (Local_none (A))`;
+   `shared_doc`'s stats readout moved into a `Local` companion;
+   `test/client_reconnect_test` + `test/client_channel_test`, every new check
+   confirmed by mutation. **P7 remaining**: the browser smoke test.

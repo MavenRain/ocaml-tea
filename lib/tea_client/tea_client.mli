@@ -8,6 +8,17 @@
     effectful half (mounting, command interpreters) lives in [Tea_client_run],
     which is js_of_ocaml-only. *)
 
+(** {2 Pure client-tier logic}
+
+    Three modules that own decisions the runtime used to make inline against
+    live browser objects, and that are therefore now testable off the browser:
+    when to reconnect a dropped socket, what to do with edits made while it was
+    down, and how a client-local companion splits the message stream. *)
+
+module Reconnect = Reconnect
+module Rebase = Rebase
+module Local_channel = Local_channel
+
 (** {2 Client command extensions}
 
     [Vdom.Cmd.t] is an open (extensible) type whose built-in constructors
@@ -96,4 +107,28 @@ module Make (A : Tea_core.App.APP) : sig
       argument flip: vdom's update is [model -> msg], ours is [msg -> model]).
       Mount it with [Tea_client_run.Start] (or [Vdom_blit.run] directly). *)
   val app : (A.model, A.msg) Vdom.app
+end
+
+(** [A] paired with a client-local companion (roadmap step 8, D10): the same
+    lift as {!Make}, but over {!Local_channel.Make}'s two-half state, and with
+    the local/shared {!Local_channel.channel} exposed so the mounting runtime
+    can decide whether to mirror a message up the live socket.
+
+    [Make_local (A) (Tea_core.Local.None_ (A))] is {!Make} with an extra [unit]
+    beside the model - which is why [Tea_client_run.Start] is defined as
+    exactly that, instead of a second code path to keep in step. *)
+module Make_local
+    (A : Tea_core.App.APP)
+    (L : Tea_core.Local.LOCAL with type shared = A.model and type msg = A.msg) : sig
+  type state = Local_channel.Make(A)(L).state
+
+  val shared : state -> A.model
+  val local : state -> L.local
+
+  (** One step, with the channel {!app} has nowhere to put. The runtime calls
+      this rather than [app.update] so that a companion-claimed message is
+      never mirrored to peers. *)
+  val step : A.msg -> state -> state * A.msg Vdom.Cmd.t * Local_channel.channel
+
+  val app : (state, A.msg) Vdom.app
 end

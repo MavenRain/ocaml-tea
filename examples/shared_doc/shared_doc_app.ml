@@ -148,7 +148,12 @@ module App = struct
           ~reply:(fun reply -> Got_stats reply) )
     | Got_stats (_ : (Shared_doc_rpc.stats_resp, Tea_rpc.error) result) -> (model, Cmd.none)
 
-  let view model =
+  (* The one seam the D10 companion needs: everything about the page is shared
+     except the stats readout, which is per-client. Parameterising the view
+     here (rather than letting the companion rebuild the page) keeps ONE view
+     definition  -  a second copy would drift, and the point of D10 is that local
+     state costs an extra argument, not an extra UI. *)
+  let view_with ~(stats_line : msg Html.t) model =
     let open Html in
     let tag_li t = li [ text t; button ~attrs:[ on_click (Remove_tag t) ] [ text " ×" ] ] in
     let add_tag_button t = button ~attrs:[ on_click (Add_tag t) ] [ text ("+ " ^ t) ] in
@@ -176,11 +181,14 @@ module App = struct
       ; div
           ~attrs:[ class_ "stats" ]
           [ button ~attrs:[ on_click Request_stats ] [ text "Stats" ]
-          ; span
-              ~attrs:[ class_ "stats-line" ]
-              [ text "per-client stats land in a later phase" ]
+          ; span ~attrs:[ class_ "stats-line" ] [ stats_line ]
           ]
       ]
+
+  (* The [APP] view: no companion, so no stats to show. A tab mounted with
+     {!Local} below overrides exactly this one node. *)
+  let view model =
+    view_with ~stats_line:(Html.text "stats are a per-client readout") model
 
   let subscriptions _model = Sub.store_watch (fun m -> Sync_doc m)
 
@@ -225,3 +233,76 @@ end
 (* Left unsealed above so servers/clients/tests can name the Msg constructors,
    but statically proven to satisfy the framework contract: *)
 module _ : Tea_core.App.APP = App
+
+(** The client-local companion (roadmap step 8, D10 client half): the home the
+    stats readout never had.
+
+    D1 removed [last_stats] from the replicated model, because an RPC reply
+    computed from {i this} tab's title and body is not a fact about the
+    document  -  replicating it would push one user's readout into every peer's
+    view and demand a CRDT join for a value that has no meaningful one. The
+    intervening phases left [Request_stats]/[Got_stats] as identity on the
+    shared model, which is to say: the button did nothing. This module is where
+    they land instead.
+
+    Both messages are claimed, so neither crosses the live socket: the request
+    is issued from here (the companion can read the shared doc, which is all
+    {!Shared_doc_rpc.Doc_stats} needs), and the reply is consumed here. A peer
+    never learns that this tab asked. *)
+module Local = struct
+  (* Aliases rather than [open Tea_core]: the framework has an [App] module of
+     its own, and opening it here would shadow this file's [App] with a
+     signature that has no [model]. *)
+  module Cmd = Tea_core.Cmd
+  module Html = Tea_core.Html
+
+  type shared = App.model
+  type msg = App.msg
+
+  (** The readout as displayed, plus nothing else. Deliberately a rendered
+      string rather than a [stats_resp option]: there is no state machine here
+      to get wrong, and "asked but not answered" is a third display value that
+      an [option] would have to encode as [None] alongside "never asked". *)
+  type local = { stats_line : string }
+
+  let init = { stats_line = "no stats yet" }
+
+  let rendered (reply : (Shared_doc_rpc.stats_resp, Tea_rpc.error) result) : string =
+    Result.fold reply
+      ~ok:(fun (s : Shared_doc_rpc.stats_resp) ->
+        Printf.sprintf "%d chars in the title, %d words in the body" s.title_len
+          s.word_count)
+      ~error:(fun (e : Tea_rpc.error) ->
+        match e with
+        | Tea_rpc.Transport (_ : Cmd.http_failure) -> "stats unavailable (transport)"
+        | Tea_rpc.Decode (_ : string) -> "stats unavailable (undecodable reply)")
+
+  (* The prior [local] is never read: every claimed msg replaces the readout
+     outright, so this companion is a function of the message alone. A
+     companion that accumulated (a request counter, a history) would use it. *)
+  let update (m : msg) (shared : shared) (_ : local) : (local * msg Cmd.t) option =
+    match m with
+    | App.Request_stats ->
+      Some
+        ( { stats_line = "asking..." }
+        , App.R.call Shared_doc_rpc.Doc_stats
+            { Shared_doc_rpc.title = App.title_of shared; body = App.body_of shared }
+            ~reply:(fun reply -> App.Got_stats reply) )
+    | App.Got_stats reply -> Some ({ stats_line = rendered reply }, Cmd.none)
+    (* Every shared edit declines: it belongs to the document, and declining is
+       what forwards it to peers. Listed constructor by constructor so a new
+       Msg is a compile error here, not a silently unmirrored edit. *)
+    | App.Set_title (_ : string)
+    | App.Set_body (_ : string)
+    | App.Like
+    | App.Unlike
+    | App.Add_tag (_ : string)
+    | App.Remove_tag (_ : string)
+    | App.Sync_doc (_ : App.model) -> None
+
+  let view (shared : shared) (local : local) : msg Html.t =
+    App.view_with ~stats_line:(Html.text local.stats_line) shared
+end
+
+module _ : Tea_core.Local.LOCAL with type shared = App.model and type msg = App.msg =
+  Local

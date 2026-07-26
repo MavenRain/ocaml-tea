@@ -2,6 +2,13 @@ module Html = Tea_core.Html
 module Cmd = Tea_core.Cmd
 module Prim = Tea_core.Prim
 
+(* The library's pure client-tier logic, re-exported through the main module so
+   the runtime and the native tests can reach it (dune hides every other module
+   of a library that has a module of its own name). *)
+module Reconnect = Reconnect
+module Rebase = Rebase
+module Local_channel = Local_channel
+
 type 'msg Vdom.Cmd.t +=
   | After of int * 'msg
   | Navigate of string
@@ -84,19 +91,22 @@ module Subs = struct
     , List.filter (fun k -> not (List.exists (equal_key k) wanted)) active )
 end
 
-module Make (A : Tea_core.App.APP) = struct
-  (* The client tab's single CRDT context (roadmap step 8, D1): one replica id
-     for every locally-born edit, minting dots from a local monotonic clock.
-     The wall source is [0] here (this half links natively and has no browser
-     clock); server stamps are real wall-seconds and therefore dominate, so a
-     pushed [Sync] head is authoritative on any LWW field (R6). A future phase
-     (D8/D9, tea_client_run) seeds this clock from the browser and owns
-     reconnect/rebase. *)
-  let ctx =
-    let clock = Tea_core.Clock.create ~now:(fun () -> 0L) in
-    let replica = Tea_core.Crdt.Replica.v (Tea_core.Prim.Session_id.v "client") in
-    Tea_core.Crdt.Ctx.v ~clock ~replica
+(* The client tab's single CRDT context (roadmap step 8, D1): one replica id
+   for every locally-born edit, minting dots from a local monotonic clock. The
+   wall source is [0] here (this half links natively and has no browser clock);
+   server stamps are real wall-seconds and therefore dominate, so a pushed
+   [Sync] head is authoritative on any LWW field (R6).
 
+   Hoisted out of {!Make} in D10 so {!Make_local} shares the identity rather
+   than minting a second replica for the same tab: two contexts would make a
+   tab's own local and shared halves look like distinct replicas to the CRDT
+   layer. One tab, one replica, whatever it is mounted with. *)
+let ctx =
+  let clock = Tea_core.Clock.create ~now:(fun () -> 0L) in
+  let replica = Tea_core.Crdt.Replica.v (Tea_core.Prim.Session_id.v "client") in
+  Tea_core.Crdt.Ctx.v ~clock ~replica
+
+module Make (A : Tea_core.App.APP) = struct
   let app =
     let model, cmd = A.init in
     Vdom.app
@@ -105,5 +115,35 @@ module Make (A : Tea_core.App.APP) = struct
         let model', cmd = A.update ctx msg model in
         (model', cmd_to_vdom cmd))
       ~view:(fun model -> html_to_vdom (A.view model))
+      ()
+end
+
+module Make_local
+    (A : Tea_core.App.APP)
+    (L : Tea_core.Local.LOCAL with type shared = A.model and type msg = A.msg) =
+struct
+  module P = Local_channel.Make (A) (L)
+
+  type state = P.state
+
+  let shared (s : state) : A.model = s.P.shared
+  let local (s : state) : L.local = s.P.local
+
+  (* The channel is surfaced beside the vdom pair because [Vdom.app]'s update
+     has no room for it, and the runtime needs it: it is precisely the "mirror
+     this msg up the socket?" decision. {!app} below drops it; the mounting
+     runtime calls this instead. *)
+  let step (msg : A.msg) (state : state) : state * A.msg Vdom.Cmd.t * Local_channel.channel =
+    let s = P.update ctx msg state in
+    (s.P.state, cmd_to_vdom s.P.cmd, s.P.channel)
+
+  let app =
+    let state, cmd = P.init in
+    Vdom.app
+      ~init:(state, cmd_to_vdom cmd)
+      ~update:(fun state msg ->
+        let state', vcmd, (_ : Local_channel.channel) = step msg state in
+        (state', vcmd))
+      ~view:(fun state -> html_to_vdom (P.view state))
       ()
 end
