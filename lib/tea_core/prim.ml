@@ -145,6 +145,22 @@ module Session_id = struct
     else Some s
 
   let to_string t = t
+  let compare = String.compare
+end
+
+module Retention = struct
+  type t = int
+
+  let of_int n = if n > 0 then Some n else None
+  let default = 8
+  let to_int t = t
+end
+
+module Ttl = struct
+  type t = float
+
+  let of_seconds s = if s > 0. then Some s else None
+  let to_seconds t = t
 end
 
 module Branch_name = struct

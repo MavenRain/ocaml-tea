@@ -51,7 +51,18 @@ module type CORE = sig
   val apply : session -> msg -> model Lwt.t
   val head_ref : session -> Tea_core.Prim.Commit_ref.t option Lwt.t
   val history : session -> Tea_core.Prim.Commit_ref.t list Lwt.t
+
   val undo : session -> model option Lwt.t
+  (** Move the branch head back one commit, returning the restored model
+      ([None] at the root). Crash-safe (D3): the pre-undo head is recorded on
+      the session's durable [redo-] ref {i before} the head moves, so a crash
+      strands only a harmless redo pointer, never a moved head with no way
+      back. *)
+
+  val redo : session -> model option Lwt.t
+  (** Undo's inverse: move the head forward onto the session's durable redo
+      pointer and clear it ([None] when there is nothing to redo). *)
+
   val model_at : S.commit -> model Lwt.t
 
   type watch = S.watch
@@ -80,6 +91,25 @@ module type CORE = sig
       concurrent writer won; the squash minted nothing visible and the caller
       may retry. Note a checkpoint severs merge ancestry with branches forked
       {i before} it — fork after checkpointing, or merge first. *)
+
+  module Retention = Tea_core.Prim.Retention
+
+  val retain : t -> retention:Retention.t -> checkpoint -> checkpoint Lwt.t
+  (** Link a [checkpoint] onto the durable [__checkpoints] spine (a chain, each
+      entry parented on the prior) and return the single GC [~retain] anchor:
+      the [K]-th checkpoint from the head, [K = Retention.to_int retention].
+      Retaining it keeps the last [K] checkpoints and everything newer; older
+      spine entries become collectible. The spine ref persists across restart
+      (D4). *)
+
+  val checkpoints_head : t -> checkpoint option Lwt.t
+  (** The current head of the durable checkpoint spine, if any. *)
+
+  val reap : t -> ttl:Tea_core.Prim.Ttl.t -> now:int64 -> int Lwt.t
+  (** Sweep expired session branches: remove every non-reserved branch whose
+      head [Info] date (a {!Clock} stamp) is older than [now - ttl]; [main],
+      the [__checkpoints] spine and every [redo-] pointer are never swept.
+      Returns the number removed (D3). *)
 
   (** Commit coalescing (R1): fold a run of chatty Msgs into one commit by
       amending the head — same parents, new tree, relabelled — while the

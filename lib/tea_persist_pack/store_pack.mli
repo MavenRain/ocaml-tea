@@ -18,11 +18,20 @@ end
 module Make (A : Tea_core.App.APP) : sig
   include Tea_persist.Store_core.CORE with type model = A.model and type msg = A.msg
 
-  val create : ?now:(unit -> int64) -> Root.t -> t Lwt.t
+  val create : ?now:(unit -> int64) -> ?lower_root:string -> Root.t -> t Lwt.t
   (** Open (or initialise) the pack store at [Root]. Always configured with
       [Indexing_strategy.minimal], so delete-mode GC stays allowed for the
       root's entire life — an [always]-indexed root is permanently poisoned
-      against GC. Call {!close} before exit. *)
+      against GC. Call {!close} before exit.
+
+      [?lower_root] configures a lower-layer directory (its parent must exist);
+      GC then archives discarded data there instead of deleting it, so
+      pre-checkpoint commits stay readable ([Gc.behaviour] becomes [`Archive]).
+      Omitted, GC deletes (D5). *)
+
+  val gc_behaviour : t -> [ `Archive | `Delete ]
+  (** [`Archive] when a [lower_root] was configured (GC moves discarded data to
+      the lower layer), [`Delete] otherwise. Observable without running a GC. *)
 
   type gc_error =
     | Gc_disallowed

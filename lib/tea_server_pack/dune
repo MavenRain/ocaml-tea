@@ -1,0 +1,3 @@
+(library
+ (name tea_server_pack)
+ (libraries tea_core tea_safe tea_server tea_persist tea_persist_pack dream lwt lwt.unix))

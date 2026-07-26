@@ -51,6 +51,7 @@ module type CORE = sig
   val head_ref : session -> Tea_core.Prim.Commit_ref.t option Lwt.t
   val history : session -> Tea_core.Prim.Commit_ref.t list Lwt.t
   val undo : session -> model option Lwt.t
+  val redo : session -> model option Lwt.t
   val model_at : S.commit -> model Lwt.t
 
   type watch = S.watch
@@ -70,6 +71,12 @@ module type CORE = sig
     | Branch_moved
 
   val checkpoint : session -> label:string -> (checkpoint, checkpoint_error) result Lwt.t
+
+  module Retention = Tea_core.Prim.Retention
+
+  val retain : t -> retention:Retention.t -> checkpoint -> checkpoint Lwt.t
+  val checkpoints_head : t -> checkpoint option Lwt.t
+  val reap : t -> ttl:Tea_core.Prim.Ttl.t -> now:int64 -> int Lwt.t
 
   module Coalescer : sig
     type t
@@ -101,11 +108,13 @@ struct
     }
 
   (** A handle onto one session's branch. [clock] is shared by reference with
-      the owning {!t}: one handle, one date order. *)
+      the owning {!t}: one handle, one date order. [name] is the branch's ref
+      name, kept so undo can mint the session's durable [redo-] pointer (D3). *)
   type session =
     { repo : S.repo
     ; branch : S.t
     ; clock : Clock.t
+    ; name : string
     }
 
   (* Typed store key: a compile-time-literal step, dropped to Irmin's raw
@@ -113,6 +122,27 @@ struct
      [\[ "model" \]]; the byte-compat pin lives in [test/safe_test]. *)
   let model_path = Tea_safe.Safe_key.(root (Step.v "model"))
   let model_path_raw = Tea_safe.Safe_key.to_steps model_path
+
+  module Retention = Tea_core.Prim.Retention
+
+  (* Reserved branch refs the reaper (D3) must never sweep and the retention
+     spine (D4) reads. The durable checkpoint chain lives on [spine_branch];
+     each undo mints a durable redo pointer on [redo_prefix ^ session-name].
+     The [Irmin.Branch.String] grammar admits only [A-Za-z0-9-_.], so the
+     spec-sketch's ["redo/<sid>"] with a '/' is not a legal ref here; the
+     '/'-free [redo-] prefix is the adaptation (documented deviation). *)
+  let spine_branch = "__checkpoints"
+  let spine_label = "checkpoint"
+  let redo_prefix = "redo-"
+  let redo_ref_name (s : session) : string = redo_prefix ^ s.name
+
+  (* A ref the reaper leaves alone: the canonical [main] branch, the retention
+     spine, and every [redo-] pointer. Session branches (["session-<hex>"]) are
+     the only sweepable refs. *)
+  let is_reserved (name : string) : bool =
+    String.equal name (Tea_core.Prim.Branch_name.(to_string main))
+    || String.equal name spine_branch
+    || String.starts_with ~prefix:redo_prefix name
 
   let default_now () : int64 = Int64.of_float (Unix.gettimeofday ())
 
@@ -136,11 +166,12 @@ struct
   let session (t : t) (sid : Tea_core.Prim.Session_id.t) : session Lwt.t =
     let name = Tea_core.Prim.Branch_name.(to_string (of_session sid)) in
     let* branch = S.of_branch t.repo name in
-    Lwt.return { repo = t.repo; branch; clock = t.clock }
+    Lwt.return { repo = t.repo; branch; clock = t.clock; name }
 
   let main_session (t : t) : session Lwt.t =
+    let name = Tea_core.Prim.Branch_name.(to_string main) in
     let* branch = S.main t.repo in
-    Lwt.return { repo = t.repo; branch; clock = t.clock }
+    Lwt.return { repo = t.repo; branch; clock = t.clock; name }
 
   (** Fork a fresh session branch off another session's current head, so the
       two branches share that commit as their single common ancestor. This is
@@ -220,22 +251,38 @@ struct
     | Some c -> walk c []
 
   (** Move the branch head back one commit. Returns the restored model, or
-      [None] when already at the root. *)
+      [None] when already at the root. Crash-safe redo (D3): the pre-undo head
+      is durably recorded on the session's [redo-] ref {i before} the head
+      moves back (write-ref-first). A crash between the two strands only a
+      harmless redo pointer at [c] — which is still the branch head until the
+      move lands — instead of a moved head with no way back and an orphaned
+      commit. *)
   let undo (s : session) : A.model option Lwt.t =
     let* head = S.Head.find s.branch in
-    match head with
-    | None -> Lwt.return None
-    | Some c -> (
-      match S.Commit.parents c with
-      | [] -> Lwt.return None
-      | pkey :: _ -> (
-        let* p = commit_of_key_opt s.repo pkey in
-        match p with
-        | None -> Lwt.return None
-        | Some pc ->
-          let* () = S.Head.set s.branch pc in
-          let* model = load s in
-          Lwt.return (Some model)))
+    Option.fold head ~none:(Lwt.return None) ~some:(fun c ->
+        match S.Commit.parents c with
+        | [] -> Lwt.return None
+        | pkey :: (_ : S.commit_key list) ->
+          let* p = commit_of_key_opt s.repo pkey in
+          Option.fold p ~none:(Lwt.return None) ~some:(fun pc ->
+              let* redo = S.of_branch s.repo (redo_ref_name s) in
+              let* () = S.Head.set redo c in
+              let* () = S.Head.set s.branch pc in
+              let* model = load s in
+              Lwt.return (Some model)))
+
+  (** Undo's inverse: read the session's durable [redo-] pointer, move the head
+      forward onto it, and clear the pointer. [None] when there is nothing to
+      redo. The pointer is single-slot, so a fresh commit or a further undo
+      overwrites it; redo restores exactly the last undone step. *)
+  let redo (s : session) : A.model option Lwt.t =
+    let* redo_b = S.of_branch s.repo (redo_ref_name s) in
+    let* target = S.Head.find redo_b in
+    Option.fold target ~none:(Lwt.return None) ~some:(fun c ->
+        let* () = S.Head.set s.branch c in
+        let* () = S.Branch.remove s.repo (redo_ref_name s) in
+        let* model = load s in
+        Lwt.return (Some model))
 
   (** The model as of one specific commit rather than the branch head: watch
       notifications read the tree they were notified about, so a burst of
@@ -306,6 +353,79 @@ struct
       let* moved = S.Head.test_and_set s.branch ~test:(Some c) ~set:(Some squashed) in
       if moved then Lwt.return (Ok (Checkpoint squashed))
       else Lwt.return (Error Branch_moved)
+
+  (* --- D3: bounded session reaper ---------------------------------------- *)
+
+  (** Sweep expired session branches: fold [S.Branch.list], skip every reserved
+      ref, and [S.Branch.remove] any remaining branch whose head [Info] date (a
+      {!Clock} stamp) is strictly older than [now - ttl]. Returns the count
+      removed. Bounded by the branch count and single-pass; the only [Lwt.catch]
+      fences the per-branch head lookup, which can raise once pack GC has
+      dropped a branch's head commit. *)
+  let reap (t : t) ~(ttl : Tea_core.Prim.Ttl.t) ~(now : int64) : int Lwt.t =
+    let cutoff = Int64.sub now (Int64.of_float (Tea_core.Prim.Ttl.to_seconds ttl)) in
+    let* names = S.Branch.list t.repo in
+    Lwt_list.fold_left_s
+      (fun (reaped : int) (name : S.branch) ->
+        if is_reserved name then Lwt.return reaped
+        else
+          let* head =
+            Lwt.catch (fun () -> S.Branch.find t.repo name) (fun (_ : exn) -> Lwt.return None)
+          in
+          Option.fold head ~none:(Lwt.return reaped) ~some:(fun c ->
+              if Int64.compare (S.Info.date (S.Commit.info c)) cutoff < 0 then
+                let* () = S.Branch.remove t.repo name in
+                Lwt.return (reaped + 1)
+              else Lwt.return reaped))
+      0 names
+
+  (* --- D4: checkpoint retention ring on the __checkpoints spine ---------- *)
+
+  (** The current head of the durable checkpoint spine, if any. *)
+  let checkpoints_head (t : t) : checkpoint option Lwt.t =
+    let* spine = S.of_branch t.repo spine_branch in
+    let* head = S.Head.find spine in
+    Lwt.return (Option.map (fun c -> Checkpoint c) head)
+
+  (** Link a fresh [checkpoint] onto the durable [__checkpoints] spine and
+      return the single GC [~retain] anchor.
+
+      The spine is a {i chain}: the first checkpoint roots it (the squashed
+      commit itself, which the caller's branch already holds), and every later
+      checkpoint is a new commit carrying the same tree but parented on the
+      prior spine head. The ref persists across restart, so the retention
+      window survives a reopen.
+
+      The anchor is the [K]-th checkpoint counting from the head (head = 1st):
+      walk back [K-1] parents, bottoming out at the spine root. GC retaining it
+      keeps that checkpoint and everything newer — exactly the last [K]
+      checkpoints and every branch head minted after the anchor — while older
+      spine entries become collectible. Because the anchor is an ancestor of
+      the (just-written) spine head, it is never newer than the checkpoints it
+      bounds, so retaining it can never drop the newest checkpoint's data. *)
+  let retain (t : t) ~(retention : Retention.t) (Checkpoint cp : checkpoint) : checkpoint Lwt.t =
+    let* spine = S.of_branch t.repo spine_branch in
+    let* spine_head = S.Head.find spine in
+    let* linked =
+      Option.fold spine_head
+        ~none:(Lwt.return cp)
+        ~some:(fun prev ->
+          S.Commit.v t.repo ~info:(info_v t.clock spine_label)
+            ~parents:[ S.Commit.key prev ] (S.Commit.tree cp))
+    in
+    let* () = S.Head.set spine linked in
+    let k = Retention.to_int retention in
+    let rec nth (c : S.commit) (steps : int) : S.commit Lwt.t =
+      if steps <= 0 then Lwt.return c
+      else
+        match S.Commit.parents c with
+        | [] -> Lwt.return c
+        | pkey :: (_ : S.commit_key list) ->
+          let* p = commit_of_key_opt t.repo pkey in
+          Option.fold p ~none:(Lwt.return c) ~some:(fun pc -> nth pc (steps - 1))
+    in
+    let* anchor = nth linked (k - 1) in
+    Lwt.return (Checkpoint anchor)
 
   module Coalescer = struct
     (** One coalescer per chatty pipeline (the WS pump mints one per socket).

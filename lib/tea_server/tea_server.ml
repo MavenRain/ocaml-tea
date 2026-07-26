@@ -17,10 +17,18 @@
     socket, a form post, or another tab — comes back down as a full Repr-JSON
     model frame via the Irmin watch. *)
 
-module Make (A : Tea_core.App.APP) = struct
+(** The backend-generic handler bodies (roadmap step 8, D2): every current
+    handler, router, step, and WS pump, functorized over any
+    {!Tea_persist.Store_core.CORE}. [Make] instantiates it over the in-memory
+    store; [Tea_server_pack.Make_pack] instantiates the {i same bodies} over
+    the durable pack store, so irmin-pack stays out of this unit's (and the
+    js_of_ocaml client's) dependency closure. *)
+module Handlers
+    (A : Tea_core.App.APP)
+    (St : Tea_persist.Store_core.CORE with type model = A.model and type msg = A.msg) =
+struct
   module Prim = Tea_core.Prim
   module Html = Tea_core.Html
-  module Store = Tea_persist.Store.Make (A)
   module Codec = Tea_core.Codec.Make (A)
 
   (** [Loop]'s IO instantiated with Lwt: the one place the pure engine meets
@@ -52,17 +60,17 @@ module Make (A : Tea_core.App.APP) = struct
         let nibble = if i mod 2 = 0 then byte lsr 4 else byte land 0xf in
         "0123456789abcdef".[nibble])
 
-  let session_of_request (repo : Store.t) (request : Dream.request) :
-      (Store.session, string) result Lwt.t =
+  let session_of_request (repo : St.t) (request : Dream.request) :
+      (St.session, string) result Lwt.t =
     Prim.Session_id.of_string (hex (Dream.session_id request))
     |> Option.fold
          ~none:(Lwt.return (Error "session id unavailable"))
          ~some:(fun sid ->
-           let* s = Store.session repo sid in
+           let* s = St.session repo sid in
            Lwt.return (Ok s))
 
-  let with_session (repo : Store.t) (request : Dream.request)
-      (k : Store.session -> Dream.response Lwt.t) : Dream.response Lwt.t =
+  let with_session (repo : St.t) (request : Dream.request)
+      (k : St.session -> Dream.response Lwt.t) : Dream.response Lwt.t =
     let* resolved = session_of_request repo request in
     Result.fold resolved ~ok:k ~error:(fun reason ->
         Dream.respond ~status:`Internal_Server_Error reason)
@@ -88,8 +96,8 @@ module Make (A : Tea_core.App.APP) = struct
       commit) and the WS pump (coalesced commit) share, so every path mints
       its commit dates from the store's single clock. A [Navigate] effect is
       captured and surfaced as the redirect target. *)
-  let step_with ~(commit : Store.session -> msg:A.msg -> A.model -> unit Lwt.t)
-      (s : Store.session) (msg : A.msg) : (step_outcome, Loop.err) result Lwt.t =
+  let step_with ~(commit : St.session -> msg:A.msg -> A.model -> unit Lwt.t)
+      (s : St.session) (msg : A.msg) : (step_outcome, Loop.err) result Lwt.t =
     let redirect = ref None in
     let fx =
       { Loop.sleep = (fun d -> Lwt_unix.sleep (float_of_int (Prim.Delay.to_ms d) /. 1000.))
@@ -99,7 +107,7 @@ module Make (A : Tea_core.App.APP) = struct
             Lwt.return_unit)
       }
     in
-    let* model = Store.load s in
+    let* model = St.load s in
     let* stepped = Loop.step ~fx ~fuel:Prim.Fuel.default msg model in
     Result.fold stepped
       ~ok:(fun model' ->
@@ -109,9 +117,9 @@ module Make (A : Tea_core.App.APP) = struct
 
   (** One TEA step over HTTP: one commit per Msg, labelled with the Msg so
       the branch log stays the event log. *)
-  let step : Store.session -> A.msg -> (step_outcome, Loop.err) result Lwt.t =
+  let step : St.session -> A.msg -> (step_outcome, Loop.err) result Lwt.t =
     step_with ~commit:(fun s ~msg model ->
-        Store.commit s ~label:(Codec.msg_to_label msg) model)
+        St.commit s ~label:(Codec.msg_to_label msg) model)
 
   (* --- Live view over WebSocket (roadmap step 3, DESIGN §7) -------------- *)
 
@@ -138,20 +146,20 @@ module Make (A : Tea_core.App.APP) = struct
       announcement races frames for commits landing during registration); the
       stream converges on the newest head because later commits always fire
       later watch callbacks. *)
-  let live_session ?(coalesce = Tea_core.Coalesce_spec.Keep_all) (s : Store.session)
+  let live_session ?(coalesce = Tea_core.Coalesce_spec.Keep_all) (s : St.session)
       (t : live_transport) : unit Lwt.t =
     (* One coalescer per socket (R1): a chatty client folds its own run of
        Msgs into one amended commit, and can never amend a commit some other
        writer minted — a form post, a merge, or an undo ends the run. *)
-    let cz = Store.Coalescer.v coalesce in
-    let step_ws = step_with ~commit:(Store.commit_coalesced cz) in
+    let cz = St.Coalescer.v coalesce in
+    let step_ws = step_with ~commit:(St.commit_coalesced cz) in
     let frames, push = Lwt_stream.create () in
     let* w =
-      Store.watch s (fun m ->
+      St.watch s (fun m ->
           push (Some (Codec.model_to_json m));
           Lwt.return_unit)
     in
-    let* model0 = Store.load s in
+    let* model0 = St.load s in
     push (Some (Codec.model_to_json model0));
     let rec pump () =
       let* frame = t.receive_frame () in
@@ -168,7 +176,7 @@ module Make (A : Tea_core.App.APP) = struct
     in
     Lwt.finalize
       (fun () -> Lwt.pick [ Lwt_stream.iter_s t.send_frame frames; pump () ])
-      (fun () -> Store.unwatch w)
+      (fun () -> St.unwatch w)
 
   (* Cross-site WebSocket hijacking gate. The full CSWSH rationale now lives on
      [Tea_safe.Origin_gate]'s doc in tea_safe.mli; [accept_ws] is the only
@@ -176,7 +184,7 @@ module Make (A : Tea_core.App.APP) = struct
      [Origin_gate.check] mints, so a socket accepted without the same-origin
      check cannot be expressed here. *)
   let accept_ws (_ : Tea_safe.Origin_gate.same_origin Tea_safe.Proof.t)
-      ~(coalesce : A.msg Tea_core.Coalesce_spec.t) (repo : Store.t)
+      ~(coalesce : A.msg Tea_core.Coalesce_spec.t) (repo : St.t)
       (request : Dream.request) : Dream.response Lwt.t =
     with_session repo request (fun s ->
         Dream.websocket (fun ws ->
@@ -185,7 +193,7 @@ module Make (A : Tea_core.App.APP) = struct
               ; receive_frame = (fun () -> Dream.receive ws)
               }))
 
-  let handle_ws ~(coalesce : A.msg Tea_core.Coalesce_spec.t) (repo : Store.t)
+  let handle_ws ~(coalesce : A.msg Tea_core.Coalesce_spec.t) (repo : St.t)
       (request : Dream.request) : Dream.response Lwt.t =
     Tea_safe.Origin_gate.check
       ~origin:(Dream.header request "Origin")
@@ -253,15 +261,15 @@ module Make (A : Tea_core.App.APP) = struct
 
   (* --- Handlers ---------------------------------------------------------- *)
 
-  let handle_root (repo : Store.t) (request : Dream.request) : Dream.response Lwt.t =
+  let handle_root (repo : St.t) (request : Dream.request) : Dream.response Lwt.t =
     with_session repo request (fun s ->
-        let* model = Store.load s in
+        let* model = St.load s in
         Dream.html (page ~csrf:(Dream.csrf_token request) model))
 
   let redirect_target (outcome : step_outcome) : string =
     Option.fold ~none:"/" ~some:Prim.Url.to_string outcome.redirect
 
-  let apply_msg (s : Store.session) (request : Dream.request) (json : string) :
+  let apply_msg (s : St.session) (request : Dream.request) (json : string) :
       Dream.response Lwt.t =
     Result.fold (Codec.msg_of_json json)
       ~ok:(fun msg ->
@@ -277,7 +285,7 @@ module Make (A : Tea_core.App.APP) = struct
           ~headers:[ ("Content-Type", "text/plain; charset=utf-8") ]
           ("undecodable msg: " ^ reason))
 
-  let handle_msg (repo : Store.t) (request : Dream.request) : Dream.response Lwt.t =
+  let handle_msg (repo : St.t) (request : Dream.request) : Dream.response Lwt.t =
     with_session repo request (fun s ->
         with_form request (fun fields ->
             List.assoc_opt "msg" fields
@@ -285,11 +293,11 @@ module Make (A : Tea_core.App.APP) = struct
                  ~none:(Dream.respond ~status:`Bad_Request "missing msg field")
                  ~some:(apply_msg s request)))
 
-  let handle_undo (repo : Store.t) (request : Dream.request) : Dream.response Lwt.t =
+  let handle_undo (repo : St.t) (request : Dream.request) : Dream.response Lwt.t =
     with_session repo request (fun s ->
         with_form request (fun _fields ->
             (* At the history root undo is a no-op; either way, re-render. *)
-            let* _restored = Store.undo s in
+            let* _restored = St.undo s in
             Dream.redirect request "/"))
 
   (* --- Assembly ----------------------------------------------------------- *)
@@ -299,7 +307,7 @@ module Make (A : Tea_core.App.APP) = struct
      one origin — which is precisely what {!same_origin} and the shared Dream
      session cookie require. *)
   let router ?(client_dir : string option) ?(rpc : Dream.route list = [])
-      ?(coalesce = Tea_core.Coalesce_spec.Keep_all) (repo : Store.t) : Dream.handler =
+      ?(coalesce = Tea_core.Coalesce_spec.Keep_all) (repo : St.t) : Dream.handler =
     let client_routes =
       Option.fold client_dir ~none:[]
         ~some:(fun dir ->
@@ -328,12 +336,22 @@ module Make (A : Tea_core.App.APP) = struct
   (** The full request pipeline: session middleware over the security-headers
       middleware over the router. Exposed so tests can drive it with
       [Dream.test] against an in-memory repo. *)
-  let handler ?client_dir ?rpc ?coalesce (repo : Store.t) : Dream.handler =
+  let handler ?client_dir ?rpc ?coalesce (repo : St.t) : Dream.handler =
     Dream.memory_sessions (secure_headers (router ?client_dir ?rpc ?coalesce repo))
 
   (** Blocking entry point for a native server binary. [?coalesce] is the
       app's commit-coalescing policy for live (WS) sessions; the default
       keeps one commit per Msg. *)
+end
+
+(** The mem-backed Dream tier: [Make (A)] instantiates {!Handlers} over the
+    in-memory store, so the T1/T2 surface (and every existing test) is
+    preserved byte for byte. The durable pack-backed tier is
+    [Tea_server_pack.Make_pack]. *)
+module Make (A : Tea_core.App.APP) = struct
+  module Store = Tea_persist.Store.Make (A)
+  include Handlers (A) (Store)
+
   let serve ?(interface = "localhost") ?(port = 8080) ?client_dir ?rpc ?coalesce () : unit =
     let repo = Lwt_main.run (Store.create ()) in
     Dream.run ~interface ~port (Dream.logger (handler ?client_dir ?rpc ?coalesce repo))

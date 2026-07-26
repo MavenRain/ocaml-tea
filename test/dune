@@ -1,6 +1,7 @@
 (tests
  (names persist_test server_test client_test merge_test collab_test safe_test
-   clock_test dedup_test coalesce_test pack_test rpc_test)
+   clock_test dedup_test coalesce_test pack_test rpc_test pack_serve_test
+   reaper_test retention_test archive_gc_test)
  (libraries
   tea_core
   tea_rpc
@@ -8,6 +9,7 @@
   tea_persist
   tea_persist_pack
   tea_server
+  tea_server_pack
   tea_client
   vdom.base
   counter_app

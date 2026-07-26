@@ -130,6 +130,35 @@ module Session_id : sig
 
   val of_string : string -> t option
   val to_string : t -> string
+
+  val compare : t -> t -> int
+  (** Total order on session ids ([String.compare] on {!to_string}); the
+      deterministic tie-break for a CRDT LWW register when two replicas mint
+      the same clock stamp (roadmap step 8, D1). *)
+end
+
+module Retention : sig
+  (** How many checkpoints a retention ring keeps (roadmap step 8, D4). *)
+  type t
+
+  val of_int : int -> t option
+  (** [None] for a non-positive count. *)
+
+  val default : t
+  (** Keep the last 8 checkpoints. *)
+
+  val to_int : t -> int
+end
+
+module Ttl : sig
+  (** A session-branch idle lifetime, in seconds, for the reaper (roadmap step
+      8, D3). *)
+  type t
+
+  val of_seconds : float -> t option
+  (** [None] for a non-positive duration. *)
+
+  val to_seconds : t -> float
 end
 
 module Branch_name : sig
