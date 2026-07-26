@@ -108,7 +108,8 @@ struct
       }
     in
     let* model = St.load s in
-    let* stepped = Loop.step ~fx ~fuel:Prim.Fuel.default msg model in
+    let ctx = St.ctx_of_session s in
+    let* stepped = Loop.step ~ctx ~fx ~fuel:Prim.Fuel.default msg model in
     Result.fold stepped
       ~ok:(fun model' ->
         let* () = commit s ~msg model' in

@@ -18,7 +18,8 @@ end
 module Make (A : Tea_core.App.APP) : sig
   include Tea_persist.Store_core.CORE with type model = A.model and type msg = A.msg
 
-  val create : ?now:(unit -> int64) -> ?lower_root:string -> Root.t -> t Lwt.t
+  val create :
+    ?now:(unit -> int64) -> ?lower_root:string -> ?exploded:exploder -> Root.t -> t Lwt.t
   (** Open (or initialise) the pack store at [Root]. Always configured with
       [Indexing_strategy.minimal], so delete-mode GC stays allowed for the
       root's entire life — an [always]-indexed root is permanently poisoned

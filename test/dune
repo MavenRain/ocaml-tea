@@ -1,8 +1,9 @@
 (tests
  (names persist_test server_test client_test merge_test collab_test safe_test
    clock_test dedup_test coalesce_test pack_test rpc_test pack_serve_test
-   reaper_test retention_test archive_gc_test)
+   reaper_test retention_test archive_gc_test crdt_test exploded_test)
  (libraries
+  repr
   tea_core
   tea_rpc
   tea_safe

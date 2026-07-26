@@ -33,7 +33,30 @@ module type CORE = sig
   type session
   (** A handle onto one session's branch; shares the owning handle's clock. *)
 
-  val v : now:(unit -> int64) -> S.repo -> t Lwt.t
+  type exploder
+  (** The exploded-tree witness (roadmap step 8, D6): the fixed set of Irmin
+      paths a model is scattered over, one per CRDT field, so a single-field
+      edit rewrites a single path instead of the whole model blob.
+
+      Irmin fixes this store's contents type to [model] at {i every} path, so a
+      leaf is not a type of its own but a {i field-isolated model} — [bottom]
+      with exactly one field carried over. Reassembly is therefore the CvRDT
+      [join] over the leaves, which is why D6 depends on D1: without a lattice
+      there is nothing to reassemble with. Registering a witness is total: it
+      carries its own [join] rather than reading one back off
+      {!Tea_core.App.APP.merge}, so there is no half-configured state. *)
+
+  val exploder :
+    bottom:model ->
+    join:(model -> model -> model) ->
+    fields:(Tea_safe.Safe_key.t * (model -> model)) list ->
+    exploder
+  (** Build a witness. [fields] pairs each field's store path with the
+      projection isolating it ([bottom] everywhere but that field); paths must
+      be pairwise distinct, or the fields sharing one collapse into a single
+      leaf and reassembly loses whichever the join does not dominate. *)
+
+  val v : now:(unit -> int64) -> ?exploded:exploder -> S.repo -> t Lwt.t
   (** The backend-instantiator seam: wrap a repo, seeding the clock from
       every branch head's [Info] date so new stamps land strictly above
       everything already in history (heads dominate live history because
@@ -48,6 +71,13 @@ module type CORE = sig
   val fork : t -> from:session -> Tea_core.Prim.Session_id.t -> session Lwt.t
   val load : session -> model Lwt.t
   val commit : session -> label:string -> model -> unit Lwt.t
+
+  val ctx_of_session : session -> Tea_core.Crdt.Ctx.t
+  (** The CRDT context (D1) a step on this session applies under: the session's
+      branch name as its replica id, plus the handle's monotonic clock. The
+      server runtime builds one to drive {!Tea_core.Loop.step}; {!apply} uses it
+      internally. *)
+
   val apply : session -> msg -> model Lwt.t
   val head_ref : session -> Tea_core.Prim.Commit_ref.t option Lwt.t
   val history : session -> Tea_core.Prim.Commit_ref.t list Lwt.t
@@ -63,7 +93,10 @@ module type CORE = sig
   (** Undo's inverse: move the head forward onto the session's durable redo
       pointer and clear it ([None] when there is nothing to redo). *)
 
-  val model_at : S.commit -> model Lwt.t
+  val model_at : t -> S.commit -> model Lwt.t
+  (** The model as of one specific commit. Takes the handle because reading is
+      witness-directed under D6: an exploded store gathers the commit's field
+      leaves, a whole-blob store reads its single path. *)
 
   type watch = S.watch
 

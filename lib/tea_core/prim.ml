@@ -144,8 +144,10 @@ module Session_id = struct
     else if String.contains s '/' then None
     else Some s
 
+  let v s = s
   let to_string t = t
   let compare = String.compare
+  let t = Repr.string
 end
 
 module Retention = struct

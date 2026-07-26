@@ -54,9 +54,9 @@ let () =
      let* spine_model =
        match spine_after_ok with
        | None -> Lwt.return (fst init)
-       | Some cp -> Store.model_at (Store.checkpoint_commit cp)
+       | Some cp -> Store.model_at t (Store.checkpoint_commit cp)
      in
-     check "the checkpoint carries the committed model (count = 2)" (spine_model.count = 2);
+     check "the checkpoint carries the committed model (count = 2)" (value spine_model = 2);
 
      (* Durability: close (flushing the pack suffix), reopen the same root, and
         the checkpoint driven through the server is still there. *)
@@ -67,12 +67,12 @@ let () =
      let* reopened_model =
        match reopened with
        | None -> Lwt.return (fst init)
-       | Some cp -> Store.model_at (Store.checkpoint_commit cp)
+       | Some cp -> Store.model_at t2 (Store.checkpoint_commit cp)
      in
-     check "the reopened checkpoint model is intact (count = 2)" (reopened_model.count = 2);
+     check "the reopened checkpoint model is intact (count = 2)" (value reopened_model = 2);
      let* main2 = Store.main_session t2 in
      let* main2_model = Store.load main2 in
-     check "the reopened main branch is intact (count = 2)" (main2_model.count = 2);
+     check "the reopened main branch is intact (count = 2)" (value main2_model = 2);
      let* () = Store.close t2 in
 
      let rec rm_rf (path : string) : unit =

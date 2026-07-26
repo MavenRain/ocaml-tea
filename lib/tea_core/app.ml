@@ -12,7 +12,13 @@ module type APP = sig
   val model_t : model Repr.t
   val msg_t : msg Repr.t
   val init : model * msg Cmd.t
-  val update : msg -> model -> model * msg Cmd.t
+
+  (** Apply one message. Gains a {!Crdt.Ctx.t} (roadmap step 8, D1): the replica
+      this tier writes as plus the clock its CRDT dots are minted from, so an
+      [update] that touches a CRDT field (an LWW title, an OR-Set tag, a
+      PN-counter like) stamps the edit with a fresh, causally-unique dot. *)
+  val update : Crdt.Ctx.t -> msg -> model -> model * msg Cmd.t
+
   val view : model -> msg Html.t
   val subscriptions : model -> (model, msg) Sub.t
 

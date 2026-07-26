@@ -15,6 +15,12 @@ module Contents (A : Tea_core.App.APP) = struct
   let merge : t option Irmin.Merge.t =
     match A.merge with
     | Tea_core.Merge_spec.Last_write_wins -> Irmin.Merge.(option (default A.model_t))
+    | Tea_core.Merge_spec.Crdt_join join ->
+      (* The CvRDT least-upper-bound registered as Irmin's merge: the ancestor
+         is discarded ([~old:_]), sound because [join] is idempotent /
+         commutative / associative (SEC). A 2-way join never conflicts, so the
+         result is always [Ok]. *)
+      Irmin.Merge.(option (v A.model_t (fun ~old:_ ours theirs -> Lwt.return (Ok (join ours theirs)))))
     | Tea_core.Merge_spec.Three_way f ->
       let merge_f ~old ours theirs =
         let* old_r = old () in
@@ -37,7 +43,18 @@ module type CORE = sig
   type t
   type session
 
-  val v : now:(unit -> int64) -> S.repo -> t Lwt.t
+  (** The D6 exploded-tree witness: one Irmin path per CRDT field, each holding
+      a field-isolated model, reassembled by the lattice join. See the
+      implementation for why a leaf is a model rather than a type of its own. *)
+  type exploder
+
+  val exploder :
+    bottom:model ->
+    join:(model -> model -> model) ->
+    fields:(Tea_safe.Safe_key.t * (model -> model)) list ->
+    exploder
+
+  val v : now:(unit -> int64) -> ?exploded:exploder -> S.repo -> t Lwt.t
   val repo : t -> S.repo
   val default_now : unit -> int64
   val model_path : Tea_safe.Safe_key.t
@@ -47,12 +64,13 @@ module type CORE = sig
   val fork : t -> from:session -> Tea_core.Prim.Session_id.t -> session Lwt.t
   val load : session -> model Lwt.t
   val commit : session -> label:string -> model -> unit Lwt.t
+  val ctx_of_session : session -> Tea_core.Crdt.Ctx.t
   val apply : session -> msg -> model Lwt.t
   val head_ref : session -> Tea_core.Prim.Commit_ref.t option Lwt.t
   val history : session -> Tea_core.Prim.Commit_ref.t list Lwt.t
   val undo : session -> model option Lwt.t
   val redo : session -> model option Lwt.t
-  val model_at : S.commit -> model Lwt.t
+  val model_at : t -> S.commit -> model Lwt.t
 
   type watch = S.watch
 
@@ -99,12 +117,38 @@ struct
   type model = A.model
   type msg = A.msg
 
+  (** The exploded-tree witness (roadmap step 8, D6): the fixed set of Irmin
+      paths one model is scattered over, one per CRDT field.
+
+      Irmin fixes this store's contents type to [A.model] at {i every} path, so
+      a leaf cannot be a type of its own — it is a {i field-isolated model}:
+      [project] returns [bottom] with exactly one field carried over. That makes
+      reassembly the CvRDT join over the leaves, which is precisely why D6
+      follows D1 (P3): without a lattice there is nothing to reassemble with,
+      and per-path merge would have no per-field join to dispatch.
+
+      The witness carries its own [join] rather than reading it back off
+      {!Tea_core.App.APP.merge}, so registering one is total: there is no
+      "witness present but the app merge is not a [Crdt_join]" state to degrade
+      out of silently. *)
+  type exploder =
+    { bottom : A.model
+    ; join : A.model -> A.model -> A.model
+    ; fields : (Tea_safe.Safe_key.t * (A.model -> A.model)) list
+    }
+
+  let exploder ~(bottom : A.model) ~(join : A.model -> A.model -> A.model)
+      ~(fields : (Tea_safe.Safe_key.t * (A.model -> A.model)) list) : exploder =
+    { bottom; join; fields }
+
   (** The store handle: the repo plus the one clock every commit date on this
       handle is minted from (a per-branch clock would re-collide across
-      branches — the DESIGN §5 dedup bug in another coat). *)
+      branches — the DESIGN §5 dedup bug in another coat). [exploded] is the
+      optional D6 witness, shared by every session opened on this handle. *)
   type t =
     { repo : S.repo
     ; clock : Clock.t
+    ; exploded : exploder option
     }
 
   (** A handle onto one session's branch. [clock] is shared by reference with
@@ -115,6 +159,7 @@ struct
     ; branch : S.t
     ; clock : Clock.t
     ; name : string
+    ; exploded : exploder option
     }
 
   (* Typed store key: a compile-time-literal step, dropped to Irmin's raw
@@ -155,23 +200,23 @@ struct
 
   let info_f (clock : Clock.t) (label : string) = fun () -> info_v clock label
 
-  let v ~(now : unit -> int64) (repo : S.repo) : t Lwt.t =
+  let v ~(now : unit -> int64) ?(exploded : exploder option) (repo : S.repo) : t Lwt.t =
     let clock = Clock.create ~now in
     let* heads = S.Repo.heads repo in
     List.iter (fun c -> Clock.seed clock (S.Info.date (S.Commit.info c))) heads;
-    Lwt.return { repo; clock }
+    Lwt.return { repo; clock; exploded }
 
   let repo (t : t) : S.repo = t.repo
 
   let session (t : t) (sid : Tea_core.Prim.Session_id.t) : session Lwt.t =
     let name = Tea_core.Prim.Branch_name.(to_string (of_session sid)) in
     let* branch = S.of_branch t.repo name in
-    Lwt.return { repo = t.repo; branch; clock = t.clock; name }
+    Lwt.return { repo = t.repo; branch; clock = t.clock; name; exploded = t.exploded }
 
   let main_session (t : t) : session Lwt.t =
     let name = Tea_core.Prim.Branch_name.(to_string main) in
     let* branch = S.main t.repo in
-    Lwt.return { repo = t.repo; branch; clock = t.clock; name }
+    Lwt.return { repo = t.repo; branch; clock = t.clock; name; exploded = t.exploded }
 
   (** Fork a fresh session branch off another session's current head, so the
       two branches share that commit as their single common ancestor. This is
@@ -198,21 +243,86 @@ struct
         let* () = S.Head.set dst.branch c in
         Lwt.return dst)
 
-  let load (s : session) : A.model Lwt.t =
-    let* v = S.find s.branch model_path_raw in
-    match v with
-    | Some m -> Lwt.return m
-    | None -> Lwt.return (fst A.init)
+  (* D6: the (path, value) writes one model becomes — the single whole-blob
+     path with no witness registered, one field-isolated path per CRDT field
+     with one. The no-witness list is exactly the historical single write, so
+     the whole-blob path stays bit-for-bit what it was. *)
+  let writes (x : exploder option) (model : A.model) : (string list * A.model) list =
+    Option.fold x
+      ~none:[ (model_path_raw, model) ]
+      ~some:(fun e ->
+        List.map
+          (fun (k, project) -> (Tea_safe.Safe_key.to_steps k, project model))
+          e.fields)
 
+  (* Scatter [model] over its paths, layered onto [base] so anything else the
+     tree carries survives. One [Tree.add] per field, one commit for the lot. *)
+  let scatter (x : exploder option) (base : S.tree) (model : A.model) : S.tree Lwt.t =
+    Lwt_list.fold_left_s
+      (fun acc (path, leaf) -> S.Tree.add acc path leaf)
+      base
+      (writes x model)
+
+  (* D6 reassembly: join every present field leaf back into a whole model.
+
+     A branch written before the witness was registered carries no field paths
+     at all, so the legacy whole-blob at [model_path] is read instead — the
+     migration-on-first-read the spec calls for, and the reason the fallback is
+     keyed on "no leaf found" rather than on "some leaf missing". A branch with
+     neither is simply fresh, and yields the app's initial model. *)
+  let gather (x : exploder option) (find : string list -> A.model option Lwt.t) :
+      A.model Lwt.t =
+    let legacy () =
+      let* v = find model_path_raw in
+      Lwt.return (Option.value v ~default:(fst A.init))
+    in
+    (Option.fold x ~none:legacy ~some:(fun e () ->
+         let* leaves =
+           Lwt_list.filter_map_s
+             (fun ((k : Tea_safe.Safe_key.t), (_ : A.model -> A.model)) ->
+               find (Tea_safe.Safe_key.to_steps k))
+             e.fields
+         in
+         match leaves with
+         | [] -> legacy ()
+         | _ :: (_ : A.model list) -> Lwt.return (List.fold_left e.join e.bottom leaves)))
+      ()
+
+  let load (s : session) : A.model Lwt.t = gather s.exploded (S.find s.branch)
+
+  (* Whole-blob and exploded stores take genuinely different write paths, and
+     the no-witness one is the historical [set_exn] {i verbatim}. Unifying both
+     onto a root [set_tree_exn] is what a first cut does, and it is wrong: a
+     root tree rebuilt from [S.tree] and re-saved does not survive a pack
+     close/reopen (the reopened contents fail to decode), while [set_exn]'s
+     transaction does. The witness path pays that cost only where it must —
+     several paths have to move in one commit — and its durability is pinned by
+     [exploded_test]'s close/reopen round trip. *)
   let commit (s : session) ~(label : string) (model : A.model) : unit Lwt.t =
-    S.set_exn s.branch model_path_raw model ~info:(info_f s.clock label)
+    (Option.fold s.exploded
+       ~none:(fun () ->
+         S.set_exn s.branch model_path_raw model ~info:(info_f s.clock label))
+       ~some:(fun (_ : exploder) () ->
+         let* head = S.Head.find s.branch in
+         let base = Option.fold head ~none:(S.Tree.empty ()) ~some:S.Commit.tree in
+         let* tree = scatter s.exploded base model in
+         S.set_tree_exn s.branch [] tree ~info:(info_f s.clock label)))
+      ()
+
+  (* The CRDT context a step on this session applies under (D1): the session's
+     own branch name is its stable replica id (a '/'-free framework literal, so
+     the trusted mint is right), joined with the handle's single monotonic
+     clock so every minted dot is causally-unique and strictly increasing. *)
+  let ctx_of_session (s : session) : Tea_core.Crdt.Ctx.t =
+    let replica = Tea_core.Crdt.Replica.v (Tea_core.Prim.Session_id.v s.name) in
+    Tea_core.Crdt.Ctx.v ~clock:s.clock ~replica
 
   (** One TEA step, persisted as one commit. (Cmd effects are the server
       runtime's job; here we persist the model transition and label the commit
       with the Msg so the history reads as an event log.) *)
   let apply (s : session) (msg : A.msg) : A.model Lwt.t =
     let* model = load s in
-    let model', _cmd = A.update msg model in
+    let model', _cmd = A.update (ctx_of_session s) msg model in
     let* () = commit s ~label:(Codec.msg_to_label msg) model' in
     Lwt.return model'
 
@@ -288,12 +398,11 @@ struct
       notifications read the tree they were notified about, so a burst of
       commits yields one frame per commit instead of n reads of whatever the
       final head happens to be. *)
-  let model_at (c : S.commit) : A.model Lwt.t =
+  let model_at_with (x : exploder option) (c : S.commit) : A.model Lwt.t =
     let* at = S.of_commit c in
-    let* v = S.find at model_path_raw in
-    match v with
-    | Some m -> Lwt.return m
-    | None -> Lwt.return (fst A.init)
+    gather x (S.find at)
+
+  let model_at (t : t) (c : S.commit) : A.model Lwt.t = model_at_with t.exploded c
 
   type watch = S.watch
 
@@ -306,7 +415,7 @@ struct
     (* A notification can outlive its commit once pack GC lands: fall back to
        the branch head rather than crash the pump. *)
     let deliver (c : S.commit) : unit Lwt.t =
-      Lwt.bind (Lwt.catch (fun () -> model_at c) (fun (_ : exn) -> load s)) k
+      Lwt.bind (Lwt.catch (fun () -> model_at_with s.exploded c) (fun (_ : exn) -> load s)) k
     in
     let* head = S.Head.find s.branch in
     S.watch s.branch ?init:head (fun (diff : S.commit Irmin.Diff.t) ->
@@ -457,12 +566,12 @@ struct
     let rec attempt (fuel : int) : unit Lwt.t =
       if fuel <= 0 then (
         Coalescer.seal cz;
-        S.set_exn s.branch model_path_raw model ~info:(info_f s.clock label))
+        commit s ~label model)
       else
         let* head = S.Head.find s.branch in
         let parents = Option.fold head ~none:[] ~some:(fun h -> [ S.Commit.key h ]) in
         let base_tree = Option.fold head ~none:(S.Tree.empty ()) ~some:S.Commit.tree in
-        let* tree = S.Tree.add base_tree model_path_raw model in
+        let* tree = scatter s.exploded base_tree model in
         let* c = S.Commit.v s.repo ~info:(info_v s.clock label) ~parents tree in
         let* moved = S.Head.test_and_set s.branch ~test:head ~set:(Some c) in
         if moved then (
@@ -494,7 +603,7 @@ struct
       (match amend with
        | None -> append_commit cz s ~msg model
        | Some (h, folded) ->
-         let* tree = S.Tree.add (S.Commit.tree h) model_path_raw model in
+         let* tree = scatter s.exploded (S.Commit.tree h) model in
          let* c =
            S.Commit.v s.repo
              ~info:(info_v s.clock (Codec.msg_to_label folded))
@@ -512,7 +621,7 @@ struct
 
   let apply_coalesced (cz : Coalescer.t) (s : session) (msg : A.msg) : A.model Lwt.t =
     let* model = load s in
-    let model', _cmd = A.update msg model in
+    let model', _cmd = A.update (ctx_of_session s) msg model in
     let* () = commit_coalesced cz s ~msg model' in
     Lwt.return model'
 end

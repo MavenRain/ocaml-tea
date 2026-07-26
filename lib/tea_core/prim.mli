@@ -129,7 +129,20 @@ module Session_id : sig
   type t
 
   val of_string : string -> t option
+
+  (** Framework-internal, compile-time / branch-name-literal mint (mirrors the
+      other newtypes' trusted [v]): the persistence layer builds a
+      {!Crdt.Replica} from a session's own branch name, which is not untrusted
+      input. Never call it on request- or model-derived data. *)
+  val v : string -> t
+
   val to_string : t -> string
+
+  val t : t Repr.t
+  (** Repr witness (a plain string codec): {!Crdt.Replica} is a session id, and
+      exposing the witness here lets the CRDT states carry it {i without} a
+      [Repr.map] wrapper — irmin-pack's contents-length framing misframes a
+      [map]-wrapped string, so the direct witness is load-bearing. *)
 
   val compare : t -> t -> int
   (** Total order on session ids ([String.compare] on {!to_string}); the

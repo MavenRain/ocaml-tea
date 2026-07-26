@@ -28,7 +28,7 @@ let () =
      let* main = Store.main_session repo in
      let* base = Store.apply main Like in
      check "base doc carries one like (the shared ancestor is non-trivial)"
-       (base.likes = 1);
+       (likes_of base = 1);
      let* alice = Store.fork repo ~from:main (sid "alice") in
      let* bob = Store.fork repo ~from:main (sid "bob") in
      (* The IDENTICAL first edit on both branches, same frozen second. *)
@@ -65,7 +65,7 @@ let () =
      check "merge of the sibling branches succeeds" (Result.is_ok merged);
      let* reconciled = Store.load bob in
      check "the merge counts BOTH sibling likes (likes = 3, not 2)"
-       (reconciled.likes = 3);
+       (likes_of reconciled = 3);
      (* Same collapse regime for checkpoints: two sessions squashing the
         identical tree in the same frozen second must mint distinct roots. *)
      let* carol = Store.fork repo ~from:main (sid "carol") in

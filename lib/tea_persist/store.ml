@@ -18,7 +18,8 @@ module Make (A : Tea_core.App.APP) = struct
   include Store_core.Make (A) (Mem)
 
   (** [?now] injects the wall source for the commit clock — tests freeze it;
-      the default reads the system clock. *)
-  let create ?(now = default_now) () : t Lwt.t =
-    Lwt.bind (S.Repo.v (Irmin_mem.config ())) (v ~now)
+      the default reads the system clock. [?exploded] registers the D6
+      exploded-tree witness; omitted, the model is stored as one whole blob. *)
+  let create ?(now = default_now) ?exploded () : t Lwt.t =
+    Lwt.bind (S.Repo.v (Irmin_mem.config ())) (v ~now ?exploded)
 end

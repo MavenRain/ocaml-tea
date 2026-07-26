@@ -97,10 +97,10 @@ let () =
      let* head_model0 =
        match head0 with
        | None -> Lwt.return (fst init)
-       | Some cp -> Store.model_at (Store.checkpoint_commit cp)
+       | Some cp -> Store.model_at t (Store.checkpoint_commit cp)
      in
      check "the spine head carries the latest checkpointed model (count = N)"
-       (head_model0.count = n);
+       (value head_model0 = n);
 
      (* Durability: the spine ref and its whole chain survive a close/reopen. *)
      let* () = Store.close t in
@@ -112,9 +112,9 @@ let () =
      let* head_model2 =
        match head2 with
        | None -> Lwt.return (fst init)
-       | Some cp -> Store.model_at (Store.checkpoint_commit cp)
+       | Some cp -> Store.model_at t2 (Store.checkpoint_commit cp)
      in
-     check "the reopened spine head still carries count = N" (head_model2.count = n);
+     check "the reopened spine head still carries count = N" (value head_model2 = n);
      let* () = Store.close t2 in
 
      let rec rm_rf (path : string) : unit =

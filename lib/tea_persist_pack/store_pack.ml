@@ -37,14 +37,14 @@ module Make (A : Tea_core.App.APP) = struct
      readable. [Irmin_pack.config] cannot carry a lower root, so the config is
      built through [Irmin_pack.Conf.init] (a superset with the same defaults);
      the raising [add_volume]/[split] volume API is never touched. *)
-  let create ?(now = default_now) ?lower_root (root : Root.t) : t Lwt.t =
+  let create ?(now = default_now) ?lower_root ?exploded (root : Root.t) : t Lwt.t =
     let config =
       Irmin_pack.Conf.init
         ~indexing_strategy:Irmin_pack.Indexing_strategy.minimal
         ~lower_root
         (Root.to_string root)
     in
-    Lwt.bind (Pack.Repo.v config) (v ~now)
+    Lwt.bind (Pack.Repo.v config) (v ~now ?exploded)
 
   (** Whether GC on this store archives discarded data to a lower layer
       ([`Archive], a [lower_root] was configured) or deletes it ([`Delete]).

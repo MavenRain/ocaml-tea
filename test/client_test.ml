@@ -16,6 +16,13 @@ let check name cond =
     Printf.printf "FAIL - %s\n%!" name;
     exit 1)
 
+(* The counter model is now a PN-counter CRDT (roadmap step 8, D1); build a
+   state whose observable value is [n] by applying [n] increments under one
+   fixed replica. Replaces the old [{ count = n }] literal. *)
+let count_of n : App.model =
+  let r = Tea_core.Crdt.Replica.v (Prim.Session_id.v "test") in
+  { App.count = List.fold_left (fun s (_ : int) -> App.Count.inc r s) App.Count.bottom (List.init n (fun i -> i)) }
+
 (* --- evaluating decoders natively ---------------------------------------- *)
 
 (* The browser-independent fragment of the decoder language: [Const] and the
@@ -147,7 +154,7 @@ let is_navigate_to url = function
 
 (* --- the checks ----------------------------------------------------------- *)
 
-let counter_vdom = Tea_client.html_to_vdom (App.view { App.count = 3 })
+let counter_vdom = Tea_client.html_to_vdom (App.view (count_of 3))
 
 let () =
   check "root is <div class=\"counter\"> with 4 children"
@@ -204,7 +211,7 @@ type wrapped = Wrapped of App.msg
 let () =
   let mapped =
     Tea_client.html_to_vdom
-      (Html.map (fun m -> Wrapped m) (App.view { App.count = 0 }))
+      (Html.map (fun m -> Wrapped m) (App.view (count_of 0)))
   in
   check "Html.map composes with translation on click Msgs"
     (Option.map attrs_of (dig [ 0 ] mapped) |> Option.map click_msg
@@ -262,11 +269,11 @@ module Client = Tea_client.Make (App)
 let () =
   let model0, cmd0 = Client.app.Vdom.init in
   check "Make wires init (model and Cmd)"
-    (model0.App.count = 0 && batch_parts cmd0 = Some []);
+    (App.value model0 = 0 && batch_parts cmd0 = Some []);
   let model1, cmd1 = Client.app.Vdom.update model0 App.Increment in
   let model2, _cmd2 = Client.app.Vdom.update model1 App.Increment in
   check "Make flips update to vdom's model-then-msg order"
-    (model1.App.count = 1 && model2.App.count = 2 && batch_parts cmd1 = Some []);
+    (App.value model1 = 1 && App.value model2 = 2 && batch_parts cmd1 = Some []);
   check "Make's view renders through the translation"
     (Option.bind (dig [ 1; 0 ] (Client.app.Vdom.view model2)) text_of = Some "2")
 
@@ -297,9 +304,9 @@ let specs =
   Subs.specs_of
     (Sub.batch
        [ Sub.none
-       ; Sub.every (interval 1000) (fun tick -> App.Sync tick)
+       ; Sub.every (interval 1000) (fun tick -> App.Sync (count_of tick))
        ; Sub.batch
-           [ Sub.store_watch (fun (m : App.model) -> App.Sync m.count); Sub.none ]
+           [ Sub.store_watch (fun (m : App.model) -> App.Sync m); Sub.none ]
        ; Sub.every (interval 250) (fun _tick -> App.Reset)
        ])
 
@@ -307,25 +314,25 @@ let () =
   check "specs_of flattens None_/Batch, preserving leaf order"
     (List.length specs = 3 && List.filter_map spec_interval specs = [ 1000; 250 ]);
   check "the Store_watch leaf sits between the two timers"
-    (Option.bind (List.nth_opt specs 1) (store_msg { App.count = 9 })
-    = Some (App.Sync 9));
+    (Option.bind (List.nth_opt specs 1) (store_msg (count_of 9))
+    = Some (App.Sync (count_of 9)));
   check "Spec_every callbacks cross intact (applied to a tick)"
-    (List.filter_map (every_msg 7) specs = [ App.Sync 7; App.Reset ]);
+    (List.filter_map (every_msg 7) specs = [ App.Sync (count_of 7); App.Reset ]);
   check "the Counter subscribes to the store, reconciling via Sync"
-    (List.filter_map (store_msg { App.count = 5 })
-       (Subs.specs_of (App.subscriptions { App.count = 0 }))
-    = [ App.Sync 5 ])
+    (List.filter_map (store_msg (count_of 5))
+       (Subs.specs_of (App.subscriptions (count_of 0)))
+    = [ App.Sync (count_of 5) ])
 
 (* Functor fidelity again: [Sub.map] must reach under [Store_watch]. *)
 let () =
   let mapped =
     Sub.map
       (fun m -> Wrapped m)
-      (Sub.store_watch (fun (m : App.model) -> App.Sync m.count))
+      (Sub.store_watch (fun (m : App.model) -> App.Sync m))
   in
   check "Sub.map composes under Store_watch"
-    (List.filter_map (store_msg { App.count = 4 }) (Subs.specs_of mapped)
-    = [ Wrapped (App.Sync 4) ])
+    (List.filter_map (store_msg (count_of 4)) (Subs.specs_of mapped)
+    = [ Wrapped (App.Sync (count_of 4)) ])
 
 let () =
   check "key_of_spec keys timers by period and any watch as the one socket"
@@ -338,11 +345,11 @@ let () =
     (Subs.keys_of
        (Subs.specs_of
           (Sub.batch
-             [ Sub.every (interval 500) (fun tick -> App.Sync tick)
+             [ Sub.every (interval 500) (fun tick -> App.Sync (count_of tick))
              ; Sub.every (interval 500) (fun _tick -> App.Reset)
-             ; Sub.store_watch (fun (m : App.model) -> App.Sync m.count)
+             ; Sub.store_watch (fun (m : App.model) -> App.Sync m)
              ; Sub.every (interval 250) (fun _tick -> App.Increment)
-             ; Sub.store_watch (fun (m : App.model) -> App.Sync (m.count + 1))
+             ; Sub.store_watch (fun (m : App.model) -> App.Sync m)
              ]))
     = [ Subs.Key_every 500; Subs.Key_store; Subs.Key_every 250 ])
 
@@ -530,7 +537,7 @@ module Probe = struct
 
   let init = (None, Cmd.none)
 
-  let update msg (model : model) =
+  let update (_ : Tea_core.Crdt.Ctx.t) msg (model : model) =
     match msg with
     | Fire -> (model, call ~reply:(fun r -> Store r))
     | Fire_loop -> (model, call ~reply:(fun (_ : reply) -> Fire_loop))
@@ -547,6 +554,11 @@ end
 module _ : Tea_core.App.APP = Probe
 module L = Tea_core.Loop.Loop (Identity) (Probe)
 
+let probe_ctx =
+  Tea_core.Crdt.Ctx.v
+    ~clock:(Tea_core.Clock.create ~now:(fun () -> 0L))
+    ~replica:(Tea_core.Crdt.Replica.v (Prim.Session_id.v "probe"))
+
 let probe_fx =
   { L.sleep = (fun (_ : Prim.Delay.t) -> ())
   ; navigate = (fun (_ : Prim.Url.t) -> ())
@@ -554,7 +566,7 @@ let probe_fx =
 
 let () =
   check "identity-Io Loop resolves an R.call to Error (Transport No_transport)"
-    (L.step ~fx:probe_fx ~fuel:Prim.Fuel.default Probe.Fire None
+    (L.step ~ctx:probe_ctx ~fx:probe_fx ~fuel:Prim.Fuel.default Probe.Fire None
     |> Result.fold
          ~error:(fun L.Fuel_exhausted -> false)
          ~ok:(fun (m : Probe.model) ->
@@ -568,7 +580,7 @@ let () =
   check "a reply that re-fires the call burns fuel like Emit (fuel 2 -> Fuel_exhausted)"
     (Prim.Fuel.of_int 2
     |> Option.fold ~none:false ~some:(fun fuel2 ->
-           L.step ~fx:probe_fx ~fuel:fuel2 Probe.Fire_loop None
+           L.step ~ctx:probe_ctx ~fx:probe_fx ~fuel:fuel2 Probe.Fire_loop None
            |> Result.fold ~ok:(fun (_ : Probe.model) -> false)
                 ~error:(fun L.Fuel_exhausted -> true)))
 

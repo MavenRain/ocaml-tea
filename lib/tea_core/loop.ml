@@ -25,21 +25,21 @@ module Loop (Io : IO) (A : App.APP) = struct
 
   let ( let* ) = Io.bind
 
-  let rec drive ~fx ~fuel model cmd : (A.model, err) result Io.t =
+  let rec drive ~ctx ~fx ~fuel model cmd : (A.model, err) result Io.t =
     match Prim.Fuel.burn fuel with
     | None -> Io.return (Error Fuel_exhausted)
-    | Some fuel' -> interpret ~fx ~fuel:fuel' model cmd
+    | Some fuel' -> interpret ~ctx ~fx ~fuel:fuel' model cmd
 
-  and interpret ~fx ~fuel model (cmd : A.msg Cmd.t) : (A.model, err) result Io.t =
+  and interpret ~ctx ~fx ~fuel model (cmd : A.msg Cmd.t) : (A.model, err) result Io.t =
     match cmd with
     | Cmd.None_ -> Io.return (Ok model)
     | Cmd.Emit msg ->
-      let model', cmd' = A.update msg model in
-      drive ~fx ~fuel model' cmd'
+      let model', cmd' = A.update ctx msg model in
+      drive ~ctx ~fx ~fuel model' cmd'
     | Cmd.After (delay, msg) ->
       let* () = fx.sleep delay in
-      let model', cmd' = A.update msg model in
-      drive ~fx ~fuel model' cmd'
+      let model', cmd' = A.update ctx msg model in
+      drive ~ctx ~fx ~fuel model' cmd'
     | Cmd.Navigate url ->
       let* () = fx.navigate url in
       Io.return (Ok model)
@@ -49,20 +49,21 @@ module Loop (Io : IO) (A : App.APP) = struct
          reply msg is fuel-bounded and the app decides what a transportless
          call means. Swapping this arm for an [fx.http] field is the
          compile-forced upgrade path if server-side dispatch is ever wanted. *)
-      let model', cmd' = A.update (expect (Error Cmd.No_transport)) model in
-      drive ~fx ~fuel model' cmd'
-    | Cmd.Batch cmds -> fold ~fx ~fuel model cmds
+      let model', cmd' = A.update ctx (expect (Error Cmd.No_transport)) model in
+      drive ~ctx ~fx ~fuel model' cmd'
+    | Cmd.Batch cmds -> fold ~ctx ~fx ~fuel model cmds
 
-  and fold ~fx ~fuel model = function
+  and fold ~ctx ~fx ~fuel model = function
     | [] -> Io.return (Ok model)
     | c :: rest -> (
-      let* r = interpret ~fx ~fuel model c in
+      let* r = interpret ~ctx ~fx ~fuel model c in
       match r with
-      | Ok model' -> fold ~fx ~fuel model' rest
+      | Ok model' -> fold ~ctx ~fx ~fuel model' rest
       | Error Fuel_exhausted -> Io.return (Error Fuel_exhausted))
 
-  (** Apply one message and settle its command tail. *)
-  let step ~fx ~fuel msg model : (A.model, err) result Io.t =
-    let model', cmd = A.update msg model in
-    drive ~fx ~fuel model' cmd
+  (** Apply one message and settle its command tail. [ctx] is the CRDT context
+      the message and every folded-back [Emit]/[After] is applied under. *)
+  let step ~ctx ~fx ~fuel msg model : (A.model, err) result Io.t =
+    let model', cmd = A.update ctx msg model in
+    drive ~ctx ~fx ~fuel model' cmd
 end

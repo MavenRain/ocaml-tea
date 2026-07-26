@@ -223,14 +223,19 @@ let () =
      (* (a) The session opens by announcing the current model. *)
      let* announced = await (fun () -> !sent <> []) in
      check "live_session announces the current model first"
-       (announced
-       && frames () = [ Codec.model_to_json { Counter_app.App.count = 0 } ]);
+       (announced && frames () = [ Codec.model_to_json (fst Counter_app.App.init) ]);
      (* (b) A Msg frame up is stepped, committed, and echoed down via the
         store watch as a full model frame. *)
      push (Some (Codec.msg_to_json Counter_app.App.Increment));
      let* stepped =
        await (fun () ->
-           List.mem (Codec.model_to_json { Counter_app.App.count = 1 }) (frames ()))
+           List.exists
+             (fun f ->
+               Codec.model_of_json f
+               |> Result.fold
+                    ~error:(fun (_ : Tea_core.Codec.err) -> false)
+                    ~ok:(fun (m : Counter_app.App.model) -> Counter_app.App.value m = 1))
+             (frames ()))
      in
      check "a Msg frame up yields the committed model frame down" stepped;
      (* (c) Peer close ends the session. *)
@@ -258,7 +263,7 @@ let () =
      let* hist2 = Server.Store.history s2 in
      let* after2 = Server.Store.load s2 in
      check "a garbage frame commits nothing"
-       (hist2 = [] && after2.Counter_app.App.count = 0);
+       (hist2 = [] && Counter_app.App.value after2 = 0);
      Printf.printf "\nThe live-view pump serves roadmap step 3, no socket needed.\n%!";
      Lwt.return_unit)
 
@@ -309,9 +314,8 @@ let () =
     Lwt_main.run
       (let open Lwt.Syntax in
        let* s = Server.Store.main_session repo in
-       let* m = Server.Store.load s in
-       Server.Store.commit s ~label:"rpc_test: one more commit"
-         { Counter_app.App.count = m.Counter_app.App.count + 1 })
+       let* (_ : Counter_app.App.model) = Server.Store.apply s Counter_app.App.Increment in
+       Lwt.return_unit)
   in
   let after = history_count_of (rpc_post ~ct:json ~path:"/rpc/history_count" history_body) in
   check "history_count increments by exactly 1 after one direct commit to main"

@@ -18,18 +18,18 @@ let () =
      let* _ = Store.apply s Increment in
      let* _ = Store.apply s Increment in
      let* m3 = Store.apply s Increment in
-     check "three increments -> count = 3" (m3.count = 3);
+     check "three increments -> count = 3" (value m3 = 3);
      let* hist = Store.history s in
      check "history has one commit per update (3)" (List.length hist = 3);
      let* undone = Store.undo s in
      let undo_ok =
        match undone with
-       | Some m -> m.count = 2
+       | Some m -> value m = 2
        | None -> false
      in
      check "undo walks to previous commit -> count = 2" undo_ok;
      let* loaded = Store.load s in
-     check "reload after undo -> count = 2" (loaded.count = 2);
+     check "reload after undo -> count = 2" (value loaded = 2);
      Printf.printf "\nAll persistence invariants hold (T1 proven end-to-end).\n%!";
      Lwt.return_unit)
 
@@ -60,7 +60,7 @@ let () =
      let* (_ : model) = Store.apply s Increment in
      let* delivered = await (fun () -> !seen1 <> []) in
      check "watch delivers the committed model (count = 1)"
-       (delivered && List.map (fun m -> m.count) !seen1 = [ 1 ]);
+       (delivered && List.map value !seen1 = [ 1 ]);
      (* Fence: unwatch w1, commit, register w2, commit again. w2's delivery
         proves the notification round for the later commit completed, so a
         still-live w1 would have recorded the second commit by now. *)
@@ -75,7 +75,7 @@ let () =
      let* (_ : model) = Store.apply s Increment in
      let* fenced = await (fun () -> !seen2 <> []) in
      check "a fresh watch anchors at registration (sees only count = 3)"
-       (fenced && List.map (fun m -> m.count) !seen2 = [ 3 ]);
+       (fenced && List.map value !seen2 = [ 3 ]);
      check "unwatch stops delivery (w1 recorded exactly one frame)"
        (List.length !seen1 = 1);
      let* () = Store.unwatch w2 in
@@ -110,7 +110,7 @@ let () =
      let* hist = Store.history s in
      check "history after checkpoint is exactly one commit" (List.length hist = 1);
      let* m = Store.load s in
-     check "the model survives the squash (count = 2)" (m.count = 2);
+     check "the model survives the squash (count = 2)" (value m = 2);
      let* u = Store.undo s in
      check "undo at the squashed root is None" (Option.is_none u);
      let sid = Option.get (Tea_core.Prim.Session_id.of_string "cafe") in

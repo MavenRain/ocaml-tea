@@ -37,7 +37,7 @@ let () =
      let* (_ : model) = Store.apply main Increment in
      let* (_ : model) = Store.apply main Increment in
      let* m3 = Store.apply main Increment in
-     check "archive baseline: three increments -> count = 3" (m3.count = 3);
+     check "archive baseline: three increments -> count = 3" (value m3 = 3);
      let* mainb = Store.S.main (Store.repo t) in
      let* head0 = Store.S.Head.find mainb in
      (* Probe by HASH, not by the direct (offset) key: archive GC relocates the
@@ -65,7 +65,7 @@ let () =
 
      (* Head model is intact, history collapsed to the checkpoint. *)
      let* m_main = Store.load main in
-     check "main's model is intact after archive gc (count = 3)" (m_main.count = 3);
+     check "main's model is intact after archive gc (count = 3)" (value m_main = 3);
      let* hist_main = Store.history main in
      check "main's history is exactly the checkpoint after gc" (List.length hist_main = 1);
 
@@ -93,7 +93,7 @@ let () =
      let* main2 = Store.main_session t2 in
      let* m_re = Store.load main2 in
      check "the retained checkpoint model survives archive gc + reopen (count = 3)"
-       (m_re.count = 3);
+       (value m_re = 3);
      let* () = Store.close t2 in
 
      let rec rm_rf (path : string) : unit =

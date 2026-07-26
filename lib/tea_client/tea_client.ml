@@ -85,12 +85,24 @@ module Subs = struct
 end
 
 module Make (A : Tea_core.App.APP) = struct
+  (* The client tab's single CRDT context (roadmap step 8, D1): one replica id
+     for every locally-born edit, minting dots from a local monotonic clock.
+     The wall source is [0] here (this half links natively and has no browser
+     clock); server stamps are real wall-seconds and therefore dominate, so a
+     pushed [Sync] head is authoritative on any LWW field (R6). A future phase
+     (D8/D9, tea_client_run) seeds this clock from the browser and owns
+     reconnect/rebase. *)
+  let ctx =
+    let clock = Tea_core.Clock.create ~now:(fun () -> 0L) in
+    let replica = Tea_core.Crdt.Replica.v (Tea_core.Prim.Session_id.v "client") in
+    Tea_core.Crdt.Ctx.v ~clock ~replica
+
   let app =
     let model, cmd = A.init in
     Vdom.app
       ~init:(model, cmd_to_vdom cmd)
       ~update:(fun model msg ->
-        let model', cmd = A.update msg model in
+        let model', cmd = A.update ctx msg model in
         (model', cmd_to_vdom cmd))
       ~view:(fun model -> html_to_vdom (A.view model))
       ()

@@ -62,18 +62,18 @@ let () =
      check "main is reserved and kept" (List.mem "main" post);
      (* The live branch's model is intact after the sweep. *)
      let* live_m = Store.load live in
-     check "the kept live branch still loads its model (count = 1)" (live_m.count = 1);
+     check "the kept live branch still loads its model (count = 1)" (value live_m = 1);
 
      (* --- Crash-safe redo (write-ref-first) ------------------------------- *)
      (* Build a little history on the live branch, then undo. *)
      let* (_ : model) = Store.apply live Increment in
      let* (_ : model) = Store.apply live Increment in
      let* before_undo = Store.load live in
-     check "live branch is at count = 3 before undo" (before_undo.count = 3);
+     check "live branch is at count = 3 before undo" (value before_undo = 3);
      let* undone = Store.undo live in
      let undo_ok =
        match undone with
-       | Some m -> m.count = 2
+       | Some m -> value m = 2
        | None -> false
      in
      check "undo walks back one commit (count = 2)" undo_ok;
@@ -86,9 +86,9 @@ let () =
      let* redo_model =
        Option.fold redo_head
          ~none:(Lwt.return (fst init))
-         ~some:(fun c -> Store.model_at c)
+         ~some:(fun c -> Store.model_at t c)
      in
-     check "the redo pointer targets the pre-undo head (count = 3)" (redo_model.count = 3);
+     check "the redo pointer targets the pre-undo head (count = 3)" (value redo_model = 3);
      (* The reaper must never sweep a redo- pointer, even though it is a branch. *)
      let* reaped2 = Store.reap t ~ttl ~now:9000L in
      let* after = Store.S.Branch.list (Store.repo t) in
@@ -105,7 +105,7 @@ let () =
      let* redone = Store.redo live2 in
      let redo_ok =
        match redone with
-       | Some m -> m.count = 3
+       | Some m -> value m = 3
        | None -> false
      in
      check "redo after restart restores the pre-undo head (count = 3)" redo_ok;

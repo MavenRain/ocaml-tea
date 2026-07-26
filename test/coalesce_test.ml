@@ -35,13 +35,13 @@ let () =
      let* hist = Store.history sa in
      check "a 3-msg burst lands as exactly one extra commit"
        (List.length hist = List.length base_hist + 1);
-     check "the folded model is the full 3-step fold (count = 4)" (m.count = 4);
+     check "the folded model is the full 3-step fold (count = 4)" (value m = 4);
 
      (* (c) undo after the burst restores the pre-burst model. *)
      let* undone = Store.undo sa in
      let undo_ok =
        match undone with
-       | Some u -> u.count = 1
+       | Some u -> value u = 1
        | None -> false
      in
      check "undo after a burst is whole-run (back to pre-burst count = 1)" undo_ok;
@@ -52,7 +52,7 @@ let () =
          (fun ~last:_ ~next ->
            match next with
            | Reset -> None
-           | Increment | Decrement | Sync _ -> Some next)
+           | Increment | Decrement | Sync (_ : model) -> Some next)
      in
      let* sb = Store.session repo (sid "bb") in
      let cz2 = Store.Coalescer.v boundary_on_reset in
@@ -65,7 +65,7 @@ let () =
      let* undone2 = Store.undo sb in
      let one_back =
        match undone2 with
-       | Some u -> u.count = 2
+       | Some u -> value u = 2
        | None -> false
      in
      check "undo then steps exactly one boundary back (count = 2)" one_back;
@@ -77,13 +77,13 @@ let () =
      let* (_ : model) = Store.apply_coalesced cz3 sd Increment in
      let* m3 = Store.apply_coalesced cz3 sd Increment in
      let* hist3 = Store.history sd in
-     check "Keep_all parity: three increments -> count = 3" (m3.count = 3);
+     check "Keep_all parity: three increments -> count = 3" (value m3 = 3);
      check "Keep_all parity: history has one commit per update (3)"
        (List.length hist3 = 3);
      let* u3 = Store.undo sd in
      let keep_all_undo =
        match u3 with
-       | Some u -> u.count = 2
+       | Some u -> value u = 2
        | None -> false
      in
      check "Keep_all parity: undo walks one commit (count = 2)" keep_all_undo;
@@ -93,7 +93,7 @@ let () =
      let* se = Store.session repo (sid "ee") in
      let cz4 = Store.Coalescer.v fold_all in
      let* (_ : model) = Store.apply_coalesced cz4 se Increment in
-     let* (_ : model) = Store.apply se (Sync 10) in
+     let* (_ : model) = Store.apply se Increment in
      let* foreign_head = Store.head_ref se in
      let* (_ : model) = Store.apply_coalesced cz4 se Increment in
      let* hist4 = Store.history se in
@@ -110,7 +110,7 @@ let () =
      in
      check "the foreign commit survives verbatim in history" foreign_survives;
      let* m4 = Store.load se in
-     check "the model still folds every msg (10 + 1 = 11)" (m4.count = 11);
+     check "the model still folds every msg (1 + 1 + 1 = 3)" (value m4 = 3);
 
      (* (g) seal forces a run boundary. *)
      let* sg = Store.session repo (sid "gg") in
@@ -128,7 +128,7 @@ let () =
      let seen = ref [] in
      let* w =
        Store.watch sf (fun mw ->
-           seen := mw.count :: !seen;
+           seen := value mw :: !seen;
            Lwt.return_unit)
      in
      let cz6 = Store.Coalescer.v fold_all in
@@ -140,32 +140,35 @@ let () =
        (fired && List.rev !seen = [ 1; 2; 3 ]);
      let* () = Store.unwatch w in
 
-     (* (h) Fork mid-burst is the documented hazard: the next amend moves the
-        merge base off the forked commit, so the merge sees both sides
-        changed and surfaces it. [Coalescer.seal] before forking is the
-        escape hatch — the post-seal Msg appends instead, the forked head
-        stays an ancestor, and the merge is a clean fast-forward. *)
+     (* (h) Fork mid-burst WAS the documented hazard: the next amend moved the
+        merge base off the forked commit, so the step-4 three-way merge saw both
+        sides changed and conflicted. Under the CvRDT merge (D1) that base shift
+        no longer conflicts — the PN-counter join reconciles the two heads with
+        no ancestor (D9 resolved). Both the mid-burst fork and the sealed fork
+        now converge; the observable difference is only in commit count, which
+        the earlier cases pin. *)
      let* sh = Store.session repo (sid "hh") in
      let cz7 = Store.Coalescer.v fold_all in
-     let* (_ : model) = Store.apply sh (Sync 0) in
+     let* (_ : model) = Store.apply sh Increment in
      let* (_ : model) = Store.apply_coalesced cz7 sh Increment in
      let* forked_hot = Store.fork repo ~from:sh (sid "midburst") in
      let* (_ : model) = Store.apply_coalesced cz7 sh Increment in
      let* merged_hot = Store.merge_into ~src:sh ~dst:forked_hot in
-     check "fork mid-burst surfaces the base shift (merge reports a conflict)"
-       (Result.is_error merged_hot);
+     check "fork mid-burst now converges via the CvRDT join (no conflict)"
+       (Result.is_ok merged_hot);
+     let* mhot = Store.load forked_hot in
+     check "the mid-burst merge reconciles to the full run (count = 3)" (value mhot = 3);
      let* sh2 = Store.session repo (sid "hh2") in
      let cz8 = Store.Coalescer.v fold_all in
-     let* (_ : model) = Store.apply sh2 (Sync 0) in
+     let* (_ : model) = Store.apply sh2 Increment in
      let* (_ : model) = Store.apply_coalesced cz8 sh2 Increment in
      Store.Coalescer.seal cz8;
      let* forked_cold = Store.fork repo ~from:sh2 (sid "sealed") in
      let* (_ : model) = Store.apply_coalesced cz8 sh2 Increment in
      let* merged_cold = Store.merge_into ~src:sh2 ~dst:forked_cold in
-     check "seal before fork keeps the base: the merge fast-forwards"
-       (Result.is_ok merged_cold);
+     check "seal before fork converges too (fast-forward)" (Result.is_ok merged_cold);
      let* mf = Store.load forked_cold in
-     check "the sealed-fork session sees the appended run (count = 2)" (mf.count = 2);
+     check "the sealed-fork session sees the appended run (count = 3)" (value mf = 3);
 
      (* (i) Seeded property loop: whatever the (deterministically random)
         policy verdicts and msg mix, the final model equals the plain
@@ -177,6 +180,14 @@ let () =
          1L
      in
      let iters = 200 in
+     (* A single-replica context for the reference fold: the counter's value is
+        replica-agnostic (n increments read as n under any one replica), so this
+        matches whatever replica the store applies each branch under. *)
+     let prop_ctx =
+       Tea_core.Crdt.Ctx.v
+         ~clock:(Tea_core.Clock.create ~now:(fun () -> 0L))
+         ~replica:(Tea_core.Crdt.Replica.v (Prim.Session_id.v "prop"))
+     in
      let* prop_ok =
        List.fold_left
          (fun acc (i : int) ->
@@ -187,7 +198,7 @@ let () =
                Spec.Fold_run
                  (fun ~last:_ ~next ->
                    match next with
-                   | Increment | Decrement | Reset | Sync _ ->
+                   | Increment | Decrement | Reset | Sync (_ : model) ->
                      if lcg_bit () then Some next else None)
              in
              let* si = Store.session repo (sid (Printf.sprintf "prop%04x" i)) in
@@ -204,9 +215,9 @@ let () =
                  (Store.load si) msgs
              in
              let expected =
-               List.fold_left (fun mm msg -> fst (update msg mm)) (fst init) msgs
+               List.fold_left (fun mm msg -> fst (update prop_ctx msg mm)) (fst init) msgs
              in
-             Lwt.return (final.count = expected.count))
+             Lwt.return (value final = value expected))
          (Lwt.return true)
          (List.init iters Fun.id)
      in

@@ -27,7 +27,7 @@ let () =
      let* (_ : model) = Store.apply main Increment in
      let* (_ : model) = Store.apply main Increment in
      let* m3 = Store.apply main Increment in
-     check "pack baseline: three increments -> count = 3" (m3.count = 3);
+     check "pack baseline: three increments -> count = 3" (value m3 = 3);
      let* hist = Store.history main in
      check "pack baseline: history has one commit per update (3)" (List.length hist = 3);
      (* Capture the pre-checkpoint head commit key for the post-GC probe. *)
@@ -46,7 +46,7 @@ let () =
      check "checkpoint succeeds on a non-empty branch" (Option.is_some cp);
      let cp = Option.get cp in
      let* m_after = Store.load main in
-     check "checkpoint leaves the model unchanged (count = 3)" (m_after.count = 3);
+     check "checkpoint leaves the model unchanged (count = 3)" (value m_after = 3);
      let* hist_cp = Store.history main in
      let cp_pinned =
        match hist_cp with
@@ -81,7 +81,7 @@ let () =
      in
      check "gc ~retain:checkpoint succeeds (minimal indexing)" gc_ok;
      let* m_main = Store.load main in
-     check "main's model is intact after gc (count = 3)" (m_main.count = 3);
+     check "main's model is intact after gc (count = 3)" (value m_main = 3);
      let* hist_main = Store.history main in
      check "main's history is still exactly the checkpoint"
        (List.length hist_main = 1);
@@ -105,11 +105,11 @@ let () =
         | `Gone_none | `Gone_raised -> true
         | `Still_readable -> false);
      let* m_b = Store.load b in
-     check "the post-checkpoint fork's model is intact (count = 4)" (m_b.count = 4);
+     check "the post-checkpoint fork's model is intact (count = 4)" (value m_b = 4);
      let* undo_b = Store.undo b in
      let undo_b_ok =
        match undo_b with
-       | Some u -> u.count = 3
+       | Some u -> value u = 3
        | None -> false
      in
      check "undo on the fork lands on the checkpoint model (count = 3)" undo_b_ok;
@@ -137,7 +137,7 @@ let () =
      let* t2 = Store.create ~now:(fun () -> 43L) root in
      let* main2 = Store.main_session t2 in
      let* m_re = Store.load main2 in
-     check "close/reopen keeps the checkpoint-era model (count = 3)" (m_re.count = 3);
+     check "close/reopen keeps the checkpoint-era model (count = 3)" (value m_re = 3);
      (* The reopened clock is seeded from the branch heads, so a commit under
         a frozen wall clock BELOW the stored dates still stamps strictly
         above them — restart cannot reopen the dedup window. *)
