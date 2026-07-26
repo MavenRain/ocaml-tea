@@ -81,3 +81,47 @@ let () =
      let* () = Store.unwatch w2 in
      Printf.printf "\nStore watches deliver commits, and unwatch fences (step 3).\n%!";
      Lwt.return_unit)
+
+(** Checkpoint squash on the mem backend (roadmap step 6): the squashed root
+    carries the model, history collapses to one commit, and undo bottoms
+    out — the same semantics [pack_test] pins on disk, pinned cheaply here. *)
+let () =
+  Lwt_main.run
+    (let open Lwt.Syntax in
+     let open Counter_app.App in
+     let module Store = Tea_persist.Store.Make (Counter_app.App) in
+     let check name cond =
+       if cond then Printf.printf "ok   - %s\n%!" name
+       else (
+         Printf.printf "FAIL - %s\n%!" name;
+         exit 1)
+     in
+     let* repo = Store.create () in
+     let* s = Store.main_session repo in
+     let* (_ : model) = Store.apply s Increment in
+     let* (_ : model) = Store.apply s Increment in
+     let* cp_r = Store.checkpoint s ~label:"checkpoint" in
+     let cp_ok =
+       match cp_r with
+       | Ok (_ : Store.checkpoint) -> true
+       | Error (Empty_branch | Branch_moved) -> false
+     in
+     check "checkpoint on mem succeeds" cp_ok;
+     let* hist = Store.history s in
+     check "history after checkpoint is exactly one commit" (List.length hist = 1);
+     let* m = Store.load s in
+     check "the model survives the squash (count = 2)" (m.count = 2);
+     let* u = Store.undo s in
+     check "undo at the squashed root is None" (Option.is_none u);
+     let sid = Option.get (Tea_core.Prim.Session_id.of_string "cafe") in
+     let* empty_s = Store.session repo sid in
+     let* cp_e = Store.checkpoint empty_s ~label:"nothing" in
+     let empty_arm =
+       match cp_e with
+       | Error Empty_branch -> true
+       | Error Branch_moved -> false
+       | Ok (_ : Store.checkpoint) -> false
+     in
+     check "checkpoint on an empty branch is Error Empty_branch" empty_arm;
+     Printf.printf "\nCheckpoint squash holds on the mem backend (step 6).\n%!";
+     Lwt.return_unit)

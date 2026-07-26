@@ -1,9 +1,11 @@
 (tests
- (names persist_test server_test client_test merge_test collab_test safe_test)
+ (names persist_test server_test client_test merge_test collab_test safe_test
+   clock_test dedup_test coalesce_test pack_test)
  (libraries
   tea_core
   tea_safe
   tea_persist
+  tea_persist_pack
   tea_server
   tea_client
   vdom.base

@@ -60,12 +60,11 @@ let () =
        (String.equal alice_start.title "Draft" && alice_start.likes = 1);
 
      (* Concurrent edits on the two branches. The two sessions' first commits
-        are deliberately different shapes: Irmin commits are content-addressed,
-        so if both branches made the *identical* first edit (same tree, same
-        parent, same second-resolution commit info) those two commits would
-        dedup to one shared node, pulling the merge base off the true root and
-        double-subtracting the shared delta. Real collaborators diverge; the
-        test mirrors that. Only Bob edits the title. *)
+        are deliberately different shapes for realism; since roadmap step 6
+        the monotonic commit clock makes even *identical* same-second first
+        edits stay distinct commits (the content-address dedup that used to
+        pull the merge base off the true root is pinned fixed in
+        [dedup_test.ml]). Only Bob edits the title. *)
      let* (_ : model) = Store.apply alice Like in
      let* (_ : model) = Store.apply alice (Add_tag "urgent") in
      let* (_ : model) = Store.apply bob (Add_tag "review") in
@@ -117,9 +116,9 @@ let () =
         shared doc floors likes at 0 (via [Unlike]'s clamp); the merge policy
         clamps too, so two concurrent unlikes of the 1-like ancestor reconcile
         to 0, never the -1 the raw delta-sum (0 + 0 - 1) would give. Each side
-        adds a distinct tag first, so their Unlike commits stay distinct and the
-        merge base holds at likes = 1 (else the shared-commit collapse from
-        scenario 1 would hide the clamp). *)
+        adds a distinct tag first so the scenario reads as real divergence;
+        the step-6 monotonic clock alone already keeps identical Unlike
+        commits distinct (see [dedup_test.ml]). *)
      let* eve = Store.fork repo ~from:main (sid "eve") in
      let* frank = Store.fork repo ~from:main (sid "frank") in
      let* (_ : model) = Store.apply eve (Add_tag "e") in

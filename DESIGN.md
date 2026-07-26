@@ -28,7 +28,10 @@ toolchain removes an entire tier lean-tea had to hand-write.
 | `test/client_test` - translation fidelity via native decoder evaluation | **passes** (confirmed by mutation) |
 | `examples/counter/client` - Counter in the browser (js_of_ocaml) | **built** (`main.bc.js` + `index.html`) |
 | `lib/tea_rpc` - GADT endpoint contract | designed (§8), not yet built |
-| `lib/tea_safe` - the 9 security primitives | designed (§9), stubs pending |
+| `lib/tea_safe` - the 9 security primitives as `.mli` boundaries | **built, green** (roadmap step 5, R7) |
+| `lib/tea_persist/clock` + `store_core` - monotonic commit clock, backend-generic store, coalescing, checkpoint | **built, green** (roadmap step 6) |
+| `lib/tea_persist_pack` - irmin-pack backend + GC behind a retained checkpoint | **built, green; `test/pack_test` passes** |
+| `test/clock_test`, `test/dedup_test`, `test/coalesce_test`, `test/pack_test` - step-6 suite | **passes** (confirmed by mutation) |
 
 Toolchain: OCaml 5.3.0, dune 3.24, a dedicated opam switch (`irmin-tea` locally) with
 `irmin 3.11`, `dream 1.0.0~alpha8`, `repr 0.8`, `vdom 0.3`, `js_of_ocaml 6.4`.
@@ -129,19 +132,36 @@ common ancestor with the source.
 > same second) therefore collapse to *one* commit, which can move a later merge
 > base off the true root - e.g. two counters that both `+1` as their first
 > concurrent act dedup, and the merge counts that shared step once, not twice.
-> This is consistent (the shared commit genuinely *is* shared) but surprising;
-> a monotonic per-commit `Info` clock would keep intended-distinct edits
-> distinct, and is the clean fix when history hygiene lands (roadmap step 6).
+> This is consistent (the shared commit genuinely *is* shared) but surprising.
+> **Fixed in roadmap step 6:** every store handle mints commit dates from a
+> monotonic clock (`Tea_persist.Clock`, `max(wall, last+1)`, seeded from the
+> branch heads on open), so intended-distinct edits stay distinct;
+> `test/dedup_test` pins the regression, including the merge counting both
+> sibling deltas.
+>
+> *Known edge (latent-LOW, documented not fixed).* The reopen seed draws from
+> `S.Repo.heads` only, so a commit orphaned by `undo` (still resident, dated
+> above every head) is not counted. A reopen within that commit's wall-clock
+> second could re-mint its date — but this fools no live path: a redo landing
+> back on the exact undone commit is the correct outcome, and within one
+> session all sessions share the single clock. A full all-commits seed scan
+> would defeat the R1 scale goal, so this waits for a feature that needs
+> date-uniqueness across all live objects rather than across heads.
 
-**Planned refinements** (from the design, not yet built):
-- *Exploded tree* - one path per model field / entity / index row, so merges are
-  per-field and "queries" become index-tree lookups (lean-tea's `Entity`/`Repo`
-  patterns → maintained secondary-index subtrees, since Irmin has no SQL).
-- *Backends* - `irmin.mem` (tests, today) → `irmin-git` (durable, inspectable) →
-  `irmin-pack` (scale + GC).
-- *History-growth control* - debounce/coalesce chatty Msgs into one commit;
-  squash session branches on checkpoint; `irmin-pack` GC behind a retained
-  checkpoint. (See risks R1/R6.)
+**Refinements:**
+- *Exploded tree* (not yet built) - one path per model field / entity / index
+  row, so merges are per-field and "queries" become index-tree lookups
+  (lean-tea's `Entity`/`Repo` patterns → maintained secondary-index subtrees,
+  since Irmin has no SQL).
+- *Backends* - **shipped** (step 6): the store body is backend-generic
+  (`Store_core.Make (A) (S)`); `Tea_persist.Store` is the `irmin.mem` shim,
+  `Tea_persist_pack.Store_pack` the durable `irmin-pack` one (scale + GC,
+  always `Indexing_strategy.minimal` so delete-GC stays allowed). `irmin-git`
+  remains a functor argument away.
+- *History-growth control* - **shipped** (step 6, R1): `Coalesce_spec`-driven
+  commit coalescing (amend-with-ownership-guard, no timers — see §6 for the
+  per-socket wiring), `checkpoint` squash-to-root, and `Store_pack.gc
+  ~retain:checkpoint`. The retention knob is the checkpoint argument itself.
 
 ## 6. Server (Dream) - designed
 
@@ -257,8 +277,15 @@ Each lean-tea private-constructor primitive → an OCaml `.mli` boundary:
 ## 10. Risk register (finder-reported, **unverified** - verify pass did not run)
 
 - **R1 (high) - commit-per-Msg volume / unbounded history.** Chatty UIs make
-  millions of commits. Mitigation: debounce/coalesce, squash, `irmin-pack` GC
-  with an explicit retention knob.
+  millions of commits. **Mitigation shipped** (roadmap step 6):
+  `Tea_core.Coalesce_spec` + the store's amend-based coalescer folds a chatty
+  run into one commit (ownership-guarded, test-and-set, no debounce loss
+  window); `checkpoint` squashes a session branch to a single root;
+  `Tea_persist_pack.gc ~retain:checkpoint` discards everything older than and
+  unreachable from the retained checkpoint. Residual footgun: GC under live
+  pre-checkpoint sessions degrades their history walks to truncation/`None`
+  (documented precondition, not enforced — enforcement belongs to the R3
+  reaper story).
 - **R2 (high) - 3-way merge of arbitrary models is unsound by default.** A naive
   last-writer-wins silently drops concurrent edits. **Mitigation shipped:**
   `lib/tea_core/merge` - `conflict` (never guess) and `atomic` (conflict when
@@ -310,4 +337,10 @@ Each lean-tea private-constructor primitive → an OCaml `.mli` boundary:
    Location-CRLF gaps; wired into `Store` and `Tea_server`; `test/safe_test`
    plus extended `server_test`, every new check confirmed by mutation).
 6. **History hygiene** - coalescing + `irmin-pack` + GC retention (R1).
+   **Done** (`Tea_persist.Clock` monotonic commit dates fixing the §5 dedup
+   collapse; backend-generic `Store_core` with `checkpoint` squash and the
+   ownership-guarded coalescer driven by `Tea_core.Coalesce_spec`;
+   `Tea_persist_pack.Store_pack` with `gc ~retain:checkpoint`; `?coalesce`
+   per-socket policy on `Tea_server.serve`; `clock_test`/`dedup_test`/
+   `coalesce_test`/`pack_test`, every new check confirmed by mutation).
 7. **RPC GADT** + a typed endpoint example.

@@ -83,10 +83,13 @@ module Make (A : Tea_core.App.APP) = struct
     ; redirect : Prim.Url.t option
     }
 
-  (** One TEA step over HTTP: load, [Loop.step] (settling the [Cmd] tail),
-      commit labelled with the Msg so the branch log stays the event log. A
-      [Navigate] effect is captured and surfaced as the redirect target. *)
-  let step (s : Store.session) (msg : A.msg) : (step_outcome, Loop.err) result Lwt.t =
+  (** One TEA step: load, [Loop.step] (settling the [Cmd] tail), then persist
+      through [commit] — the one seam the form-post path (plain event-log
+      commit) and the WS pump (coalesced commit) share, so every path mints
+      its commit dates from the store's single clock. A [Navigate] effect is
+      captured and surfaced as the redirect target. *)
+  let step_with ~(commit : Store.session -> msg:A.msg -> A.model -> unit Lwt.t)
+      (s : Store.session) (msg : A.msg) : (step_outcome, Loop.err) result Lwt.t =
     let redirect = ref None in
     let fx =
       { Loop.sleep = (fun d -> Lwt_unix.sleep (float_of_int (Prim.Delay.to_ms d) /. 1000.))
@@ -100,9 +103,15 @@ module Make (A : Tea_core.App.APP) = struct
     let* stepped = Loop.step ~fx ~fuel:Prim.Fuel.default msg model in
     Result.fold stepped
       ~ok:(fun model' ->
-        let* () = Store.commit s ~label:(Codec.msg_to_label msg) model' in
+        let* () = commit s ~msg model' in
         Lwt.return (Ok { model = model'; redirect = !redirect }))
       ~error:(fun (e : Loop.err) -> Lwt.return (Error e))
+
+  (** One TEA step over HTTP: one commit per Msg, labelled with the Msg so
+      the branch log stays the event log. *)
+  let step : Store.session -> A.msg -> (step_outcome, Loop.err) result Lwt.t =
+    step_with ~commit:(fun s ~msg model ->
+        Store.commit s ~label:(Codec.msg_to_label msg) model)
 
   (* --- Live view over WebSocket (roadmap step 3, DESIGN §7) -------------- *)
 
@@ -129,7 +138,13 @@ module Make (A : Tea_core.App.APP) = struct
       announcement races frames for commits landing during registration); the
       stream converges on the newest head because later commits always fire
       later watch callbacks. *)
-  let live_session (s : Store.session) (t : live_transport) : unit Lwt.t =
+  let live_session ?(coalesce = Tea_core.Coalesce_spec.Keep_all) (s : Store.session)
+      (t : live_transport) : unit Lwt.t =
+    (* One coalescer per socket (R1): a chatty client folds its own run of
+       Msgs into one amended commit, and can never amend a commit some other
+       writer minted — a form post, a merge, or an undo ends the run. *)
+    let cz = Store.Coalescer.v coalesce in
+    let step_ws = step_with ~commit:(Store.commit_coalesced cz) in
     let frames, push = Lwt_stream.create () in
     let* w =
       Store.watch s (fun m ->
@@ -145,7 +160,7 @@ module Make (A : Tea_core.App.APP) = struct
       | Some json ->
         Result.fold (Codec.msg_of_json json)
           ~ok:(fun msg ->
-            let* stepped = step s msg in
+            let* stepped = step_ws s msg in
             Result.fold stepped
               ~ok:(fun (_ : step_outcome) -> pump ())
               ~error:(fun (Loop.Fuel_exhausted : Loop.err) -> Lwt.return_unit))
@@ -160,21 +175,23 @@ module Make (A : Tea_core.App.APP) = struct
      function that names [Dream.websocket], and it demands the proof that
      [Origin_gate.check] mints, so a socket accepted without the same-origin
      check cannot be expressed here. *)
-  let accept_ws (_ : Tea_safe.Origin_gate.same_origin Tea_safe.Proof.t) (repo : Store.t)
+  let accept_ws (_ : Tea_safe.Origin_gate.same_origin Tea_safe.Proof.t)
+      ~(coalesce : A.msg Tea_core.Coalesce_spec.t) (repo : Store.t)
       (request : Dream.request) : Dream.response Lwt.t =
     with_session repo request (fun s ->
         Dream.websocket (fun ws ->
-            live_session s
+            live_session ~coalesce s
               { send_frame = Dream.send ws
               ; receive_frame = (fun () -> Dream.receive ws)
               }))
 
-  let handle_ws (repo : Store.t) (request : Dream.request) : Dream.response Lwt.t =
+  let handle_ws ~(coalesce : A.msg Tea_core.Coalesce_spec.t) (repo : Store.t)
+      (request : Dream.request) : Dream.response Lwt.t =
     Tea_safe.Origin_gate.check
       ~origin:(Dream.header request "Origin")
       ~host:(Dream.header request "Host")
     |> Result.fold
-         ~ok:(fun proof -> accept_ws proof repo request)
+         ~ok:(fun proof -> accept_ws proof ~coalesce repo request)
          ~error:(fun (d : Tea_safe.Origin_gate.denial) ->
            match d with
            | Origin_missing | Host_missing | Both_missing | Origin_mismatch ->
@@ -281,7 +298,8 @@ module Make (A : Tea_core.App.APP) = struct
      [/app] pages), so the SSR tier, the live client, and the WebSocket share
      one origin — which is precisely what {!same_origin} and the shared Dream
      session cookie require. *)
-  let router ?(client_dir : string option) (repo : Store.t) : Dream.handler =
+  let router ?(client_dir : string option)
+      ?(coalesce = Tea_core.Coalesce_spec.Keep_all) (repo : Store.t) : Dream.handler =
     let client_routes =
       Option.fold client_dir ~none:[]
         ~some:(fun dir ->
@@ -293,7 +311,7 @@ module Make (A : Tea_core.App.APP) = struct
       ([ Dream.get "/" (handle_root repo)
        ; Dream.post msg_path (handle_msg repo)
        ; Dream.post undo_path (handle_undo repo)
-       ; Dream.get ws_path (handle_ws repo)
+       ; Dream.get ws_path (handle_ws ~coalesce repo)
        ]
       @ client_routes)
 
@@ -310,11 +328,13 @@ module Make (A : Tea_core.App.APP) = struct
   (** The full request pipeline: session middleware over the security-headers
       middleware over the router. Exposed so tests can drive it with
       [Dream.test] against an in-memory repo. *)
-  let handler ?client_dir (repo : Store.t) : Dream.handler =
-    Dream.memory_sessions (secure_headers (router ?client_dir repo))
+  let handler ?client_dir ?coalesce (repo : Store.t) : Dream.handler =
+    Dream.memory_sessions (secure_headers (router ?client_dir ?coalesce repo))
 
-  (** Blocking entry point for a native server binary. *)
-  let serve ?(interface = "localhost") ?(port = 8080) ?client_dir () : unit =
+  (** Blocking entry point for a native server binary. [?coalesce] is the
+      app's commit-coalescing policy for live (WS) sessions; the default
+      keeps one commit per Msg. *)
+  let serve ?(interface = "localhost") ?(port = 8080) ?client_dir ?coalesce () : unit =
     let repo = Lwt_main.run (Store.create ()) in
-    Dream.run ~interface ~port (Dream.logger (handler ?client_dir repo))
+    Dream.run ~interface ~port (Dream.logger (handler ?client_dir ?coalesce repo))
 end
