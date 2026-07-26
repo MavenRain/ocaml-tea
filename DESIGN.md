@@ -158,6 +158,23 @@ common ancestor with the source.
   `Tea_persist_pack.Store_pack` the durable `irmin-pack` one (scale + GC,
   always `Indexing_strategy.minimal` so delete-GC stays allowed). `irmin-git`
   remains a functor argument away.
+
+  > **The pack contents-framing contract.** A pack entry is
+  > `[hash][kind][the contents codec's own bytes]`; nothing in irmin-pack writes
+  > a length of its own, so with `contents_length_header = `Varint` the reader
+  > recovers the entry length by decoding a varint at the head of *our* bytes.
+  > A `Repr.record`'s leading varint frames only its **first field**, so any
+  > multi-field model was handed a truncated buffer on reopen and died in
+  > `decode_bin` (`Invalid_argument "index out of bounds"`); a single-field model
+  > (the Counter) satisfies the contract by accident, which is why every
+  > Counter-driven pack test passed while the D1 CvRDT doc could not survive one
+  > close/reopen. `Store_pack.framed` wraps the whole model as one
+  > `Repr.string`, restoring the invariant for any app model — so framing is the
+  > storage layer's job, and CRDT states stay structural `Repr` values (a
+  > readable JSON wire form). Pinned by `test/pack_crdt_test.ml`, whole-model and
+  > exploded. Setting the header to `None` is not the alternative: with minimal
+  > indexing the length would then be unrecoverable (reads fail as
+  > `dangling hash`).
 - *History-growth control* - **shipped** (step 6, R1): `Coalesce_spec`-driven
   commit coalescing (amend-with-ownership-guard, no timers — see §6 for the
   per-socket wiring), `checkpoint` squash-to-root, and `Store_pack.gc

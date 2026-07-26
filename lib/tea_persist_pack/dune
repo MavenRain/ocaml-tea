@@ -1,3 +1,4 @@
 (library
  (name tea_persist_pack)
- (libraries tea_core tea_safe tea_persist irmin irmin-pack irmin-pack.unix lwt))
+ (libraries tea_core tea_safe tea_persist repr irmin irmin-pack irmin-pack.unix
+   lwt))

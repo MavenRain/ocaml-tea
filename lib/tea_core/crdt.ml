@@ -11,8 +11,6 @@ module Replica = struct
   let compare = Prim.Session_id.compare
   let equal (a : t) (b : t) : bool = compare a b = 0
 
-  (* A direct string witness (via [Prim.Session_id.t]), NOT [Repr.map]: a
-     map-wrapped string misframes under irmin-pack's contents-length header. *)
   let t : t Repr.t = Prim.Session_id.t
 end
 
@@ -51,33 +49,22 @@ module Ctx = struct
   let replica (t : t) : Replica.t = t.replica
 end
 
-(* Encode a structured state as an opaque, self-delimiting string blob.
-
-   irmin-pack's contents-length framing ([contents_length_header = `Varint])
-   round-trips a scalar leaf (an int, a string) but misframes a structured
-   dynamic content (a [list] of [pair]s) on reopen — the decoder reads a garbage
-   length and blits past the buffer. Wrapping the state's binary encoding as a
-   single [Repr.string] makes every CRDT field a scalar leaf, which pack stores
-   and reloads faithfully. The [of_bin_string] round-trip is total for any bytes
-   we ourselves wrote; the [fallback] is the never-taken corrupt-bytes arm (no
-   exception in normal control flow). *)
-let blob (type a) (inner : a Repr.t) (fallback : a) : a Repr.t =
-  let enc = Repr.unstage (Repr.to_bin_string inner) in
-  let dec = Repr.unstage (Repr.of_bin_string inner) in
-  Repr.map Repr.string
-    (fun (s : string) -> Result.fold (dec s) ~ok:Fun.id ~error:(fun (_ : [ `Msg of string ]) -> fallback))
-    enc
+(* Every CRDT state below is a plain structural [Repr.t] — a list, a record, an
+   option. That is safe on every backend because entry framing is the storage
+   layer's job, not the model's: the pack backend wraps the WHOLE model in one
+   length-framed blob ([Tea_persist_pack.Store_pack.framed]), which is what
+   irmin-pack's [contents_length_header] actually requires. Framing individual
+   fields here instead is both unnecessary and insufficient (it only ever
+   accidentally satisfied the contract for a single-field model), and it costs a
+   readable JSON wire form. *)
 
 module Pn_counter = struct
   (* Sorted-by-replica assoc list replica -> (increments, decrements). Sorted +
-     one entry per replica is the canonical form every operation preserves. The
-     halves are plain [int] (a like/vote counter never approaches [max_int]);
-     [Repr.int] is a self-delimiting varint, which irmin-pack's contents framing
-     round-trips, unlike a fixed-width [int64] in this position. *)
+     one entry per replica is the canonical form every operation preserves. *)
   type state = (Replica.t * (int * int)) list
 
   let bottom : state = []
-  let t : state Repr.t = blob Repr.(list (pair Replica.t (pair int int))) bottom
+  let t : state Repr.t = Repr.(list (pair Replica.t (pair int int)))
 
   let value (s : state) : int =
     List.fold_left (fun acc ((_ : Replica.t), (i, d)) -> acc + (i - d)) 0 s
@@ -139,13 +126,12 @@ module Or_set (E : ELT) = struct
   let bottom : state = { adds = []; tombs = [] }
 
   let t : state Repr.t =
-    blob
-      Repr.(
-        record "or_set" (fun adds tombs -> { adds; tombs })
-        |+ field "adds" (list (pair Dot.t E.t)) (fun s -> s.adds)
-        |+ field "tombs" (list Dot.t) (fun s -> s.tombs)
-        |> sealr)
-      bottom
+    Repr.(
+      record "or_set" (fun adds tombs -> { adds; tombs })
+      |+ field "adds" (list (pair Dot.t E.t)) (fun s -> s.adds)
+      |+ field "tombs" (list Dot.t) (fun s -> s.tombs)
+      |> sealr)
+
   let equal : state -> state -> bool = Repr.(unstage (equal t))
 
   let dot_mem (d : Dot.t) (ds : Dot.t list) : bool = List.exists (fun d' -> Dot.equal d d') ds
@@ -206,15 +192,10 @@ module Lww (V : VAL) = struct
     ; value : V.t
     }
 
-  (* The dot rides as an opaque blob (a [list]-free scalar leaf for pack); the
-     value stays a direct [V.t] leaf. Intended for scalar values (an LWW title /
-     body is a string). *)
-  let dot_blob : Dot.t option Repr.t = blob Repr.(option Dot.t) None
-
   let t : state Repr.t =
     Repr.(
       record "lww" (fun dot value -> { dot; value })
-      |+ field "dot" dot_blob (fun s -> s.dot)
+      |+ field "dot" (option Dot.t) (fun s -> s.dot)
       |+ field "value" V.t (fun s -> s.value)
       |> sealr)
 

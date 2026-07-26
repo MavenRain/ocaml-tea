@@ -26,7 +26,6 @@ let () =
      let open Shared_doc_app.App in
      let module Prim = Tea_core.Prim in
      let module Mem = Tea_persist.Store.Make (Shared_doc_app.App) in
-     let module Pack = Tea_persist_pack.Store_pack.Make (Shared_doc_app.App) in
      let sid s = Option.get (Prim.Session_id.of_string s) in
      let branch_of (s : string) = Prim.Branch_name.(to_string (of_session (sid s))) in
 

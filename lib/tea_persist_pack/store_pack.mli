@@ -15,6 +15,23 @@ module Root : sig
   val to_string : t -> string
 end
 
+val framed : 'a Repr.t -> 'a -> 'a Repr.t
+(** [framed inner fallback] re-encodes [inner] as a single length-prefixed
+    [Repr.string], which is the codec shape irmin-pack requires of a contents
+    type: a pack entry is [hash][kind][the codec's own bytes] and the reader
+    recovers the entry's length by decoding a varint at the head of those bytes.
+    A [Repr.record]'s leading varint frames only its {i first field}, so a
+    multi-field model read back short and its decoder walked off the end of the
+    buffer ([Invalid_argument "index out of bounds"]) — a single-field model
+    satisfied the contract by accident, which is why the Counter-based pack
+    tests never saw it.
+
+    Exposed so the contract is testable on its own, and applied to every store
+    this module builds. [fallback] is the corrupt-bytes arm (no exception in
+    normal control flow); it cannot mask corruption, because irmin re-hashes
+    what it decoded and a fallback value hashes to something other than the
+    requested key. *)
+
 module Make (A : Tea_core.App.APP) : sig
   include Tea_persist.Store_core.CORE with type model = A.model and type msg = A.msg
 
