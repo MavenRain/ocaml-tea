@@ -288,6 +288,14 @@ let () =
     | Shared_doc_rpc.History_count ->
       Lwt.bind (Server.Store.main_session repo) Server.Store.history |> Lwt.map List.length
     | Shared_doc_rpc.Doc_stats -> Lwt.return (Shared_doc_rpc.stats_of req)
+    | Shared_doc_rpc.Append_tag ->
+      (* This suite mounts the shared_doc contract onto the COUNTER app, so
+         there is no doc to tag here. The arm exists ONLY to satisfy the GADT:
+         it is unreachable in this suite, because the sweep below sends a
+         same-origin POST that decodes as no [string], so the 400 lands before
+         any handler runs. The real store-mutating handler and its origin gate
+         are exercised against the shared_doc server in [csrf_test]. *)
+      Lwt.return (String.length req)
   in
   let driver =
     Dream.test (Server.handler ~rpc:(Rpc_ep.routes { Rpc_ep.handle = rpc_handle }) repo)
@@ -360,11 +368,20 @@ let () =
   let over_cap = String.make (Rpc_ep.max_body_bytes + 1) 'x' in
   check "a body of max_body_bytes+1 is refused 413"
     (status (rpc_post ~ct:json ~path:"/rpc/doc_stats" over_cap) = 413);
-  (* (8) reachability sweep: every derived path is routed (non-404). *)
+  (* (8) reachability sweep: every derived path is routed (non-404). Sent
+     same-origin, so a [Mutating] endpoint clears its origin gate and the check
+     is about ROUTING - otherwise a 403 would satisfy "non-404" while proving
+     only that the gate ran. *)
+  let same_origin_headers =
+    [ ("Content-Type", json); ("Origin", "http://example.com"); ("Host", "example.com") ]
+  in
   check "every path derived from Shared_doc_rpc.all is reachable (non-404)"
     (List.for_all
        (fun (Shared_doc_rpc.Any e) ->
          let p = Tea_core.Prim.Rpc_path.to_string (R.path_of e) in
-         status (rpc_post ~ct:json ~path:p "null") <> 404)
+         let r =
+           driver (Dream.request ~method_:`POST ~target:p ~headers:same_origin_headers "null")
+         in
+         status r <> 404 && status r <> 403)
        Shared_doc_rpc.all);
   Printf.printf "\nThe typed RPC tier serves both endpoints over Dream (roadmap step 7).\n%!"

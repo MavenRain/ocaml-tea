@@ -28,14 +28,29 @@ type ('req, 'resp) t =
       (** commits on the canonical branch — the seam [undo] proves *)
   | Doc_stats : (stats_req, stats_resp) t
       (** pure echo-with-transform over the doc fields *)
+  | Append_tag : (string, int) t
+      (** the store-mutating endpoint (roadmap step 8, D12): adds the requested
+          tag to the canonical document through the ordinary TEA step (one
+          [Add_tag] Msg, one labelled commit) and answers with the resulting tag
+          count. [Tea_rpc.Mutating], so a cross-origin POST here is a 403 and
+          never reaches the store. It does NOT push to live peers: they watch
+          their own per-session branches, not the canonical one. See
+          {!Shared_doc_serve.rpc_handler} for that limit and the concurrency
+          one. *)
 
 val name : ('req, 'resp) t -> Tea_rpc.Name.t
-(** Total, wildcard-free; [Name.v "history_count"] / [Name.v "doc_stats"]. *)
+(** Total, wildcard-free; [Name.v "history_count"] / [Name.v "doc_stats"] /
+    [Name.v "append_tag"]. *)
 
 val req_t : ('req, 'resp) t -> 'req Repr.t
 val resp_t : ('req, 'resp) t -> 'resp Repr.t
 (** Total, wildcard-free: a new constructor without a codec is a compile error
     in this module, before either tier even builds. *)
+
+val kind : ('req, 'resp) t -> Tea_rpc.endpoint_kind
+(** Total, wildcard-free: {!Append_tag} is [Mutating]; the two query endpoints
+    are [Read_only] and their handlers must stay that way (the server gates on
+    this value alone). *)
 
 type any = Any : ('req, 'resp) t -> any
 

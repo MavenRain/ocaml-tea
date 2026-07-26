@@ -1,3 +1,11 @@
+; The server tier is a library so the test suite links the very handler the
+; binary serves (see shared_doc_serve.ml); [main] is only the entry point.
+(library
+ (name shared_doc_serve)
+ (modules shared_doc_serve)
+ (libraries tea_server shared_doc_app dream lwt))
+
 (executable
  (name main)
- (libraries tea_server shared_doc_app dream))
+ (modules main)
+ (libraries shared_doc_serve tea_server shared_doc_app dream))

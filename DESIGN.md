@@ -268,7 +268,7 @@ while the socket is still `Connecting` apply locally only, audibly; timer- and
 `After`-born msgs are mirrored like any other, so a chatty `Sub.every` app
 commits on every tick (R1 - coalescing is roadmap step 6).
 
-## 8. Shared RPC contract - built (roadmap step 7)
+## 8. Shared RPC contract - built (roadmap step 7; hardened step 8, D11/D12)
 
 lean-tea kept its tiers aligned by convention: route strings and encode/decode
 pairs matched only because a human kept them matching. ocaml-tea makes each
@@ -309,11 +309,46 @@ classifies the outcome (XHR status 0 = `Network_error`).
 
 **Security posture.** The content-type gate makes a cross-site RPC POST
 non-simple (and no CORS headers are served); strict CSP + nosniff ride every
-rpc response via `secure_headers`, including router 404s. Both milestone
-endpoints are read-only *server-side* - the handler never writes the store -
-and that is the property the gate protects: hard gate, no *store-mutating* RPC
-handler ships until an anti-CSRF check (`Origin_gate` or token) lands on this
-path; state-changing traffic stays on `/msg` behind Dream's form tokens.
+rpc response via `secure_headers`, including router 404s.
+
+**Anti-CSRF gate (D12, step 8).** The hard gate is now *shipped*, so
+store-mutating endpoints are admitted. `Tea_rpc` carries
+`endpoint_kind = Read_only | Mutating` and `API` a total, wildcard-free
+`kind` witness beside the codec witnesses, so no endpoint can reach the router
+unclassified. `Rpc.route` matches it: a `Mutating` endpoint dispatches only
+behind the `same_origin` proof `Origin_gate.check` mints - the `accept_ws`
+discipline, one function that *demands* the proof - and answers 403 on every
+`denial` arm. The gate runs **first**, ahead of the content-type and body
+checks, so a forged cross-site POST is refused without its body being read
+(observable: cross-origin + a refused content type is 403, where the same
+request same-origin is 415). `shared_doc` ships the real thing:
+`Append_tag : (string, int) t`, `Mutating`, which drives one `Add_tag` Msg
+through `Server.step` on the canonical branch, so an accepted RPC mutation is an
+ordinary labelled commit through the same `App.update` every other path runs -
+not a second write path with its own semantics. Two limits, because the obvious
+readings of that sentence are both wrong: it does **not** reach live peers (a
+live session watches its *per-cookie* session branch, and the canonical branch
+is not that branch - cross-branch propagation is the still-deferred R3 auto-merge
+story), and `step` is load-step-commit with **no** compare-and-set, which R10
+below covers.
+`/msg` form traffic keeps using Dream's own token. Residual, by construction:
+`Read_only` is a *declaration*, not an enforcement - a `Read_only` handler that
+writes the store re-opens the hole, so classification is a review obligation.
+The negative case is not browser-testable (Chromium sets `Origin` itself and
+will not forge one), so `test/csrf_test` carries it over `Dream.test`, pairing
+every refusal with a read of the branch: refused means *nothing was written*.
+
+**Streaming body cap (D11, step 8).** The 64 KiB cap is enforced *while* the
+body streams (`Body.read_capped` over `Dream.body_stream`, aborting the instant
+the accumulated length exceeds the cap), so it now bounds peak memory per
+request - cap plus one transport chunk - and not merely decode work. Within the
+cap the result is byte-identical to `Dream.body`, which is what keeps the
+earlier assertions true. The chunk source is a seam (the `live_transport`
+discipline): `test/rpc_stream_test` drives it with a *counting* source and
+asserts on bytes **pulled**, because a status code cannot distinguish "refused"
+from "refused without reading it all" - the post-read cap this replaced passes
+every status check.
+
 (Server-read-only is distinct from what a *client* does with the reply: the
 `shared_doc` example folds its `Doc_stats` reply into a `model_t` field, so
 because that model is replicated the reply becomes a shared, on-demand badge
@@ -321,13 +356,17 @@ committed and broadcast like any edit. A genuinely per-client reply would need
 a client-local state channel this single-replicated-model framework does not
 yet have - **deferred**.)
 
-**Totality ledger.** Compile-checked: the three witnesses, the rank-2 server
-handler, `cmd_to_vdom`, the `Loop` arm, and cross-tier payload/codec
-agreement (all derived from the constructor). Test-checked: `all`
-completeness (cover witness + length equation + server reachability sweep),
-name uniqueness and literal-parse validity, literal wire-path pins, and
-per-endpoint codec roundtrips (`test/rpc_test`, plus the `server_test` /
-`client_test` transport checks).
+**Totality ledger.** Compile-checked: the four witnesses (`name`, `req_t`,
+`resp_t`, `kind`), the rank-2 server handler, `cmd_to_vdom`, the `Loop` arm,
+and cross-tier payload/codec agreement (all derived from the constructor).
+Test-checked: `all` completeness (cover witness + length equation + server
+reachability sweep), name uniqueness and literal-parse validity, literal
+wire-path pins, per-endpoint codec roundtrips, and the per-constructor `kind`
+table (`test/rpc_test`, plus the `server_test` / `client_test` transport checks
+and the `rpc_stream_test` / `csrf_test` gate checks). The example's server tier
+is a library (`shared_doc_serve`) precisely so the suite drives the handler the
+binary serves - a store assertion against a second hand-written copy of the
+handler would prove nothing.
 
 ## 9. Security primitives (T4) - mapping
 
@@ -383,7 +422,59 @@ Each lean-tea private-constructor primitive → an OCaml `.mli` boundary:
   (a socket accepted without the same-origin check is now uncompilable), `Store`
   speaks only `Safe_key`, and a `Security_headers` middleware puts a strict CSP on
   every response. The remaining direct-sink discipline (never call raw
-  Dream/Irmin/Unix past a boundary) stays a review convention.
+  Dream/Irmin/Unix past a boundary) stays a review convention. **Extended to the
+  RPC tier** (roadmap step 8, D12): `Rpc.route`'s mutating dispatch demands the
+  same `Origin_gate` proof, so that path cannot be taken without one. Unlike
+  `accept_ws` this is *not* an isolated sink, and the difference is worth being
+  exact about: `accept_ws` is the module's only mention of `Dream.websocket`,
+  whereas `Rpc.route`'s `dispatch` must stay in scope for the `Read_only` arm, so
+  rewriting the `Mutating` arm to call it directly would compile. The gate is
+  enforced by the total `kind` match plus `test/csrf_test`, and keeping the two
+  arms distinct is a review obligation - see R8.
+- **R10 (med) - `step` is a read-modify-write with no compare-and-set, and D12
+  put different clients on one branch.** `Store.commit` is a plain `set` (last
+  write wins), so `load` -> `Loop.step` -> `commit` can interleave: two writers
+  each read the pre-edit model and the second erases the first. This was
+  harmless while every write path was *per-session* (the only racer was the same
+  user); the `Mutating` RPC endpoint is the first path where different clients
+  read-modify-write the **same** branch, which is what promotes this from
+  theoretical to a real exposure. Note `append_commit`'s test-and-set does not
+  fix it either: the retry re-commits the *same stale model*, so it preserves
+  history, not content. Mitigation shipped: `shared_doc_serve`'s handler holds
+  an `Lwt_mutex` across the whole read-modify-write, correct within one process.
+  **Not test-confirmed, and deliberately labelled as such** - under `Irmin_mem`
+  with an `Add_tag` that emits `Cmd.none` there is no Lwt yield between load and
+  commit, so deleting the lock leaves `test/csrf_test` green (verified by
+  mutation). The real fix belongs in `store_core`: a compare-and-set retry
+  around the whole step, which would also cover the pack backend and any Msg
+  with a Cmd tail. Until then, an app mutating a shared branch from concurrent
+  requests must serialize it itself.
+- **R8 (low) - a `Read_only` RPC endpoint whose handler writes the store.** The
+  `Tea_rpc.endpoint_kind` witness is what the server gates on, and it is a
+  *declaration*: the type system forces every endpoint to carry one (no
+  wildcard, so a new constructor cannot default to ungated) but cannot check
+  that a `Read_only` handler is in fact read-only. Misclassifying a
+  store-writing endpoint restores the CSRF exposure the gate removes.
+  Mitigation: the per-constructor `kind` table pinned in `test/rpc_test` (so a
+  silent reclassification fails a check rather than production), and
+  classification as a review obligation on every new endpoint.
+- **R9 (low) - what the D11 cap does and does not bound.** It bounds *this
+  loop*: the buffer never holds more than 64 KiB (the chunk that would cross the
+  cap is refused rather than added), and bytes pulled never exceed the cap plus
+  that one chunk, whatever `Content-Length` claims. It is **not** a process
+  memory budget, and three gaps are worth naming rather than rounding away.
+  (i) `Buffer` doubles as it grows and reallocates by copying, so live bytes
+  transiently exceed the length it is holding; `Buffer.contents` then copies the
+  admitted body once more, so an admitted 64 KiB request touches ~2x64 KiB.
+  (ii) A refused body is left undrained. That is deliberate - it is why the
+  refusal is cheap - but what the transport does with a request nobody drained
+  is Dream's business, and an undrained keep-alive connection may be *held* to a
+  timeout rather than closed, so each refusal can cost a parked connection.
+  (iii) How many such requests are in flight at once is Dream's connection
+  limit, not this cap's job. `test/rpc_stream_test` pins bytes *pulled* as a
+  number, so a rewrite that drains the stream before deciding (the pre-D11
+  behaviour, which keeps every status code correct) fails a check - but note
+  that check covers (i) not at all.
 
 ## 11. Roadmap
 

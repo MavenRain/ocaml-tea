@@ -2,7 +2,7 @@
  (names persist_test server_test client_test merge_test collab_test safe_test
    clock_test dedup_test coalesce_test pack_test rpc_test pack_serve_test
    reaper_test retention_test archive_gc_test crdt_test exploded_test
-   pack_crdt_test)
+   pack_crdt_test rpc_stream_test csrf_test)
  (libraries
   repr
   tea_core
@@ -16,6 +16,9 @@
   vdom.base
   counter_app
   shared_doc_app
+  ; the example's own server tier: csrf_test/rpc_stream_test drive the SAME
+  ; handler the shared_doc binary serves, not a second copy of it
+  shared_doc_serve
   dream
   lwt
   lwt.unix))

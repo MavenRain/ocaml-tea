@@ -37,7 +37,23 @@ type error =
   | Transport of Tea_core.Cmd.http_failure
   | Decode of string  (** a 2xx body that does not parse as ['resp] *)
 
-(** What an application supplies: one GADT of endpoints plus three
+(** Whether an endpoint changes server state, and therefore whether the server
+    demands a same-origin proof before dispatching it (roadmap step 8, D12).
+
+    This is the {i declaration}, not an enforcement: nothing stops a
+    [Read_only] handler from writing the store, and such a handler re-opens
+    exactly the cross-site forgery hole the gate closes. Classify an endpoint
+    [Mutating] the moment its handler can touch persistent state. *)
+type endpoint_kind =
+  | Read_only
+      (** dispatched ungated (the [Content-Type] gate alone makes a cross-site
+          POST non-simple, so a browser preflights it); the handler must not
+          write the store *)
+  | Mutating
+      (** dispatched only behind the [same_origin] proof
+          [Tea_safe.Origin_gate.check] mints; every other outcome is a 403 *)
+
+(** What an application supplies: one GADT of endpoints plus four
     per-endpoint witnesses, each an exhaustive wildcard-free match — adding a
     constructor without extending them is a compile error in both tiers. *)
 module type API = sig
@@ -46,6 +62,12 @@ module type API = sig
   val name : ('req, 'resp) t -> Name.t
   val req_t : ('req, 'resp) t -> 'req Repr.t
   val resp_t : ('req, 'resp) t -> 'resp Repr.t
+
+  val kind : ('req, 'resp) t -> endpoint_kind
+  (** Total and wildcard-free like the codec witnesses, so no endpoint can
+      reach the router unclassified: a new constructor without a kind is a
+      compile error before either tier builds. A wildcard arm here would
+      silently default the next mutating endpoint to ungated. *)
 
   type any = Any : ('req, 'resp) t -> any
 

@@ -30,12 +30,17 @@ type error =
   | Transport of Tea_core.Cmd.http_failure
   | Decode of string
 
+type endpoint_kind =
+  | Read_only
+  | Mutating
+
 module type API = sig
   type ('req, 'resp) t
 
   val name : ('req, 'resp) t -> Name.t
   val req_t : ('req, 'resp) t -> 'req Repr.t
   val resp_t : ('req, 'resp) t -> 'resp Repr.t
+  val kind : ('req, 'resp) t -> endpoint_kind
 
   type any = Any : ('req, 'resp) t -> any
 

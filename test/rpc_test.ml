@@ -79,14 +79,16 @@ let () =
   check "History_count pins to /rpc/history_count"
     (Prim.Rpc_path.to_string (R.path_of S.History_count) = "/rpc/history_count");
   check "Doc_stats pins to /rpc/doc_stats"
-    (Prim.Rpc_path.to_string (R.path_of S.Doc_stats) = "/rpc/doc_stats")
+    (Prim.Rpc_path.to_string (R.path_of S.Doc_stats) = "/rpc/doc_stats");
+  check "Append_tag pins to /rpc/append_tag"
+    (Prim.Rpc_path.to_string (R.path_of S.Append_tag) = "/rpc/append_tag")
 
 (* --- distinctness, length equation, reserved-path disjointness ------------- *)
 
 let () =
   let dedup = List.sort_uniq String.compare paths in
   check "derived paths are pairwise distinct" (List.length paths = List.length dedup);
-  check "all enumerates exactly two endpoints" (List.length S.all = 2);
+  check "all enumerates exactly three endpoints" (List.length S.all = 3);
   check "Tea_rpc.prefix is /rpc/" (String.equal Tea_rpc.prefix "/rpc/");
   let reserved = [ "/"; "/msg"; "/undo"; Tea_core.Wire.ws_path; "/app" ] in
   check "no derived path collides with a reserved flat path"
@@ -117,8 +119,23 @@ let () =
 let _cover : type a b. (a, b) S.t -> unit = function
   | S.History_count -> ()
   | S.Doc_stats -> ()
+  | S.Append_tag -> ()
 
-let () = check "cover witness compiles and all still has length 2" (List.length S.all = 2)
+let () = check "cover witness compiles and all still has length 3" (List.length S.all = 3)
+
+(* --- the anti-CSRF classification (D12): the table the server gates on ------
+   Pinned per constructor, not derived, so a silent reclassification of a
+   store-writing endpoint to [Read_only] - which would drop its origin gate -
+   fails here rather than in production. *)
+
+let () =
+  check "Append_tag is classified Mutating" (S.kind S.Append_tag = Tea_rpc.Mutating);
+  check "the two query endpoints are classified Read_only"
+    (S.kind S.History_count = Tea_rpc.Read_only && S.kind S.Doc_stats = Tea_rpc.Read_only);
+  check "exactly one deployed endpoint is Mutating"
+    (List.length
+       (List.filter (fun (S.Any e) -> S.kind e = Tea_rpc.Mutating) S.all)
+    = 1)
 
 (* --- Doc_stats pure semantics (the one definition server + tests share) ---- *)
 
@@ -157,7 +174,17 @@ let () =
   let resp = { S.title_len = 5; word_count = 4 } in
   check "Doc_stats resp codec round-trips a canned value"
     (R.encode_resp S.Doc_stats resp |> R.decode_resp S.Doc_stats
-     |> Result.fold ~error:(fun (_ : Codec.err) -> false) ~ok:(fun r -> stats_resp_eq r resp))
+     |> Result.fold ~error:(fun (_ : Codec.err) -> false) ~ok:(fun r -> stats_resp_eq r resp));
+  (* [Append_tag]'s payloads are bare [string]/[int], the shapes most likely to
+     be confused for JSON-quoted vs raw; pin both directions on values with
+     escaping and an edge count. *)
+  check "Append_tag req codec round-trips plain, quoted, and empty tag strings"
+    (List.for_all
+       (fun t -> R.encode_req S.Append_tag t |> R.decode_req S.Append_tag = Ok t)
+       [ "urgent"; ""; "a \"quoted\" tag"; "tab\there" ]);
+  check "Append_tag resp codec round-trips a tag count"
+    (R.encode_resp S.Append_tag 0 |> R.decode_resp S.Append_tag = Ok 0
+    && R.encode_resp S.Append_tag 7 |> R.decode_resp S.Append_tag = Ok 7)
 
 (* One printable-ASCII string (space..'~', so quotes and backslashes appear)
    whose length and content are driven by the LCG — stresses the JSON string

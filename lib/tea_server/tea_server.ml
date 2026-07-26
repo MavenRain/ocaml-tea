@@ -358,28 +358,109 @@ module Make (A : Tea_core.App.APP) = struct
     Dream.run ~interface ~port (Dream.logger (handler ?client_dir ?rpc ?coalesce repo))
 end
 
+(** Request-body admission (roadmap step 8, D11): a size cap enforced {i while}
+    the body streams in, so an oversized body is refused without ever being
+    fully buffered.
+
+    The bytes this module accumulates never exceed the cap, and the bytes it
+    pulls never exceed the cap plus the one chunk that crossed it, whatever the
+    attacker's [Content-Length] says. That is a bound on {i this} loop, not a
+    memory budget for the process: [Buffer] growth reallocates as it doubles,
+    [Buffer.contents] copies the admitted body once more, and how many requests
+    may be in flight at once is Dream's connection limit rather than anything
+    decided here (DESIGN {b section 10}, R9).
+
+    Within the cap the result is byte-identical to [Dream.body], which is what
+    keeps every existing RPC assertion true.
+
+    [read] is a seam, the {!Handlers.live_transport} discipline: a test drives
+    the cap with a counting chunk source to witness that the refusal happens
+    before the whole body is buffered, with no live connection involved.
+
+    App-generic on purpose: it names no [Api], so there is one copy of the cap
+    loop however many RPC contracts a program mounts. *)
+module Body = struct
+  type capped =
+    | Within_cap of string
+    | Body_too_large
+
+  (* Check BEFORE adding, so the buffer itself never holds more than [max]
+     bytes: the chunk that would cross the cap is refused rather than
+     accumulated. The boundary is the one the old post-read
+     [String.length body > max] check had - exactly [max] bytes is admitted,
+     [max + 1] is refused - and it is independent of how the transport happens
+     to split the body.
+
+     Matching [chunk] directly rather than through [Option.fold] is deliberate
+     (the {!Handlers.live_session} pump precedent): [~none:] is eager, so
+     folding here would copy the whole accumulated buffer on every chunk,
+     quadratic in the body size. *)
+  let read_capped ~(max : int) ~(read : unit -> string option Lwt.t) :
+      capped Lwt.t =
+    let buf = Buffer.create 1024 in
+    let rec pull () =
+      Lwt.bind (read ()) (fun chunk ->
+          match chunk with
+          | None -> Lwt.return (Within_cap (Buffer.contents buf))
+          | Some c ->
+            if Buffer.length buf + String.length c > max then Lwt.return Body_too_large
+            else (
+              Buffer.add_string buf c;
+              pull ()))
+    in
+    pull ()
+
+  let of_request ~(max : int) (request : Dream.request) : capped Lwt.t =
+    (* [Dream.body_stream] is resolved ONCE and then pulled: it is the
+       request's single consumable body stream, not a fresh reader per call.
+       A refused body leaves the remainder unpulled, which is the point of the
+       streaming cap. What the transport then does with a request whose body
+       nobody drained is Dream's business, and NOT something this module should
+       claim to know: an undrained keep-alive connection may well be held until
+       a timeout rather than closed, so the refusal is cheap in memory without
+       being free (DESIGN {b section 10}, R9). *)
+    let stream = Dream.body_stream request in
+    read_capped ~max ~read:(fun () -> Dream.read stream)
+end
+
 (** Typed RPC dispatch (DESIGN §8): one fixed [Dream.post] route per element
     of [Api.all], derived from the same [Tea_rpc.Make] closures the client
     posts with — no second copy of a name or codec exists to drift. Mount the
     result via [Make(A).serve ~rpc:(Rpc(Api).routes { handle })]; the routes
     then inherit the session and security-header middleware like every other
-    route. HTTP statuses are exclusively the transport-error channel (404
-    route-miss, 415 content-type gate, 413 size cap, 400 decode refusal);
-    app-level fallibility is declared inside ['resp] in the GADT and rides
-    the 200 channel. Both milestone endpoints are read-only BY POLICY: no
-    mutating RPC endpoint ships until an anti-CSRF check (Origin_gate or
-    token) lands on this path — state-changing traffic stays on [/msg]
-    behind Dream's form tokens. *)
+    route. HTTP statuses are exclusively the transport-error channel (403
+    cross-origin gate, 404 route-miss, 415 content-type gate, 413 size cap,
+    400 decode refusal); app-level fallibility is declared inside ['resp] in
+    the GADT and rides the 200 channel.
+
+    State-changing endpoints are admitted here (roadmap step 8, D12): an
+    endpoint the [Api] classifies [Tea_rpc.Mutating] dispatches only behind the
+    [same_origin] proof {!Tea_safe.Origin_gate.check} mints, and answers 403 on
+    every [denial] arm. The gate runs {i first}, before the content-type and
+    body checks, so a forged cross-site POST is refused without its body ever
+    being read. A [Tea_rpc.Read_only] endpoint stays ungated behind the
+    content-type gate alone, which is a convention its handler must honour: see
+    {!Tea_rpc.endpoint_kind}. Form-posted Msg traffic on [/msg] keeps using
+    Dream's own token instead.
+
+    How much that gate is worth, stated honestly. The [kind] witness is total,
+    so no endpoint can reach the router unclassified, and [dispatch_mutating]
+    demands the proof, so the gated path cannot be taken without one. But
+    [dispatch] is necessarily in scope for the [Read_only] arm as well, so
+    unlike [accept_ws] - which is the module's only mention of
+    [Dream.websocket], hence a syntactically isolated sink - rewriting the
+    [Mutating] arm to call [dispatch] directly would compile. Keeping the two
+    arms distinct is therefore a {i review} obligation backed by
+    [test/csrf_test] per endpoint, NOT an invariant the type checker carries
+    (DESIGN {b section 10}, R7/R8). *)
 module Rpc (Api : Tea_rpc.API) = struct
   module R = Tea_rpc.Make (Api)
 
   let ( let* ) = Lwt.bind
 
-  (* Post-read cap: [Dream.body] has ALREADY buffered the full request by the
-     time this runs (alpha8 exposes no pre-read limit), so the cap bounds
-     decode work and downstream handling, NOT peak memory per request. The
-     streaming [Dream.body_stream] chunk-accounted cap is a recorded deferral
-     (DESIGN §8). 64 KiB fits every plausible RPC payload here. *)
+  (* Streaming cap (D11): enforced chunk by chunk by [Body.of_request], so it
+     bounds peak memory per request (cap + one chunk) as well as decode work.
+     64 KiB fits every plausible RPC payload here. *)
   let max_body_bytes = 65_536
 
   (* Pin text/plain on refusal bodies so an attacker-derived reason can never
@@ -416,27 +497,55 @@ module Rpc (Api : Tea_rpc.API) = struct
   let route (h : handler) (p : Api.any) : Dream.route =
     match p with
     | Api.Any ep ->
+      (* Content-type gate, then the streaming size cap, then decode, then the
+         app's handler. Shared by both kinds: gating is the only difference a
+         [Mutating] classification makes. *)
+      let dispatch (request : Dream.request) : Dream.response Lwt.t =
+        if not (content_type_is_json request) then
+          Dream.respond ~status:`Unsupported_Media_Type ~headers:text_plain
+            "rpc requires Content-Type: application/json"
+        else
+          let* capped = Body.of_request ~max:max_body_bytes request in
+          match (capped : Body.capped) with
+          | Body_too_large ->
+            Dream.respond ~status:`Payload_Too_Large ~headers:text_plain
+              "rpc body too large"
+          | Within_cap body ->
+            R.decode_req ep body
+            |> Result.fold
+                 ~error:(fun (Tea_core.Codec.Decode_failed reason) ->
+                   Dream.respond ~status:`Bad_Request ~headers:text_plain
+                     ("undecodable rpc request: " ^ reason))
+                 ~ok:(fun req ->
+                   let* resp = h.handle ep req in
+                   Dream.respond ~status:`OK ~headers:json_content_type
+                     (R.encode_resp ep resp))
+      in
+      (* The gated path demands the [same_origin] proof, so it cannot be taken
+         without one. It is not a full [accept_ws]-style isolated sink, though:
+         see the module doc above for exactly what this does and does not
+         guarantee. *)
+      let dispatch_mutating
+          (_ : Tea_safe.Origin_gate.same_origin Tea_safe.Proof.t)
+          (request : Dream.request) : Dream.response Lwt.t =
+        dispatch request
+      in
       Dream.post
         (Tea_core.Prim.Rpc_path.to_string (R.path_of ep))
         (fun request ->
-          if not (content_type_is_json request) then
-            Dream.respond ~status:`Unsupported_Media_Type ~headers:text_plain
-              "rpc requires Content-Type: application/json"
-          else
-            let* body = Dream.body request in
-            if String.length body > max_body_bytes then
-              Dream.respond ~status:`Payload_Too_Large ~headers:text_plain
-                "rpc body too large"
-            else
-              R.decode_req ep body
-              |> Result.fold
-                   ~error:(fun (Tea_core.Codec.Decode_failed reason) ->
-                     Dream.respond ~status:`Bad_Request ~headers:text_plain
-                       ("undecodable rpc request: " ^ reason))
-                   ~ok:(fun req ->
-                     let* resp = h.handle ep req in
-                     Dream.respond ~status:`OK ~headers:json_content_type
-                       (R.encode_resp ep resp)))
+          match (Api.kind ep : Tea_rpc.endpoint_kind) with
+          | Read_only -> dispatch request
+          | Mutating ->
+            Tea_safe.Origin_gate.check
+              ~origin:(Dream.header request "Origin")
+              ~host:(Dream.header request "Host")
+            |> Result.fold
+                 ~ok:(fun proof -> dispatch_mutating proof request)
+                 ~error:(fun (d : Tea_safe.Origin_gate.denial) ->
+                   match d with
+                   | Origin_missing | Host_missing | Both_missing | Origin_mismatch ->
+                     Dream.respond ~status:`Forbidden ~headers:text_plain
+                       "cross-origin mutating rpc rejected"))
 
   let routes (h : handler) : Dream.route list = List.map (route h) Api.all
 end

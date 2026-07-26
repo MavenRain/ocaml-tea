@@ -49,6 +49,7 @@ let stats_of (req : stats_req) : stats_resp =
 type ('req, 'resp) t =
   | History_count : (unit, int) t
   | Doc_stats : (stats_req, stats_resp) t
+  | Append_tag : (string, int) t
 
 (* Compile-time-literal-only mints (the house [Tag.v] doctrine): the names
    are program constants, never request or model data. Both witnesses below
@@ -57,15 +58,28 @@ type ('req, 'resp) t =
 let name : type req resp. (req, resp) t -> Tea_rpc.Name.t = function
   | History_count -> Tea_rpc.Name.v "history_count"
   | Doc_stats -> Tea_rpc.Name.v "doc_stats"
+  | Append_tag -> Tea_rpc.Name.v "append_tag"
 
 let req_t : type req resp. (req, resp) t -> req Repr.t = function
   | History_count -> Repr.unit
   | Doc_stats -> stats_req_t
+  | Append_tag -> Repr.string
 
 let resp_t : type req resp. (req, resp) t -> resp Repr.t = function
   | History_count -> Repr.int
   | Doc_stats -> stats_resp_t
+  | Append_tag -> Repr.int
+
+(* The anti-CSRF classification the server gates on (D12). [Append_tag] drives
+   a Msg through the store, so it is [Mutating]; the two query endpoints answer
+   from state they never touch. Wildcard-free on purpose: defaulting a future
+   endpoint to [Read_only] is exactly the mistake this witness exists to make
+   impossible. *)
+let kind : type req resp. (req, resp) t -> Tea_rpc.endpoint_kind = function
+  | History_count -> Tea_rpc.Read_only
+  | Doc_stats -> Tea_rpc.Read_only
+  | Append_tag -> Tea_rpc.Mutating
 
 type any = Any : ('req, 'resp) t -> any
 
-let all = [ Any History_count; Any Doc_stats ]
+let all = [ Any History_count; Any Doc_stats; Any Append_tag ]
