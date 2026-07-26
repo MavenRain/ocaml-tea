@@ -298,7 +298,7 @@ module Make (A : Tea_core.App.APP) = struct
      [/app] pages), so the SSR tier, the live client, and the WebSocket share
      one origin — which is precisely what {!same_origin} and the shared Dream
      session cookie require. *)
-  let router ?(client_dir : string option)
+  let router ?(client_dir : string option) ?(rpc : Dream.route list = [])
       ?(coalesce = Tea_core.Coalesce_spec.Keep_all) (repo : Store.t) : Dream.handler =
     let client_routes =
       Option.fold client_dir ~none:[]
@@ -313,7 +313,7 @@ module Make (A : Tea_core.App.APP) = struct
        ; Dream.post undo_path (handle_undo repo)
        ; Dream.get ws_path (handle_ws ~coalesce repo)
        ]
-      @ client_routes)
+      @ rpc @ client_routes)
 
   (* Append the strict security headers to every response (CSP, X-Frame-Options,
      X-Content-Type-Options). Outermost so even error and 403 responses carry
@@ -328,13 +328,96 @@ module Make (A : Tea_core.App.APP) = struct
   (** The full request pipeline: session middleware over the security-headers
       middleware over the router. Exposed so tests can drive it with
       [Dream.test] against an in-memory repo. *)
-  let handler ?client_dir ?coalesce (repo : Store.t) : Dream.handler =
-    Dream.memory_sessions (secure_headers (router ?client_dir ?coalesce repo))
+  let handler ?client_dir ?rpc ?coalesce (repo : Store.t) : Dream.handler =
+    Dream.memory_sessions (secure_headers (router ?client_dir ?rpc ?coalesce repo))
 
   (** Blocking entry point for a native server binary. [?coalesce] is the
       app's commit-coalescing policy for live (WS) sessions; the default
       keeps one commit per Msg. *)
-  let serve ?(interface = "localhost") ?(port = 8080) ?client_dir ?coalesce () : unit =
+  let serve ?(interface = "localhost") ?(port = 8080) ?client_dir ?rpc ?coalesce () : unit =
     let repo = Lwt_main.run (Store.create ()) in
-    Dream.run ~interface ~port (Dream.logger (handler ?client_dir ?coalesce repo))
+    Dream.run ~interface ~port (Dream.logger (handler ?client_dir ?rpc ?coalesce repo))
+end
+
+(** Typed RPC dispatch (DESIGN §8): one fixed [Dream.post] route per element
+    of [Api.all], derived from the same [Tea_rpc.Make] closures the client
+    posts with — no second copy of a name or codec exists to drift. Mount the
+    result via [Make(A).serve ~rpc:(Rpc(Api).routes { handle })]; the routes
+    then inherit the session and security-header middleware like every other
+    route. HTTP statuses are exclusively the transport-error channel (404
+    route-miss, 415 content-type gate, 413 size cap, 400 decode refusal);
+    app-level fallibility is declared inside ['resp] in the GADT and rides
+    the 200 channel. Both milestone endpoints are read-only BY POLICY: no
+    mutating RPC endpoint ships until an anti-CSRF check (Origin_gate or
+    token) lands on this path — state-changing traffic stays on [/msg]
+    behind Dream's form tokens. *)
+module Rpc (Api : Tea_rpc.API) = struct
+  module R = Tea_rpc.Make (Api)
+
+  let ( let* ) = Lwt.bind
+
+  (* Post-read cap: [Dream.body] has ALREADY buffered the full request by the
+     time this runs (alpha8 exposes no pre-read limit), so the cap bounds
+     decode work and downstream handling, NOT peak memory per request. The
+     streaming [Dream.body_stream] chunk-accounted cap is a recorded deferral
+     (DESIGN §8). 64 KiB fits every plausible RPC payload here. *)
+  let max_body_bytes = 65_536
+
+  (* Pin text/plain on refusal bodies so an attacker-derived reason can never
+     be sniffed as markup (the handle_msg precedent). *)
+  let text_plain = [ ("Content-Type", "text/plain; charset=utf-8") ]
+
+  let json_content_type : (string * string) list =
+    Tea_safe.Header.Value.of_string "application/json; charset=utf-8"
+    |> Result.fold
+         ~ok:(fun value ->
+           let h = Tea_safe.Header.v (Tea_safe.Header.Name.v "Content-Type") value in
+           [ (Tea_safe.Header.name h, Tea_safe.Header.value h) ])
+         ~error:(fun (Tea_safe.Header.Value.Control_char (_ : char)) ->
+           (* Dead: the literal above is control-free; typed fallback beats a
+              partial match. *)
+           [ ("Content-Type", "application/json") ])
+
+  (* Media type only, parameters stripped, case-folded: "application/json",
+     "application/json; charset=utf-8", and "APPLICATION/JSON" all pass. The
+     gate makes a cross-site RPC POST non-simple (a browser preflights it),
+     which is the cheap half of CSRF hardening for read-only endpoints. *)
+  let content_type_is_json (request : Dream.request) : bool =
+    Dream.header request "Content-Type"
+    |> Option.fold ~none:false ~some:(fun ct ->
+           match String.split_on_char ';' ct with
+           | [] -> false (* unreachable: split_on_char never returns [] *)
+           | media :: (_ : string list) ->
+             String.equal (String.lowercase_ascii (String.trim media)) "application/json")
+
+  (* Rank-2 record so one value handles every endpoint at its own type — the
+     [Vdom_blit.Cmd.handler] precedent. *)
+  type handler = { handle : 'req 'resp. ('req, 'resp) Api.t -> 'req -> 'resp Lwt.t }
+
+  let route (h : handler) (p : Api.any) : Dream.route =
+    match p with
+    | Api.Any ep ->
+      Dream.post
+        (Tea_core.Prim.Rpc_path.to_string (R.path_of ep))
+        (fun request ->
+          if not (content_type_is_json request) then
+            Dream.respond ~status:`Unsupported_Media_Type ~headers:text_plain
+              "rpc requires Content-Type: application/json"
+          else
+            let* body = Dream.body request in
+            if String.length body > max_body_bytes then
+              Dream.respond ~status:`Payload_Too_Large ~headers:text_plain
+                "rpc body too large"
+            else
+              R.decode_req ep body
+              |> Result.fold
+                   ~error:(fun (Tea_core.Codec.Decode_failed reason) ->
+                     Dream.respond ~status:`Bad_Request ~headers:text_plain
+                       ("undecodable rpc request: " ^ reason))
+                   ~ok:(fun req ->
+                     let* resp = h.handle ep req in
+                     Dream.respond ~status:`OK ~headers:json_content_type
+                       (R.encode_resp ep resp)))
+
+  let routes (h : handler) : Dream.route list = List.map (route h) Api.all
 end

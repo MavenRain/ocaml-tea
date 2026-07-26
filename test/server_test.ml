@@ -8,6 +8,14 @@
 module Server = Tea_server.Make (Counter_app.App)
 module Codec = Tea_core.Codec.Make (Counter_app.App)
 
+(* The typed-RPC dispatcher and its derived client codecs (roadmap step 7).
+   The [Rpc] functor is App-independent — it is mounted onto the Counter
+   [Server] here purely to reuse one [Store]; [History_count] counts the
+   canonical branch, so the store-backed proof commits directly to [main]
+   rather than coupling to a session cookie (deviation #2). *)
+module Rpc_ep = Tea_server.Rpc (Shared_doc_rpc)
+module R = Tea_rpc.Make (Shared_doc_rpc)
+
 let check name cond =
   if cond then Printf.printf "ok   - %s\n%!" name
   else (
@@ -253,3 +261,106 @@ let () =
        (hist2 = [] && after2.Counter_app.App.count = 0);
      Printf.printf "\nThe live-view pump serves roadmap step 3, no socket needed.\n%!";
      Lwt.return_unit)
+
+(* --- The typed RPC tier over Dream (roadmap step 7, DESIGN §8) ------------- *)
+
+(* A raw POST: unlike the CSRF [post] above, RPC endpoints read [Dream.body]
+   directly (no form token — read-only by policy), so these drive the exact
+   wire the client emits: a same-origin JSON POST. *)
+let rpc_request ?ct ~path payload =
+  let headers = Option.fold ct ~none:[] ~some:(fun c -> [ ("Content-Type", c) ]) in
+  Dream.request ~method_:`POST ~target:path ~headers payload
+
+let () =
+  let repo = Lwt_main.run (Server.Store.create ()) in
+  (* The request-free rank-2 handler: [History_count] counts commits on the
+     canonical branch (it cannot see the Dream session); [Doc_stats] is the
+     pure transform. Distinct req/resp indices make a codec transposition a
+     unification error. *)
+  let rpc_handle : type a b. (a, b) Shared_doc_rpc.t -> a -> b Lwt.t =
+   fun ep req ->
+    match ep with
+    | Shared_doc_rpc.History_count ->
+      Lwt.bind (Server.Store.main_session repo) Server.Store.history |> Lwt.map List.length
+    | Shared_doc_rpc.Doc_stats -> Lwt.return (Shared_doc_rpc.stats_of req)
+  in
+  let driver =
+    Dream.test (Server.handler ~rpc:(Rpc_ep.routes { Rpc_ep.handle = rpc_handle }) repo)
+  in
+  let rpc_post ?ct ~path payload = driver (rpc_request ?ct ~path payload) in
+  let json = "application/json" in
+  let history_body = R.encode_req Shared_doc_rpc.History_count () in
+  let history_count_of r =
+    R.decode_resp Shared_doc_rpc.History_count (body r)
+    |> Result.fold ~error:(fun (_ : Tea_core.Codec.err) -> -1) ~ok:Fun.id
+  in
+  (* (1) history_count happy path: 200 + an int body. *)
+  let r_base = rpc_post ~ct:json ~path:"/rpc/history_count" history_body in
+  check "POST /rpc/history_count (application/json) responds 200" (status r_base = 200);
+  let baseline = history_count_of r_base in
+  check "the /rpc/history_count body decodes via resp_t as an int" (baseline >= 0);
+  check "the /rpc/history_count 200 is application/json; charset=utf-8"
+    (Dream.header r_base "Content-Type" = Some "application/json; charset=utf-8");
+  check "the /rpc/history_count 200 carries the security headers"
+    (has_security_headers r_base);
+  (* (2) store-backed proof: one direct commit to the canonical branch bumps
+     the count by exactly 1 (deviation #2 — no session-cookie coupling). *)
+  let () =
+    Lwt_main.run
+      (let open Lwt.Syntax in
+       let* s = Server.Store.main_session repo in
+       let* m = Server.Store.load s in
+       Server.Store.commit s ~label:"rpc_test: one more commit"
+         { Counter_app.App.count = m.Counter_app.App.count + 1 })
+  in
+  let after = history_count_of (rpc_post ~ct:json ~path:"/rpc/history_count" history_body) in
+  check "history_count increments by exactly 1 after one direct commit to main"
+    (after = baseline + 1);
+  (* (3) doc_stats happy path: unequal canned lengths so field-confusion moves
+     the answer. *)
+  let stats_body = R.encode_req Shared_doc_rpc.Doc_stats { Shared_doc_rpc.title = "hello"; body = "a b c d" } in
+  let r_stats = rpc_post ~ct:json ~path:"/rpc/doc_stats" stats_body in
+  check "POST /rpc/doc_stats responds 200" (status r_stats = 200);
+  check "doc_stats returns exactly {title_len=5; word_count=4}"
+    (R.decode_resp Shared_doc_rpc.Doc_stats (body r_stats)
+     |> Result.fold ~error:(fun (_ : Tea_core.Codec.err) -> false)
+          ~ok:(fun (s : Shared_doc_rpc.stats_resp) ->
+            s.title_len = 5 && s.word_count = 4));
+  (* (4) routing: unknown endpoint and wrong method both 404. *)
+  check "POST /rpc/nope is a 404 (router fallback)"
+    (status (rpc_post ~ct:json ~path:"/rpc/nope" "null") = 404);
+  check "GET on an rpc path is a 404 (POST-only routes)"
+    (status (driver (Dream.request ~method_:`GET ~target:"/rpc/doc_stats" "")) = 404);
+  (* (5) malformed body: 400 with the pinned prefix and unsniffable text/plain. *)
+  let r_bad = rpc_post ~ct:json ~path:"/rpc/doc_stats" "{" in
+  check "a malformed rpc body responds 400" (status r_bad = 400);
+  check "the 400 body carries the \"undecodable rpc request: \" prefix"
+    (contains ~needle:"undecodable rpc request: " (body r_bad));
+  check "the 400 refusal is text/plain; charset=utf-8"
+    (Dream.header r_bad "Content-Type" = Some "text/plain; charset=utf-8");
+  check "the 400 refusal carries the security headers" (has_security_headers r_bad);
+  (* (6) content-type gate: strip params, case-fold; reject the rest. *)
+  check "urlencoded Content-Type is refused 415"
+    (status
+       (rpc_post ~ct:"application/x-www-form-urlencoded" ~path:"/rpc/doc_stats" stats_body)
+     = 415);
+  let r_no_ct = rpc_post ~path:"/rpc/doc_stats" stats_body in
+  check "an absent Content-Type is refused 415" (status r_no_ct = 415);
+  check "the 415 refusal carries the security headers" (has_security_headers r_no_ct);
+  check "application/json; charset=utf-8 passes the CT gate (param-strip)"
+    (status (rpc_post ~ct:"application/json; charset=utf-8" ~path:"/rpc/doc_stats" stats_body)
+    = 200);
+  check "APPLICATION/JSON passes the CT gate (case-fold)"
+    (status (rpc_post ~ct:"APPLICATION/JSON" ~path:"/rpc/doc_stats" stats_body) = 200);
+  (* (7) body cap: refused before any decode. *)
+  let over_cap = String.make (Rpc_ep.max_body_bytes + 1) 'x' in
+  check "a body of max_body_bytes+1 is refused 413"
+    (status (rpc_post ~ct:json ~path:"/rpc/doc_stats" over_cap) = 413);
+  (* (8) reachability sweep: every derived path is routed (non-404). *)
+  check "every path derived from Shared_doc_rpc.all is reachable (non-404)"
+    (List.for_all
+       (fun (Shared_doc_rpc.Any e) ->
+         let p = Tea_core.Prim.Rpc_path.to_string (R.path_of e) in
+         status (rpc_post ~ct:json ~path:p "null") <> 404)
+       Shared_doc_rpc.all);
+  Printf.printf "\nThe typed RPC tier serves both endpoints over Dream (roadmap step 7).\n%!"

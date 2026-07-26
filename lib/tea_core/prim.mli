@@ -147,3 +147,39 @@ module Commit_ref : sig
   val of_hash : string -> t
   val to_string : t -> string
 end
+
+module Rpc_path : sig
+  type t
+
+  type err =
+    | Empty
+    | Not_rooted  (** must begin with ['/'] *)
+    | Invalid_char of char
+        (** the first byte outside [\[A-Za-z0-9/_.-\]]: the path is spliced
+            into the client's [XHR.open_] and matched byte-for-byte by the
+            server router, so the charset closes URL-metachar smuggling
+            ([? # \\]) and control-byte injection at admission *)
+
+  val of_string : string -> (t, err) result
+
+  (** Framework-internal, compile-time-literal-only mint: RPC paths come from
+      [Tea_rpc.Make.path_of] over the closed [Name] charset, never from
+      request or model data. *)
+  val v : string -> t
+
+  val to_string : t -> string
+end
+
+module Status : sig
+  (** An HTTP status actually received: [100..599]. [of_int] rejects XHR's
+      status [0] (no HTTP response at all: offline, DNS, abort) and junk, so
+      classification downstream needs no magic-int tests. *)
+  type t
+
+  val of_int : int -> t option
+
+  (** [200..299] *)
+  val is_success : t -> bool
+
+  val to_int : t -> int
+end

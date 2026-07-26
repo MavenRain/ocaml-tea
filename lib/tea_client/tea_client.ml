@@ -5,6 +5,11 @@ module Prim = Tea_core.Prim
 type 'msg Vdom.Cmd.t +=
   | After of int * 'msg
   | Navigate of string
+  | Http of
+      { path : string  (* lowered at the vdom boundary, as [Navigate] lowers [Url] *)
+      ; body : string
+      ; expect : (string, Cmd.http_failure) result -> 'msg
+      }
 
 (* ["value"] must track the model on every redraw, so it crosses as the DOM
    *property* (an attribute would only seed the initial value and leave stale
@@ -35,6 +40,8 @@ let rec cmd_to_vdom = function
   | Cmd.Emit msg -> Vdom.Cmd.Echo msg
   | Cmd.After (delay, msg) -> After (Prim.Delay.to_ms delay, msg)
   | Cmd.Navigate url -> Navigate (Prim.Url.to_string url)
+  | Cmd.Http { path; body; expect } ->
+    Http { path = Prim.Rpc_path.to_string path; body; expect }
 
 module Subs = struct
   type ('model, 'msg) spec =

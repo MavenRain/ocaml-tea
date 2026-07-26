@@ -359,4 +359,217 @@ let () =
   check "plan to nothing stops the active key"
     (Subs.plan ~active:[ Subs.Key_store ] ~wanted:[] = ([], [ Subs.Key_store ]))
 
+(* --- The typed RPC verb, lowered and interpreted (roadmap step 7, DESIGN §8)
+
+   Discipline: NEVER apply the polymorphic [(=)] to a [Tea_core.Cmd.t] (or a
+   lowered [Vdom.Cmd.t]) that may carry [Http] — its [expect] field is a
+   closure and structural comparison over a function raises. Every check below
+   observes a command by matching its constructor to pull [expect] out and
+   {e evaluating} it on canned frames; only closure-free msg *payloads* are
+   ever compared with [(=)]. *)
+
+module SR = Shared_doc_rpc
+module Sd = Shared_doc_app.App
+module R = Tea_rpc.Make (Shared_doc_rpc)
+
+(* Pull the lowered [Http] extension out of a [Vdom.Cmd.t]; the type is open,
+   so the catch-all is required by the type system, not a shortcut. *)
+let http_of = function
+  | Tea_client.Http { path; body; expect } -> Some (path, body, expect)
+  | other ->
+    ignore other;
+    None
+
+let stats_resp_eq = Repr.(unstage (equal SR.stats_resp_t))
+
+(* Recover a [Got_stats] payload from the app msg, or [None] otherwise —
+   wildcard-free so a new msg constructor is a compile error here. *)
+let got_stats_of : Sd.msg -> (SR.stats_resp, Tea_rpc.error) result option = function
+  | Sd.Got_stats r -> Some r
+  | Sd.Set_title (_ : string) -> None
+  | Sd.Set_body (_ : string) -> None
+  | Sd.Like -> None
+  | Sd.Unlike -> None
+  | Sd.Add_tag (_ : string) -> None
+  | Sd.Remove_tag (_ : string) -> None
+  | Sd.Sync_doc (_ : Sd.model) -> None
+  | Sd.Request_stats -> None
+
+let stats_req_val = { SR.title = "hello"; body = "a b c d" }
+let resp_val = { SR.title_len = 5; word_count = 4 }
+let ok_frame = Ok (R.encode_resp SR.Doc_stats resp_val)
+
+(* [reply] into the real app msg so the whole client path is exercised. *)
+let stats_cmd = R.call SR.Doc_stats stats_req_val ~reply:(fun r -> Sd.Got_stats r)
+
+let () =
+  let lowered = Tea_client.cmd_to_vdom stats_cmd in
+  check "cmd_to_vdom lowers R.call to Tea_client.Http with the derived path and encoded body"
+    (http_of lowered
+    |> Option.fold ~none:false ~some:(fun (path, wire_body, _expect) ->
+           String.equal path "/rpc/doc_stats"
+           && String.equal wire_body (R.encode_req SR.Doc_stats stats_req_val)));
+  check "the lowered Http expect maps an Ok canned resp to Got_stats (Ok stats)"
+    (http_of lowered
+    |> Option.fold ~none:false ~some:(fun (_path, _body, expect) ->
+           got_stats_of (expect ok_frame)
+           |> Option.fold ~none:false ~some:(fun r ->
+                  Result.fold r ~error:(fun (_ : Tea_rpc.error) -> false)
+                    ~ok:(fun s -> stats_resp_eq s resp_val))));
+  check "the lowered Http expect routes an Http_status 500 into the app's error msg (no drop)"
+    (http_of lowered
+    |> Option.fold ~none:false ~some:(fun (_path, _body, expect) ->
+           Prim.Status.of_int 500
+           |> Option.fold ~none:false ~some:(fun s ->
+                  got_stats_of (expect (Error (Cmd.Http_status s)))
+                  |> Option.fold ~none:false ~some:(fun r ->
+                         Result.fold r ~ok:(fun (_ : SR.stats_resp) -> false)
+                           ~error:(function
+                             | Tea_rpc.Transport (Cmd.Http_status s') ->
+                               Prim.Status.to_int s' = 500
+                             | Tea_rpc.Transport Cmd.Network_error -> false
+                             | Tea_rpc.Transport Cmd.No_transport -> false
+                             | Tea_rpc.Decode _ -> false)))))
+
+(* --- Cmd.map post-composition over Http (both frames) + Batch distribution - *)
+
+type wrap = Wrap of Sd.msg
+
+let () =
+  let g m = Wrap m in
+  let src_expect =
+    http_of (Tea_client.cmd_to_vdom stats_cmd) |> Option.map (fun (_, _, e) -> e)
+  in
+  let mapped_expect =
+    http_of (Tea_client.cmd_to_vdom (Cmd.map g stats_cmd)) |> Option.map (fun (_, _, e) -> e)
+  in
+  let err_frame s = Error (Cmd.Http_status s) in
+  check "Cmd.map post-composes the Http expect (g o expect) on an Ok frame"
+    (Option.fold src_expect ~none:false ~some:(fun e ->
+         Option.fold mapped_expect ~none:false ~some:(fun e' ->
+             e' ok_frame = g (e ok_frame))));
+  check "Cmd.map post-composes the Http expect (g o expect) on an Error frame"
+    (Prim.Status.of_int 500
+    |> Option.fold ~none:false ~some:(fun s ->
+           Option.fold src_expect ~none:false ~some:(fun e ->
+               Option.fold mapped_expect ~none:false ~some:(fun e' ->
+                   e' (err_frame s) = g (e (err_frame s))))))
+
+let () =
+  let g m = Wrap m in
+  let src_expect =
+    http_of (Tea_client.cmd_to_vdom stats_cmd) |> Option.map (fun (_, _, e) -> e)
+  in
+  let mapped_batch =
+    Tea_client.cmd_to_vdom (Cmd.map g (Cmd.batch [ stats_cmd; Cmd.emit Sd.Request_stats ]))
+  in
+  check "Cmd.map distributes through Batch [http; emit], mapping both children"
+    (batch_parts mapped_batch
+    |> Option.fold ~none:false ~some:(function
+         | [ http_child; echo_child ] ->
+           (http_of http_child
+           |> Option.fold ~none:false ~some:(fun (path, _body, e') ->
+                  String.equal path "/rpc/doc_stats"
+                  && Option.fold src_expect ~none:false ~some:(fun e ->
+                         e' ok_frame = g (e ok_frame))))
+           && is_echo_of (Wrap Sd.Request_stats) echo_child
+         | [] -> false
+         | [ _ ] -> false
+         | _ :: _ :: _ :: _ -> false))
+
+(* --- The server-side Loop resolves Http to No_transport (identity Io) ------ *)
+
+(* No identity-Io Loop precedent existed in the suite; this is the first. A
+   minimal APP whose update stores the raw reply (so the No_transport error is
+   observable, not folded away like the real app's [Got_stats]). *)
+module Identity = struct
+  type 'a t = 'a
+
+  let return x = x
+  let bind x f = f x
+  let all xs = xs
+end
+
+module Probe = struct
+  open Tea_core
+  module Rp = Tea_rpc.Make (Shared_doc_rpc)
+
+  type reply = (SR.stats_resp, Tea_rpc.error) result
+  type model = reply option
+
+  type msg =
+    | Fire  (** one call whose reply is stored *)
+    | Fire_loop  (** a call whose reply re-fires the call — the fuel probe *)
+    | Store of reply
+
+  (* [reply] has no faithful wire form (Tea_rpc.error wraps the abstract
+     Status); project through the success option purely to satisfy [APP]. The
+     Loop never serialises. *)
+  let reply_t : reply Repr.t =
+    Repr.map
+      (Repr.option SR.stats_resp_t)
+      (Option.fold ~none:(Error (Tea_rpc.Decode "no wire form")) ~some:(fun s -> Ok s))
+      (Result.fold ~ok:Option.some ~error:(fun (_ : Tea_rpc.error) -> None))
+
+  let model_t = Repr.option reply_t
+
+  let msg_t =
+    Repr.(
+      variant "msg" (fun fire fire_loop store ->
+        function
+        | Fire -> fire
+        | Fire_loop -> fire_loop
+        | Store r -> store r)
+      |~ case0 "Fire" Fire
+      |~ case0 "Fire_loop" Fire_loop
+      |~ case1 "Store" reply_t (fun r -> Store r)
+      |> sealv)
+
+  let call ~reply =
+    Rp.call SR.Doc_stats { SR.title = "t"; body = "b" } ~reply
+
+  let init = (None, Cmd.none)
+
+  let update msg (model : model) =
+    match msg with
+    | Fire -> (model, call ~reply:(fun r -> Store r))
+    | Fire_loop -> (model, call ~reply:(fun (_ : reply) -> Fire_loop))
+    | Store r -> (Some r, Cmd.none)
+
+  let view (_ : model) = Html.text "probe"
+  let subscriptions (_ : model) = Sub.none
+  let merge = Merge.(to_spec (atomic ~eq:Repr.(unstage (equal model_t))))
+  let title = Prim.Title.v "probe"
+  let url_of_model (_ : model) = None
+  let msg_of_url (_ : Prim.Url.t) = None
+end
+
+module _ : Tea_core.App.APP = Probe
+module L = Tea_core.Loop.Loop (Identity) (Probe)
+
+let probe_fx =
+  { L.sleep = (fun (_ : Prim.Delay.t) -> ())
+  ; navigate = (fun (_ : Prim.Url.t) -> ())
+  }
+
+let () =
+  check "identity-Io Loop resolves an R.call to Error (Transport No_transport)"
+    (L.step ~fx:probe_fx ~fuel:Prim.Fuel.default Probe.Fire None
+    |> Result.fold
+         ~error:(fun L.Fuel_exhausted -> false)
+         ~ok:(fun (m : Probe.model) ->
+           Option.fold m ~none:false ~some:(fun r ->
+               Result.fold r ~ok:(fun (_ : SR.stats_resp) -> false)
+                 ~error:(function
+                   | Tea_rpc.Transport Cmd.No_transport -> true
+                   | Tea_rpc.Transport (Cmd.Http_status (_ : Prim.Status.t)) -> false
+                   | Tea_rpc.Transport Cmd.Network_error -> false
+                   | Tea_rpc.Decode _ -> false))));
+  check "a reply that re-fires the call burns fuel like Emit (fuel 2 -> Fuel_exhausted)"
+    (Prim.Fuel.of_int 2
+    |> Option.fold ~none:false ~some:(fun fuel2 ->
+           L.step ~fx:probe_fx ~fuel:fuel2 Probe.Fire_loop None
+           |> Result.fold ~ok:(fun (_ : Probe.model) -> false)
+                ~error:(fun L.Fuel_exhausted -> true)))
+
 let () = print_endline "client_test: all checks passed"

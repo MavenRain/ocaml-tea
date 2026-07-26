@@ -18,6 +18,14 @@
 type 'msg Vdom.Cmd.t +=
   | After of int * 'msg  (** emit ['msg] after the given delay, in ms *)
   | Navigate of string  (** push a relative URL onto the browser history *)
+  | Http of
+      { path : string  (** lowered at the vdom boundary, as [Navigate] lowers [Url] *)
+      ; body : string
+      ; expect : (string, Tea_core.Cmd.http_failure) result -> 'msg
+      }
+      (** POST [body] to same-origin [path] (application/json); feed the raw
+          transport outcome to [expect]. Interpreted by [Tea_client_run]'s
+          XHR arm. *)
 
 (** {2 Total translations}
 

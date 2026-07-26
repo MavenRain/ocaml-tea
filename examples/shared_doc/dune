@@ -1,3 +1,6 @@
 (library
  (name shared_doc_app)
- (libraries tea_core repr))
+ ; unwrapped so the shared RPC contract links into both tiers and the tests as
+ ; the bare [Shared_doc_rpc], the ONE endpoint definition (DESIGN §8).
+ (wrapped false)
+ (libraries tea_core tea_rpc repr))

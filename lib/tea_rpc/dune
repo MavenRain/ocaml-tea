@@ -1,0 +1,3 @@
+(library
+ (name tea_rpc)
+ (libraries tea_core repr))

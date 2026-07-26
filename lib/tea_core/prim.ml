@@ -172,3 +172,38 @@ module Commit_ref = struct
   let of_hash h = h
   let to_string t = t
 end
+
+module Rpc_path = struct
+  type t = string
+
+  type err =
+    | Empty
+    | Not_rooted
+    | Invalid_char of char
+
+  (* [A-Za-z0-9/_.-], rooted: the path is spliced into the client's
+     [XHR.open_] and matched byte-for-byte by the server router, so the
+     charset closes URL-metachar smuggling (? # \) and control-byte injection
+     at admission. *)
+  let is_path_char c =
+    is_lower c || is_upper c || is_digit c || Char.equal c '/'
+    || Char.equal c '_' || Char.equal c '.' || Char.equal c '-'
+
+  let of_string s =
+    if String.length s = 0 then Error Empty
+    else if not (Char.equal s.[0] '/') then Error Not_rooted
+    else
+      first_where (fun c -> not (is_path_char c)) s
+      |> Option.fold ~none:(Ok s) ~some:(fun c -> Error (Invalid_char c))
+
+  let v s = s
+  let to_string t = t
+end
+
+module Status = struct
+  type t = int
+
+  let of_int n = if n >= 100 && n <= 599 then Some n else None
+  let is_success t = t >= 200 && t <= 299
+  let to_int t = t
+end

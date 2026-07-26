@@ -43,6 +43,14 @@ module Loop (Io : IO) (A : App.APP) = struct
     | Cmd.Navigate url ->
       let* () = fx.navigate url in
       Io.return (Ok model)
+    | Cmd.Http { path = (_ : Prim.Rpc_path.t); body = (_ : string); expect } ->
+      (* This tier has no HTTP client: fail closed INTO the app, not past it.
+         The continuation is fed back through [update] like [Emit], so the
+         reply msg is fuel-bounded and the app decides what a transportless
+         call means. Swapping this arm for an [fx.http] field is the
+         compile-forced upgrade path if server-side dispatch is ever wanted. *)
+      let model', cmd' = A.update (expect (Error Cmd.No_transport)) model in
+      drive ~fx ~fuel model' cmd'
     | Cmd.Batch cmds -> fold ~fx ~fuel model cmds
 
   and fold ~fx ~fuel model = function

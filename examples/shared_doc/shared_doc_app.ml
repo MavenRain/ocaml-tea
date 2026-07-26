@@ -18,20 +18,35 @@
 module App = struct
   open Tea_core
 
+  (** The typed RPC client builder for this app's one contract: [R.call]
+      encodes a request with {!Shared_doc_rpc}'s codecs and returns a
+      {!Tea_core.Cmd.http} whose reply the app folds back into a msg (DESIGN
+      §8). Linking the same [Make] both tiers use is what makes name, path,
+      and codec identical by construction. *)
+  module R = Tea_rpc.Make (Shared_doc_rpc)
+
   type model =
     { title : string
     ; body : string
     ; likes : int
     ; tags : string list
+    ; last_stats : Shared_doc_rpc.stats_resp option
+        (** the most recent {!Shared_doc_rpc.Doc_stats} reply — a {e shared}
+            field of the document, not a per-client one: it rides [model_t]
+            below, so a click that recomputes it is committed and broadcast to
+            every live editor exactly like a title or tag edit. [None] before
+            the first round-trip; reset to [None] by a failed one. *)
     }
 
   let model_t =
     Repr.(
-      record "doc" (fun title body likes tags -> { title; body; likes; tags })
+      record "doc" (fun title body likes tags last_stats ->
+        { title; body; likes; tags; last_stats })
       |+ field "title" string (fun m -> m.title)
       |+ field "body" string (fun m -> m.body)
       |+ field "likes" int (fun m -> m.likes)
       |+ field "tags" (list string) (fun m -> m.tags)
+      |+ field "last_stats" (option Shared_doc_rpc.stats_resp_t) (fun m -> m.last_stats)
       |> sealr)
 
   type msg =
@@ -44,10 +59,45 @@ module App = struct
     | Sync_doc of model
         (** reconcile from a pushed store head (live view): the committed
             document is the authority *)
+    | Request_stats
+        (** ask the [Doc_stats] endpoint about the current title/body *)
+    | Got_stats of (Shared_doc_rpc.stats_resp, Tea_rpc.error) result
+        (** the reply delivered by {!R.call}'s continuation, folded into the
+            shared [last_stats] field; lossily projected on the error side
+            when the live mirror serialises it (see [stats_reply_t]) *)
+
+  (* WHY THIS APP FOLDS AN RPC REPLY INTO THE REPLICATED MODEL.
+     A [Doc_stats] call is server-read-only (the endpoint never writes the
+     store), but this app CHOOSES to store its reply in [last_stats], a
+     [model_t] field. The live-view runtime mirrors every locally-born msg up
+     the socket, so [Got_stats] travels the wire, the server commits it, and
+     the new head broadcasts to every editor: the recomputed stats become a
+     {e shared} badge, updated on demand by whoever clicks — and, like any
+     msg in this every-update-is-a-commit framework, the click adds a commit
+     (which [History_count] counts and [undo] walks; step-6 coalescing is the
+     answer to that volume). A genuinely per-client reply would need a
+     client-local state channel this single-replicated-model framework does
+     not yet have (DESIGN §8, deferred). Because [Got_stats] is serialised,
+     [msg_t] must encode it; [{!Tea_rpc.error}] wraps the abstract
+     {!Tea_core.Prim.Status.t} and has no faithful wire form, so the
+     projection is deliberately lossy on the error side — a mirrored
+     [Got_stats (Error (Transport ...))] reaches the server as the canonical
+     [Error (Decode _)] below, collapsing WHICH transport failure occurred.
+     Both tiers fold any [Error] to [last_stats = None], so the [Ok] side is
+     wire-faithful and the shared badge never disagrees between tiers. *)
+  let stats_reply_t : (Shared_doc_rpc.stats_resp, Tea_rpc.error) result Repr.t =
+    Repr.map
+      (Repr.option Shared_doc_rpc.stats_resp_t)
+      (Option.fold
+         ~none:(Error (Tea_rpc.Decode "rpc reply has no wire form"))
+         ~some:(fun s -> Ok s))
+      (Result.fold ~ok:Option.some ~error:(fun (_ : Tea_rpc.error) -> None))
 
   let msg_t =
     Repr.(
-      variant "msg" (fun set_title set_body like unlike add_tag remove_tag sync ->
+      variant "msg"
+        (fun set_title set_body like unlike add_tag remove_tag sync request_stats
+             got_stats ->
         function
         | Set_title s -> set_title s
         | Set_body s -> set_body s
@@ -55,7 +105,9 @@ module App = struct
         | Unlike -> unlike
         | Add_tag t -> add_tag t
         | Remove_tag t -> remove_tag t
-        | Sync_doc d -> sync d)
+        | Sync_doc d -> sync d
+        | Request_stats -> request_stats
+        | Got_stats r -> got_stats r)
       |~ case1 "Set_title" string (fun s -> Set_title s)
       |~ case1 "Set_body" string (fun s -> Set_body s)
       |~ case0 "Like" Like
@@ -63,9 +115,13 @@ module App = struct
       |~ case1 "Add_tag" string (fun t -> Add_tag t)
       |~ case1 "Remove_tag" string (fun t -> Remove_tag t)
       |~ case1 "Sync_doc" model_t (fun d -> Sync_doc d)
+      |~ case0 "Request_stats" Request_stats
+      |~ case1 "Got_stats" stats_reply_t (fun r -> Got_stats r)
       |> sealv)
 
-  let init = ({ title = "Untitled"; body = ""; likes = 0; tags = [] }, Cmd.none)
+  let init =
+    ( { title = "Untitled"; body = ""; likes = 0; tags = []; last_stats = None }
+    , Cmd.none )
 
   let update msg model =
     match msg with
@@ -79,6 +135,17 @@ module App = struct
     | Remove_tag t ->
       ({ model with tags = List.filter (fun x -> not (String.equal x t)) model.tags }, Cmd.none)
     | Sync_doc d -> (d, Cmd.none)
+    | Request_stats ->
+      ( model
+      , R.call Shared_doc_rpc.Doc_stats
+          { Shared_doc_rpc.title = model.title; body = model.body }
+          ~reply:(fun r -> Got_stats r) )
+    | Got_stats r ->
+      ( { model with
+          last_stats =
+            Result.fold r ~ok:Option.some ~error:(fun (_ : Tea_rpc.error) -> None)
+        }
+      , Cmd.none )
 
   let view model =
     let open Html in
@@ -107,6 +174,18 @@ module App = struct
           ]
       ; ul ~attrs:[ class_ "tags" ] (List.map tag_li model.tags)
       ; div ~attrs:[ class_ "add-tags" ] (List.map add_tag_button [ "urgent"; "review"; "done" ])
+      ; div
+          ~attrs:[ class_ "stats" ]
+          [ button ~attrs:[ on_click Request_stats ] [ text "Stats" ]
+          ; span
+              ~attrs:[ class_ "stats-line" ]
+              [ text
+                  (Option.fold model.last_stats ~none:"no stats yet"
+                     ~some:(fun (s : Shared_doc_rpc.stats_resp) ->
+                       Printf.sprintf "title %d chars, %d words" s.title_len
+                         s.word_count))
+              ]
+          ]
       ]
 
   let subscriptions _model = Sub.store_watch (fun m -> Sync_doc m)

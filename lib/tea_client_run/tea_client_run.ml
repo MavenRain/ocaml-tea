@@ -31,6 +31,33 @@ let env =
           | Tea_client.Navigate url ->
             Js_browser.History.push_state (W.history window) Ojs.null "" url;
             true
+          | Tea_client.Http { path; body; expect } ->
+            (* The wire half of [Tea_rpc.Make.call]: POST the encoded request,
+               classify the transport outcome, feed it to the [expect]
+               continuation the typed layer built. [send_msg] from an async
+               callback is the established [After]/[set_timeout] precedent.
+               [Status.of_int 0 = None] is the network-failure classifier:
+               offline/DNS/abort surface as XHR status 0. *)
+            let module X = Js_browser.XHR in
+            let xhr = X.create () in
+            X.open_ xhr "POST" path;
+            X.set_request_header xhr "Content-Type" "application/json";
+            X.set_onreadystatechange xhr (fun () ->
+                match X.ready_state xhr with
+                | X.Done ->
+                  let outcome =
+                    Prim.Status.of_int (X.status xhr)
+                    |> Option.fold
+                         ~none:(Error Tea_core.Cmd.Network_error)
+                         ~some:(fun st ->
+                           if Prim.Status.is_success st then Ok (X.response_text xhr)
+                           else Error (Tea_core.Cmd.Http_status st))
+                  in
+                  Vdom_blit.Cmd.send_msg ctx (expect outcome)
+                | X.Unsent | X.Opened | X.Headers_received | X.Loading -> ()
+                | X.Other (_ : int) -> ());
+            X.send xhr (Ojs.string_to_js body);
+            true
           | unrecognized ->
             ignore unrecognized;
             false)
