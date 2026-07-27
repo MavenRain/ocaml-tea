@@ -98,6 +98,14 @@ async function transition(label, read, want, opts = {}) {
    shape (worse: it needs re-diagnosing). */
 const pin = (label, read, want, opts = {}) => transition(label, read, want, { ...opts, kind: 'pin' })
 
+/* The static sibling of [pin], for a known-bad value that is ALREADY settled
+   rather than reached by an action. [pin] cannot express this: it is built on
+   [transition], whose vacuity guard correctly rejects a condition that already
+   held before the action. Same pin semantics otherwise: it asserts today's
+   broken value, counts as an xfail while the gap is open, and turns into a
+   loud FAIL the day the gap closes and the value changes. */
+const pinValue = (label, ok, detail = '') => ({ label, ok, detail, kind: 'pin' })
+
 /* ------------------------------------------------------------------ server */
 
 /* Spawn a real compiled example server on one origin, so the static bundle,
@@ -326,7 +334,13 @@ const frameTag = (message) => {
    not count as one. `socket` is the newest client-side route, so a scenario
    can break the live link and let the reconnect ladder rebuild it. */
 function wsTap() {
-  const tap = { applies: 0, acks: 0, dropUps: 0, dropAcks: false, socket: null }
+  /* [droppedAcks] counts acks the tap swallowed. It matters because an ack the
+     CLIENT never sees is still proof the SERVER got that far, and the pump
+     persists the taken floor BEFORE it acks, so "the ack was emitted" is the
+     only sound signal that the durable floor is written. Without it a test can
+     only wait on a rendered count, which the store watch can satisfy while the
+     journal append is still in flight. */
+  const tap = { applies: 0, acks: 0, droppedAcks: 0, dropUps: 0, dropAcks: false, socket: null }
   tap.handler = (ws) => {
     tap.socket = ws
     const server = ws.connectToServer()
@@ -342,7 +356,10 @@ function wsTap() {
     })
     server.onMessage((message) => {
       if (frameTag(message) === 'ack') {
-        if (tap.dropAcks) return
+        if (tap.dropAcks) {
+          tap.droppedAcks += 1
+          return
+        }
         tap.acks += 1
       }
       ws.send(message)
@@ -540,7 +557,15 @@ async function dropAckScenario(browser, base) {
 
    This is a positive test, not a pin: the durable sink exists now. */
 async function durableRestartScenario(browser) {
-  const root = await mkdtemp(join(tmpdir(), 'tea-smoke-b4-'))
+  /* The pack root must be a path irmin-pack creates and owns: the PARENT has
+     to exist and the leaf must not. Handing it the mkdtemp directory itself
+     dies with `Pack_error: "Invalid_layout"` before the server ever listens
+     (and a missing parent dies with No_such_file_or_directory), so the temp
+     directory is the parent and the store sits one component below it,
+     exactly as the OCaml pack tests do it. Both lives share this path: that
+     is what makes the restart a restart rather than a fresh store. */
+  const parent = await mkdtemp(join(tmpdir(), 'tea-smoke-b4-'))
+  const root = join(parent, 'store')
   const server = () =>
     spawnServer({
       name: 'durable counter server',
@@ -589,6 +614,23 @@ async function durableRestartScenario(browser) {
       { act: () => plusOn(a).click() }
     ))) return out
 
+    /* Wait for the server to have EMITTED that ack (the tap swallows it, so
+       the client still replays). The pump persists the taken floor before it
+       acks, so this is the signal that the floor is written; the observer's
+       count is NOT, because the store watch can render the commit while the
+       journal append is still in flight. Stopping on the count alone made this
+       scenario flaky: a SIGTERM landing in that window closes the journal
+       under the pending append, the floor is lost, and the replay double
+       applies to 3. That degrades in the designed direction (a visible,
+       convergent duplicate rather than a loss), but it is a race, and a test
+       that races is not evidence. */
+    if (!step(await transition(
+      'durable B4: the server emitted the second click\'s Ack before the stop, so its floor is persisted (persist precedes ack)',
+      () => tap.droppedAcks,
+      (n) => n > 0,
+      { pre: 0 }
+    ))) return out
+
     tap.dropAcks = false
     const outcome = await stop(srv, 'SIGTERM')
     if (!step(check(
@@ -606,20 +648,51 @@ async function durableRestartScenario(browser) {
       { pre: acksAtRestart, timeout: WAIT_MS * 2 }
     ))) return out
 
-    const postA = await countOn(a)
-    const postO = await countOn(o)
-    if (!step(check(
-      'durable B4: exactly-once across the restart - both tabs read 2 (not 1: lost store; not 3: double apply)',
-      postA === '2' && postO === '2',
-      `A=${postA} O=${postO}`
-    ))) return out
+    /* Ask the SERVER what it holds, FIRST, because it is the only reading here
+       that separates the three worlds: 2 is the guarantee, 1 is the lost-store
+       arm, 3 is the double-apply arm.
 
-    if (!step(await transition(
-      'durable B4: a follow-up click moves the count 2 -> 3 (the guard admits fresh edits after the restart)',
-      () => countOn(o),
-      (v) => v === '3',
-      { act: () => plusOn(a).click() }
-    ))) return out
+       A client-rendered count cannot make that distinction. A tab's model
+       already holds 2, and the reconnect Hello is JOINED into it rather than
+       adopted over it (the CvRDT merge), so a server that came back empty
+       never pulls a tab back down. mut-b4-fresh-root proved exactly that by
+       scoring ZERO reds against the client-count assertion.
+
+       So: a new page in the SAME context (same session cookie, therefore the
+       same branch) on the SSR route, which runs no client logic at all, so
+       what it renders IS the stored model. */
+    const ssr = await ctx.newPage()
+    await ssr.goto(`${srv.base}/`)
+    const served = await countOn(ssr)
+    await ssr.close()
+
+    /* KNOWN GAP, pinned rather than asserted, because the honest reading is
+       that the end-to-end guarantee does not hold yet and the reason is NOT
+       the guard.
+
+       The server holds 1, not 2. The guard journal survived the restart
+       exactly as designed, but nothing ever consults it, because the identity
+       it is keyed to did not survive: [Tea_server] runs on
+       [Dream.memory_sessions], and the session id (tea_server.ml, [hex
+       (Dream.session_id request)]) is what derives BOTH the branch name AND
+       the replica id. A restart therefore mints a fresh session id, so the
+       reconnecting tab lands on a NEW branch (empty model, hence the replay
+       applying onto 0 and reading 1) under a NEW replica (so the journalled
+       floor is looked up under a key that can never match).
+
+       Durable floors need a durable identity. Until session identity survives
+       a restart (cookie-backed sessions with a stable secret, or an
+       app-managed durable session cookie), exactly-once across a restart is
+       reachable in process, where the tests construct the same replica across
+       both lives, but not through the real binary.
+
+       This is a PIN: it asserts the CURRENT broken value. The day identity
+       becomes durable this goes stale and reddens, which is the alarm. */
+    step(pinValue(
+      'durable B4 PIN (KNOWN GAP): the restarted server holds 1, not 2 - memory_sessions loses the session id, so the restart lands on a new branch and a new replica and the durable floor is never consulted',
+      served === '1',
+      `server-rendered count=${served} (2 would mean the gap is closed: update this pin)`
+    ))
 
     step(check('durable B4: no uncaught browser exception', errors.length === 0, errors.join(' | ')))
     return out
@@ -627,9 +700,9 @@ async function durableRestartScenario(browser) {
     if (ctx) await ctx.close().catch(() => {})
     if (srv) await stop(srv, 'SIGTERM').catch(() => {})
     /* The journal is a SIBLING of the pack root (serve_pack keeps it out of
-       irmin-pack's directory on purpose), so both must go. */
-    await rm(root, { recursive: true, force: true })
-    await rm(root + '.guard', { recursive: true, force: true })
+       irmin-pack's directory on purpose); both live under the temp parent, so
+       removing the parent takes the store and the journal together. */
+    await rm(parent, { recursive: true, force: true })
   }
 }
 

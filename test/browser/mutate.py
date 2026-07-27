@@ -41,7 +41,17 @@ MUTATIONS = [
         # expectation is a failure, M1 could not pass. Confirmed statically:
         # "KNOWN BUG" survives in this harness only inside smoke.mjs's header
         # comment, never as a check label.
-        "expect_red": ["purely via the WS live frame"],
+        # Step 11 added B1-B4, which ALL depend on the live view, so this
+        # mutation now reddens the earliest live-frame check in each of them
+        # too. Every one must be named: an unnamed red is reported as a STRAY,
+        # and a stray is a failure just like a missed expectation.
+        "expect_red": [
+            "purely via the WS live frame",
+            "the click's up-frame is captured in flight",
+            "tab A's first edit reaches tab B",
+            "the click lands while its Ack is dropped",
+            "first click commits and streams to the observer",
+        ],
     },
     {
         "id": "M2",
@@ -69,7 +79,15 @@ MUTATIONS = [
         "file": "examples/counter/counter_app.ml",
         "old": 'class_ "count"',
         "new": 'class_ "count-renamed"',
-        "expect_red": ["counter: scenario ran to completion"],
+        # The count element is the mount gate for EVERY counter-based scenario,
+        # so renaming its class strands B1-B4 at their own mount waits as well.
+        "expect_red": [
+            "counter: scenario ran to completion",
+            "replay B1: scenario ran to completion",
+            "replay B2: scenario ran to completion",
+            "replay B3: scenario ran to completion",
+            "durable B4: scenario ran to completion",
+        ],
     },
     # --- step 11 (D16): the delivery scenarios B1-B4 -------------------------
     #
@@ -120,7 +138,15 @@ MUTATIONS = [
         # 0 + a replayed 1 is indistinguishable from the real guarantee.
         "old": "Pack_server.serve_pack ~port ?client_dir ~root:(Tea_server_pack.Root.v root) ())",
         "new": 'Pack_server.serve_pack ~port ?client_dir ~root:(Tea_server_pack.Root.v (Random.self_init (); root ^ "-" ^ string_of_int (Random.int 1000000))) ())',
-        "expect_red": ["exactly-once across the restart"],
+        # BLOCKED on the session-identity gap that B4 now pins. A restart
+        # already lands on a fresh branch under a fresh replica (Dream's
+        # memory-backed sessions lose the session id), so the honest world and
+        # this mutated one BOTH leave the restarted server holding 1: the
+        # mutation is currently unobservable, and running it would report a
+        # MISS that says nothing about vacuity. Unblocks the day session
+        # identity survives a restart, which is also the day B4's pin reddens.
+        "blocked": "session identity is not durable; see B4's PIN in smoke.mjs",
+        "expect_red": ["the RESTARTED SERVER itself holds 2"],
     },
     {
         "id": "mut-journal-unwired",
@@ -133,7 +159,17 @@ MUTATIONS = [
         # their path - so they MUST stay green under this mutation.
         "old": "~tabs:Replay_guard.default_tabs ~sink ~floors",
         "new": "~tabs:Replay_guard.default_tabs ~sink:(ignore sink; Guard_sink.null) ~floors:(ignore floors; Durable_guard.Floors.empty)",
-        "expect_red": ["exactly-once across the restart"],
+        # BLOCKED on the same session-identity gap as mut-b4-fresh-root, and
+        # for a sharper reason: a restart already lands on a fresh replica, so
+        # the journalled floor is never consulted no matter what sink wrote it.
+        # Unwiring the journal is therefore unobservable end to end (measured:
+        # zero reds). It DID score a red in the first sweep, but only against
+        # B4's old client-rendered assertion, which the join makes unreliable -
+        # that red was not evidence either. The journal's effect is covered in
+        # process instead, where durable_guard_test/exactly_once_test pin it and
+        # the OCaml sweep confirmed it. Unblocks when B4's pin reddens.
+        "blocked": "session identity is not durable, so no restart consults the journal; see B4's PIN",
+        "expect_red": ["the RESTARTED SERVER itself holds 2"],
     },
 ]
 
@@ -160,7 +196,18 @@ def apply_mutation(m):
 
 def main():
     wanted = sys.argv[1:]
-    chosen = [m for m in MUTATIONS if not wanted or m["id"] in wanted]
+    # A blocked mutation is one nothing can currently observe (see its own
+    # note). Naming it explicitly on the command line still runs it; a bare
+    # sweep skips it and SAYS SO, because a silently dropped mutation reads as
+    # coverage that was never there.
+    chosen = [
+        m
+        for m in MUTATIONS
+        if (m["id"] in wanted) or (not wanted and not m.get("blocked"))
+    ]
+    skipped = [m for m in MUTATIONS if m not in chosen]
+    for m in skipped:
+        print(f"SKIP {m['id']}: blocked - {m['blocked']}")
 
     base_out, base_red = smoke()
     if base_red:
