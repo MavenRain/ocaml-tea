@@ -283,3 +283,56 @@ let () =
   let second = Guard.Cell.take c ~replica:r ~tab:t ~seq:(seq 3) in
   check "Cell.seed is idempotent and take still admits a seq exactly once"
     (is_fresh first ~at:3 && is_duplicate second ~high:3)
+
+(* --- 9. seed against the bounds: durability must not blow the table (D16) --- *)
+
+(* [seed] is driven by the durable mirror, which is read on every Cell miss, so
+   it is the one entry point an attacker can aim at the table's capacity: a
+   journal full of minted cookies would otherwise grow the in-memory table
+   without limit. Both checks below are about seed being an ORDINARY table
+   write for bounding purposes, and a recency-touching one for eviction. *)
+let () =
+  let r = replica "seedrecency" in
+  let g0 = Guard.v ~sessions:(bound 8) ~tabs:(bound 2) in
+  let g1, (_ : Guard.verdict) = Guard.take g0 ~replica:r ~tab:(tab 1) ~seq:(seq 1) in
+  let g2, (_ : Guard.verdict) = Guard.take g1 ~replica:r ~tab:(tab 2) ~seq:(seq 1) in
+  (* The table is full. Seeding tab 1 is what a restarted process does on that
+     tab's first frame, so tab 1 is the ACTIVE one and tab 2 is now the least
+     recently used. If seed did not touch recency this would evict tab 1 - the
+     tab whose durable floor was just read back - and the check below is exactly
+     that anti-vacuity. *)
+  let g3 = Guard.seed g2 ~replica:r ~tab:(tab 1) ~high:(seq 5) in
+  let g4, (_ : Guard.verdict) = Guard.take g3 ~replica:r ~tab:(tab 3) ~seq:(seq 1) in
+  check "seed touches recency, so a just-seeded tab is not the eviction victim"
+    (Option.fold ~none:false
+       ~some:(fun h -> Int.equal (Msg_seq.to_int h) 5)
+       (Guard.high_water g4 ~replica:r ~tab:(tab 1)));
+  check "the least recently used sibling is the one evicted instead"
+    (Option.is_none (Guard.high_water g4 ~replica:r ~tab:(tab 2)));
+  check "and the tab bound still holds after a seed-driven eviction"
+    (Int.equal (Guard.tabs g4 ~replica:r) 2)
+
+let () =
+  (* A hostile journal cannot cost more than the bound: seeding is capped the
+     same way taking is, at both levels of the key. *)
+  let r = replica "seedbound" in
+  let many_tabs =
+    List.fold_left
+      (fun (g : Guard.t) (i : int) ->
+        Guard.seed g ~replica:r ~tab:(tab i) ~high:(seq 1))
+      (Guard.v ~sessions:(bound 8) ~tabs:(bound 2))
+      (List.init 5 (fun (i : int) -> i + 1))
+  in
+  check "seeding more tabs than the bound leaves the bound intact"
+    (Int.equal (Guard.tabs many_tabs ~replica:r) 2);
+  let many_replicas =
+    List.fold_left
+      (fun (g : Guard.t) (i : int) ->
+        Guard.seed g
+          ~replica:(replica (Printf.sprintf "hostile%d" i))
+          ~tab:(tab 1) ~high:(seq 1))
+      (Guard.v ~sessions:(bound 2) ~tabs:(bound 8))
+      (List.init 5 (fun (i : int) -> i + 1))
+  in
+  check "seeding more replicas than the bound leaves the session bound intact"
+    (Int.equal (Guard.sessions many_replicas) 2)

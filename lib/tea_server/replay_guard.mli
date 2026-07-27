@@ -36,16 +36,32 @@
 
     {2 The direction every degradation falls}
 
-    Eviction and process restart can only ever produce a {b duplicate}, never a
-    {b loss}, because the guard never invents a high water it did not observe:
-    an absent entry accepts any sequence number. A false [Duplicate] costs a
+    Forgetting an entry, by eviction or by process restart, can only ever
+    produce a {b duplicate}, because an absent entry accepts any sequence
+    number: the guard forgets toward acceptance. A false [Duplicate] costs a
     silent permanent edit; a false [Fresh] costs one visible, convergent double
-    count. There is exactly one way to reach the loss side — a stale entry
-    outliving its branch — and it is stated as a precondition on {!forget}.
+    count. The loss side is reached only by {i remembering too much}: a high
+    water outliving the effect it records. Within this module's own state there
+    is exactly one such path, a stale entry outliving its branch, and it is
+    stated as a precondition on {!forget}; the durable wiring adds a second,
+    stated below.
 
-    The guarantee, stated exactly: {b exactly-once effect within one server
-    process lifetime and within this guard's bounds; at-least-once outside
-    them.}
+    The guarantee this pure module states for itself: {b exactly-once effect
+    within one server process lifetime and within this guard's bounds;
+    at-least-once outside them.} On the mem tier that is the whole story. The
+    durable wiring ({!Durable_guard} over {!Guard_sink}, journaled on the pack
+    tier by [Tea_server_pack.Guard_file]; roadmap step 11, D16) extends the
+    lifetime bound across an {i orderly} restart: a SIGINT/SIGTERM teardown
+    closes the store and then the journal, and the read-back floors re-enter
+    this table through {!seed}. It does not extend it across a hard kill. A
+    [kill -9] can leave a journal floor more durable than the commit whose
+    effect it records (the journal reaches the page cache per record,
+    irmin-pack buffers commits in user space), and a seed adopting such a
+    floor answers [Duplicate] against an effect that is gone: the
+    unacknowledged in-flight tail is then silently lost, bounded by the pack's
+    auto-flush lag. That is the second loss-side path, opened by durability
+    itself, stated as out of scope on [Tea_server_pack.Guard_file] rather than
+    closed by this module.
 
     {2 Why the bound is defensible}
 

@@ -71,6 +71,70 @@ MUTATIONS = [
         "new": 'class_ "count-renamed"',
         "expect_red": ["counter: scenario ran to completion"],
     },
+    # --- step 11 (D16): the delivery scenarios B1-B4 -------------------------
+    #
+    # The B scenarios abort at their FIRST failing check (smoke.mjs's `step`
+    # early return), so each expectation below names the EARLIEST check its
+    # mutation breaks - naming a later one would report a MISS for driver
+    # reasons, not for vacuity.
+    {
+        "id": "mut-unacked-empty",
+        "why": "the replay is real: a client whose unacked queue reads empty re-sends nothing",
+        "file": "lib/tea_client/delivery.ml",
+        # `unacked` feeds flush_outbox, the ONLY replay path. Filter-to-empty
+        # rather than a bare [] so `t` stays used and the mutation cannot die
+        # at compile time (warnings-as-errors would prove typing, not
+        # observation - the M2 lesson).
+        "old": "let unacked (t : 'msg t) : (Msg_seq.t * 'msg) list = List.rev t.queue",
+        "new": "let unacked (t : 'msg t) : (Msg_seq.t * 'msg) list = List.filter (fun ((_ : Msg_seq.t), (_ : 'msg)) -> false) t.queue",
+        # B1: the dropped edit is never replayed, the observer stays 0.
+        # B3: no second apply ever crosses the wire.
+        # B4: nothing is replayed after the restart, so no post-restart Ack.
+        # B2 and the step-8 scenarios never break a socket, so they stay green.
+        "expect_red": [
+            "replays the edit onto the store exactly once",
+            "a second apply crosses the wire",
+            "a post-restart Ack arrives",
+        ],
+    },
+    {
+        "id": "mut-tab-collapse",
+        "why": "the guard key is (replica, tab): collapsed to the replica alone, tab B's first edit reads as tab A's replay",
+        "file": "lib/tea_server/replay_guard.ml",
+        # A comparator that calls every tab equal collapses the per-replica tab
+        # map to one entry, which is exactly the two-tabs bug D15's key closes.
+        # Only B2 has two tabs SENDING on one session; every other scenario has
+        # a single acting tab, so only B2 may redden.
+        "old": "module Tab_map = Map.Make (Tea_core.Prim.Tab_id)",
+        "new": "module Tab_map = Map.Make (struct type t = Tea_core.Prim.Tab_id.t let compare (_ : t) (_ : t) = 0 end)",
+        "expect_red": ["guard key keeps both tabs"],
+    },
+    {
+        "id": "mut-b4-fresh-root",
+        "why": "B4's restart really reopens the SAME root: a fresh one loses the store and the count comes back 1, not 2",
+        "file": "examples/counter/server/main.ml",
+        # Each server life gets a random sibling suffix, so the second life
+        # opens an empty store and an empty journal: the replay re-applies onto
+        # 0 and both tabs read 1 - the lost-store arm of the B4 verdict. This
+        # is the mutation that forced B4's two-click design: with one click,
+        # 0 + a replayed 1 is indistinguishable from the real guarantee.
+        "old": "Pack_server.serve_pack ~port ?client_dir ~root:(Tea_server_pack.Root.v root) ())",
+        "new": 'Pack_server.serve_pack ~port ?client_dir ~root:(Tea_server_pack.Root.v (Random.self_init (); root ^ "-" ^ string_of_int (Random.int 1000000))) ())',
+        "expect_red": ["exactly-once across the restart"],
+    },
+    {
+        "id": "mut-journal-unwired",
+        "why": "B4's floor really comes from the file journal: on the null sink the restart forgets it and the replay double-applies to 3",
+        "file": "lib/tea_server_pack/tea_server_pack.ml",
+        # `ignore` keeps sink/floors used so the mutation compiles (M2's
+        # lesson). The pack tier degrades to step-10 in-memory semantics: life
+        # 1 still de-duplicates, but life 2 reads Fresh for the replayed seq 2
+        # and re-applies it. B1-B3 run the mem tier - serve_pack is never on
+        # their path - so they MUST stay green under this mutation.
+        "old": "~tabs:Replay_guard.default_tabs ~sink ~floors",
+        "new": "~tabs:Replay_guard.default_tabs ~sink:(ignore sink; Guard_sink.null) ~floors:(ignore floors; Durable_guard.Floors.empty)",
+        "expect_red": ["exactly-once across the restart"],
+    },
 ]
 
 

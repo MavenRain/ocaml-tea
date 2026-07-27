@@ -40,6 +40,8 @@ toolchain removes an entire tier lean-tea had to hand-write.
 | `test/predictor_test` - one intent, one replica slot, across both tiers in one process | **passes** (confirmed by mutation) |
 | `Wire.up` + `Tea_client.Delivery` + `Tea_server.Replay_guard` - sequenced up-frames, an unacknowledged queue, and per-(replica, tab) de-duplication above `update` | **built, green** (roadmap step 10, D15) |
 | `test/replay_test`, `test/delivery_test`, `test/exactly_once_test` - the guard, the queue, and both tiers with the socket killed mid-flight | **passes** (confirmed by mutation) |
+| `Tea_server.Guard_sink` + `Durable_guard` + `Tea_server_pack.Guard_file` - durable floor mirror behind the in-memory guard, CRC-framed append-only journal on the pack tier | **built, green** (roadmap step 11, D16) |
+| `test/guard_sink_test`, `test/durable_guard_test`, `test/guard_file_test` + extended `exactly_once_test`/`replay_test`/`reaper_test` - codec totality, restart re-seed, torn-tail fold, tombstone-before-removal | **passes** |
 
 Toolchain: OCaml 5.3.0, dune 3.24, a dedicated opam switch (`irmin-tea` locally) with
 `irmin 3.11`, `dream 1.0.0~alpha8`, `repr 0.8`, `vdom 0.3`, `js_of_ocaml 6.4`.
@@ -462,16 +464,22 @@ nothing is lost.
 >   is attempted exactly once instead of killing the session on every reconnect.
 >
 > **The guarantee, stated exactly: exactly-once effect within one server process
-> lifetime and within the guard's bounds; at-least-once outside them.** The
-> bounds are honest, and every one of them degrades toward *duplicating*, never
-> toward losing, because the guard never invents a high water it did not observe:
-> an absent entry accepts anything. A server restart re-applies whatever is
+> lifetime and within the guard's bounds; at-least-once outside them.** (Step
+> 10's statement, and still the whole story on the mem tier; step 11, D16 below,
+> extends the lifetime bound across *orderly* restarts and names the one case
+> that stays out of scope.) The
+> bounds are honest, and every one of them degrades toward *duplicating* rather
+> than losing, because the guard never invents a high water it did not observe:
+> an absent entry accepts anything. A server restart on the mem tier re-applies
+> whatever is
 > replayed (in memory, deliberately not announced on the wire: on learning an
 > epoch changed, a client's only sound action is still to replay, so the frame
 > would change no behaviour). Eviction at the bounds does the same. The one path
-> to the *loss* side is a stale entry outliving its branch, which is why
+> to the *loss* side within the guard's own state is a stale entry outliving its
+> branch, which is why
 > `Replay_guard.forget` exists and why its precondition is written on it: any
-> future reaper loop must call it for every collected session.
+> future reaper loop must call it for every collected session. (The durable
+> layer adds a second loss path, stated in D16.)
 >
 > **Left open, deliberately:** the client's unacknowledged queue is unbounded,
 > exactly as the outbox was - and that is what lets the server refuse a gap
@@ -487,6 +495,69 @@ nothing is lost.
 > client dot; de-duplication suppresses the second server apply, so it mints no
 > new server dot. `test/predictor_test`'s pin stands, and `exactly_once_test`
 > carries a sibling pin so a future fix reddens both rather than one.
+
+> **D16 - the high water made durable. Landed in step 11.** Step 10's guarantee
+> stopped at the process boundary: the high water lived in memory, so a restart
+> forgot it, and a client replaying an unacknowledged msg across that restart
+> was applied a second time. Step 11 puts a durable floor behind the guard
+> without moving the verdict off its synchronous path:
+>
+> - **`Tea_server.Guard_sink`** is the seam: an `Advance`/`Forget` event, a
+>   `null` sink (the mem tier, step-10 semantics byte for byte), a `memory`
+>   sink (the test seam for simulated restarts), and a pure, total,
+>   CRC-32-framed codec, so a torn tail or a flipped byte is a classified
+>   verdict rather than an exception.
+> - **`Tea_server.Durable_guard`** is two layers: the bounded in-memory
+>   `Replay_guard.Cell` in front, a durable `Floors` mirror behind. A Cell miss
+>   is seeded from the mirror *before* the verdict, `take` stays synchronous
+>   (consume-before-apply is still structural), and `persist` is the only
+>   asynchronous write.
+> - **`Tea_server_pack.Guard_file`** is the pack tier's journal: append-only at
+>   `<root>.guard/journal`, fold-until-broken on read, per-record flush, fsync
+>   only on close, a cap with drop-oldest, compaction at 4x cap.
+> - The pump persists **after the apply attempt and before the ack**, on both
+>   the success and the fuel-exhausted arms, because the water means "taken",
+>   not "applied" (a no-op msg mints no commit, so the record cannot ride the
+>   store).
+> - `reap ?forget` writes the tombstone **before** the branch removal, so a
+>   crash between the two steps lands on the duplicate side.
+>
+> **The guarantee, restated in three cases** (the step-10 sentence no longer
+> covers it):
+>
+> - **Exactly-once effect across an orderly restart** (a SIGINT/SIGTERM
+>   teardown, which closes the store and then the journal), within the guard's
+>   bounds.
+> - **At-least-once on a torn journal tail, a cap eviction, or a failed
+>   append:** each of those loses only a floor, an absent floor accepts
+>   anything, and the cost is a visible, convergent double count.
+> - **`kill -9` is out of scope, and it sits on the loss side.** The design
+>   rests on one inequality: a floor must not be more durable than the commit
+>   whose effect it records. Orderly teardown preserves it by closing the store
+>   before the journal. Mid-life, a hard kill violates it: the journal flushes
+>   each record to the page cache, so it survives process death, while
+>   irmin-pack buffers commits in user space. A floor can then survive a crash
+>   its commit did not; the replay reads `Duplicate` against an effect that is
+>   gone, and the unacknowledged in-flight tail is silently lost, bounded by
+>   the pack's auto-flush lag.
+>
+> **Residuals, stated rather than hidden:**
+>
+> - `Durable_guard`'s in-process `Floors` mirror is **unbounded**. The
+>   asymmetry is exact: the `Cell` in front of it is bounded precisely because
+>   an attacker mints session cookies freely, and `Guard_file`'s cap bounds the
+>   journal's copy of the floors, but the mirror between them has neither
+>   defense, so a hostile cookie-minting client grows it without limit (§10,
+>   R12).
+> - A server that wires `reap` while a durable guard is live **must** pass
+>   `Durable_guard.forget`, or a floor outlives its branch and every replay
+>   onto the recreated branch reads `Duplicate` against a stale high water:
+>   total silent loss onto an empty model. Step 11 closes the ordering half by
+>   construction (tombstone first, removal second); the wiring half stays the
+>   caller's obligation, exactly as `Replay_guard.forget`'s precondition
+>   states.
+> - The two-clocks-behind-one-replica-id note (step 9) and the D14
+>   pre-announcement window are unchanged by this step.
 
 ## 8. Shared RPC contract - built (roadmap step 7; hardened step 8, D11/D12)
 
@@ -706,6 +777,24 @@ Each lean-tea private-constructor primitive → an OCaml `.mli` boundary:
   number, so a rewrite that drains the stream before deciding (the pre-D11
   behaviour, which keeps every status code correct) fails a check - but note
   that check covers (i) not at all.
+- **R11 (med) - a hard kill can silently lose the unacknowledged in-flight
+  tail.** Roadmap step 11 (D16, §7) makes the replay-guard floor durable, and
+  the design rests on one inequality: a floor must not be more durable than
+  the commit whose effect it records. An orderly SIGINT/SIGTERM teardown
+  preserves it (store closed before journal); `kill -9` violates it, because
+  the journal reaches the page cache per record while irmin-pack buffers
+  commits in user space. A surviving floor over a dead commit makes the replay
+  read `Duplicate` against an effect that is gone. Deliberately **out of
+  scope**, stated on `Tea_server_pack.Guard_file` rather than fixed; the loss
+  is bounded by the pack's auto-flush lag. Every other durable-layer failure
+  (torn tail, cap eviction, failed append) falls on the duplicate side.
+- **R12 (low) - `Durable_guard`'s in-process floor mirror is unbounded.** The
+  `Replay_guard.Cell` in front of it is bounded precisely because an attacker
+  mints session cookies freely, and `Guard_file`'s cap bounds the journal's
+  copy of the floors; the mirror between them has neither defense, so a
+  hostile cookie-minting client grows it without limit. Known gap, recorded in
+  D16's residuals (§7); a bound here needs the same eviction-direction
+  argument the Cell already carries.
 
 ## 11. Roadmap
 
@@ -823,3 +912,39 @@ Each lean-tea private-constructor primitive → an OCaml `.mli` boundary:
     losing (§7). The client's unacknowledged queue stays unbounded, which is
     what makes refusing a gap free. The RPC tier is not covered. The D14
     pre-announcement window is unchanged, and now pinned in two files.
+    The process-lifetime bound itself is what step 11 (D16) narrows.
+
+11. **D16 - the high water made durable.** **Done.** Step 10's guarantee
+    stopped at the process boundary; this step carries the floor across it
+    without moving the verdict off its synchronous path. `Tea_server.Guard_sink`
+    is the seam (an `Advance`/`Forget` event, `null` and `memory` sinks, a
+    pure total CRC-32-framed codec); `Tea_server.Durable_guard` layers the
+    bounded `Replay_guard.Cell` over a durable `Floors` mirror, seeding a Cell
+    miss from the mirror before the verdict, with `take` still synchronous and
+    `persist` the only asynchronous write; `Tea_server_pack.Guard_file` is the
+    pack tier's append-only journal at `<root>.guard/journal`
+    (fold-until-broken read, per-record flush, fsync only on close, cap with
+    drop-oldest,
+    compaction at 4x cap). The pump persists after the apply attempt and
+    before the ack on both the success and the fuel-exhausted arms, because
+    the water means "taken", not "applied"; `reap ?forget` writes the
+    tombstone before the branch removal. `guard_sink_test`,
+    `durable_guard_test`, `guard_file_test`, plus extended
+    `exactly_once_test`/`replay_test`/`reaper_test`.
+
+    The guarantee is now three cases, not a sentence: exactly-once effect
+    across an *orderly* restart (SIGINT/SIGTERM teardown, store closed before
+    journal); at-least-once - a visible, convergent double count - on a torn
+    journal tail, a cap eviction, or a failed append, since each loses only a
+    floor and an absent floor accepts anything; and `kill -9` explicitly out
+    of scope on the *loss* side, because the journal reaches the page cache
+    per record while irmin-pack buffers commits in user space, so a floor can
+    outlive its commit and the unacknowledged in-flight tail is silently
+    lost, bounded by the pack's auto-flush lag (§7 D16, R11).
+
+    Left open, deliberately: the in-process `Floors` mirror is unbounded
+    where the Cell and the journal are both capped (R12); wiring `reap` past
+    a live durable guard without `Durable_guard.forget` is still the loss
+    path `Replay_guard.forget`'s precondition names; the step-9
+    two-clocks-behind-one-replica-id note and the D14 pre-announcement window
+    are untouched.

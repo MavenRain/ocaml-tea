@@ -21,6 +21,8 @@
     own name module is what callers see: [server_test] and [exactly_once_test]
     build an isolated guard to hand [live_session]. *)
 module Replay_guard = Replay_guard
+module Guard_sink = Guard_sink
+module Durable_guard = Durable_guard
 
 (** The backend-generic handler bodies (roadmap step 8, D2): every current
     handler, router, step, and WS pump, functorized over any
@@ -160,10 +162,14 @@ struct
      socket, because a socket dying is precisely the case de-duplication exists
      to handle. A guard minted per [live_session] would forget everything at the
      moment its knowledge becomes load-bearing. [?guard] is for tests, which
-     drive [live_session] directly and want an isolated table. *)
-  let guard : Replay_guard.Cell.cell =
-    Replay_guard.Cell.v ~sessions:Replay_guard.default_sessions
-      ~tabs:Replay_guard.default_tabs
+     drive [live_session] directly and want an isolated table, and for the pack
+     tier, which supplies one backed by a file journal (roadmap step 11, D16).
+     This default — a null sink over empty floors — is step 10's in-memory
+     behaviour byte for byte. *)
+  let guard : Durable_guard.t =
+    Durable_guard.v ~sessions:Replay_guard.default_sessions
+      ~tabs:Replay_guard.default_tabs ~sink:Guard_sink.null
+      ~floors:Durable_guard.Floors.empty
 
   let live_session ?(coalesce = Tea_core.Coalesce_spec.Keep_all) ?(guard = guard)
       (s : St.session) (t : live_transport) : unit Lwt.t =
@@ -197,13 +203,16 @@ struct
     in
     (* Validate the client-chosen header, then consume. [None] is a header this
        session could not read at all — a length or alphabet violation, or a
-       non-positive sequence number — which our own client cannot produce. *)
-    let admit ~(tab : string) ~(seq : int) : Replay_guard.verdict option =
+       non-positive sequence number — which our own client cannot produce. The
+       validated tab id rides out with the verdict because the [Fresh] arm
+       persists under it (D16). *)
+    let admit ~(tab : string) ~(seq : int) :
+        (Tea_core.Prim.Tab_id.t * Replay_guard.verdict) option =
       Result.fold (Tea_core.Prim.Tab_id.of_string tab)
         ~error:(fun (_ : Tea_core.Prim.Tab_id.err) -> None)
         ~ok:(fun tab ->
           Option.map
-            (fun seq -> Replay_guard.Cell.take guard ~replica ~tab ~seq)
+            (fun seq -> (tab, Durable_guard.take guard ~replica ~tab ~seq))
             (Tea_core.Prim.Msg_seq.of_int seq))
     in
     let rec pump () =
@@ -218,7 +227,28 @@ struct
                An unreadable delivery header ends the session, exactly as an
                undecodable frame does — it is the same protocol break. *)
             Option.fold ~none:Lwt.return_unit
-              ~some:(fun (v : Replay_guard.verdict) ->
+              ~some:(fun
+                  ((tab, v) : Tea_core.Prim.Tab_id.t * Replay_guard.verdict) ->
+                (* Record "taken" durably (D16). The write happens after the
+                   apply attempt and before the acknowledgement, so a crash
+                   between the two replays as a visible duplicate, never a
+                   loss. A failed append degrades the same direction: one
+                   audible line, then carry on under step-10 in-memory
+                   semantics — never end the session over durability. *)
+                let persist_taken (n : Tea_core.Prim.Msg_seq.t) : unit Lwt.t =
+                  let* persisted = Durable_guard.persist guard ~replica ~tab ~seq:n in
+                  Result.fold persisted ~ok:Lwt.return
+                    ~error:(fun (e : Guard_sink.err) ->
+                      let reason =
+                        match e with
+                        | Guard_sink.Sink_closed -> "sink closed"
+                        | Guard_sink.Io io -> io
+                      in
+                      Printf.eprintf
+                        "tea_server: guard persist failed (%s); continuing at-least-once\n%!"
+                        reason;
+                      Lwt.return_unit)
+                in
                 match v with
                 (* Consume-before-apply is structural, not a convention:
                    [Cell.take] is synchronous and there is no Lwt yield point
@@ -232,9 +262,14 @@ struct
                   let* stepped = step_ws s msg in
                   Result.fold stepped
                     ~ok:(fun (_ : step_outcome) ->
+                      let* () = persist_taken n in
                       ack n;
                       pump ())
-                    ~error:(fun (Loop.Fuel_exhausted : Loop.err) -> Lwt.return_unit)
+                    (* Fuel exhaustion still ends the session, but the taken
+                       record is persisted first: the high water means
+                       "attempted", so a fuel-poison msg is attempted once per
+                       guard lifetime — now once ever, not once per restart. *)
+                    ~error:(fun (Loop.Fuel_exhausted : Loop.err) -> persist_taken n)
                 | Replay_guard.Duplicate n ->
                   (* Acknowledge without applying. An unacknowledged duplicate
                      is a replay loop that never terminates. *)
@@ -258,22 +293,23 @@ struct
      [Origin_gate.check] mints, so a socket accepted without the same-origin
      check cannot be expressed here. *)
   let accept_ws (_ : Tea_safe.Origin_gate.same_origin Tea_safe.Proof.t)
-      ~(coalesce : A.msg Tea_core.Coalesce_spec.t) (repo : St.t)
-      (request : Dream.request) : Dream.response Lwt.t =
+      ~(coalesce : A.msg Tea_core.Coalesce_spec.t) ~(guard : Durable_guard.t)
+      (repo : St.t) (request : Dream.request) : Dream.response Lwt.t =
     with_session repo request (fun s ->
         Dream.websocket (fun ws ->
-            live_session ~coalesce s
+            live_session ~coalesce ~guard s
               { send_frame = Dream.send ws
               ; receive_frame = (fun () -> Dream.receive ws)
               }))
 
-  let handle_ws ~(coalesce : A.msg Tea_core.Coalesce_spec.t) (repo : St.t)
-      (request : Dream.request) : Dream.response Lwt.t =
+  let handle_ws ~(coalesce : A.msg Tea_core.Coalesce_spec.t)
+      ~(guard : Durable_guard.t) (repo : St.t) (request : Dream.request) :
+      Dream.response Lwt.t =
     Tea_safe.Origin_gate.check
       ~origin:(Dream.header request "Origin")
       ~host:(Dream.header request "Host")
     |> Result.fold
-         ~ok:(fun proof -> accept_ws proof ~coalesce repo request)
+         ~ok:(fun proof -> accept_ws proof ~coalesce ~guard repo request)
          ~error:(fun (d : Tea_safe.Origin_gate.denial) ->
            match d with
            | Origin_missing | Host_missing | Both_missing | Origin_mismatch ->
@@ -381,7 +417,8 @@ struct
      one origin — which is precisely what {!same_origin} and the shared Dream
      session cookie require. *)
   let router ?(client_dir : string option) ?(rpc : Dream.route list = [])
-      ?(coalesce = Tea_core.Coalesce_spec.Keep_all) (repo : St.t) : Dream.handler =
+      ?(coalesce = Tea_core.Coalesce_spec.Keep_all) ?(guard = guard)
+      (repo : St.t) : Dream.handler =
     let client_routes =
       Option.fold client_dir ~none:[]
         ~some:(fun dir ->
@@ -393,7 +430,7 @@ struct
       ([ Dream.get "/" (handle_root repo)
        ; Dream.post msg_path (handle_msg repo)
        ; Dream.post undo_path (handle_undo repo)
-       ; Dream.get ws_path (handle_ws ~coalesce repo)
+       ; Dream.get ws_path (handle_ws ~coalesce ~guard repo)
        ]
       @ rpc @ client_routes)
 
@@ -410,8 +447,9 @@ struct
   (** The full request pipeline: session middleware over the security-headers
       middleware over the router. Exposed so tests can drive it with
       [Dream.test] against an in-memory repo. *)
-  let handler ?client_dir ?rpc ?coalesce (repo : St.t) : Dream.handler =
-    Dream.memory_sessions (secure_headers (router ?client_dir ?rpc ?coalesce repo))
+  let handler ?client_dir ?rpc ?coalesce ?guard (repo : St.t) : Dream.handler =
+    Dream.memory_sessions
+      (secure_headers (router ?client_dir ?rpc ?coalesce ?guard repo))
 
   (** Blocking entry point for a native server binary. [?coalesce] is the
       app's commit-coalescing policy for live (WS) sessions; the default

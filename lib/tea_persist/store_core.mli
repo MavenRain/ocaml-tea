@@ -138,11 +138,27 @@ module type CORE = sig
   val checkpoints_head : t -> checkpoint option Lwt.t
   (** The current head of the durable checkpoint spine, if any. *)
 
-  val reap : t -> ttl:Tea_core.Prim.Ttl.t -> now:int64 -> int Lwt.t
+  val reap :
+    ?forget:(Tea_core.Prim.Session_id.t -> unit Lwt.t) ->
+    t ->
+    ttl:Tea_core.Prim.Ttl.t ->
+    now:int64 ->
+    int Lwt.t
   (** Sweep expired session branches: remove every non-reserved branch whose
       head [Info] date (a {!Clock} stamp) is older than [now - ttl]; [main],
       the [__checkpoints] spine and every [redo-] pointer are never swept.
-      Returns the number removed (D3). *)
+      Returns the number removed (D3).
+
+      [?forget] is called with each victim's session id {i before} its branch
+      is removed (default: nothing — today's behaviour exactly). {b Hard
+      precondition when a durable replay guard is live} (roadmap step 11,
+      D16): a server wiring [reap] in {b must} pass
+      [Tea_server.Durable_guard.forget] here, because a guard floor that
+      outlives its branch converts every replay onto the recreated branch
+      into a [Duplicate] against a stale high water — total silent loss onto
+      an empty model, the one loss-side path in the guard's degradation
+      (stated on [Tea_server.Replay_guard.forget], closed here by ordering:
+      tombstone first, then removal). *)
 
   (** Commit coalescing (R1): fold a run of chatty Msgs into one commit by
       amending the head — same parents, new tree, relabelled — while the

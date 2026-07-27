@@ -94,7 +94,12 @@ module type CORE = sig
 
   val retain : t -> retention:Retention.t -> checkpoint -> checkpoint Lwt.t
   val checkpoints_head : t -> checkpoint option Lwt.t
-  val reap : t -> ttl:Tea_core.Prim.Ttl.t -> now:int64 -> int Lwt.t
+  val reap :
+    ?forget:(Tea_core.Prim.Session_id.t -> unit Lwt.t) ->
+    t ->
+    ttl:Tea_core.Prim.Ttl.t ->
+    now:int64 ->
+    int Lwt.t
 
   module Coalescer : sig
     type t
@@ -471,7 +476,8 @@ struct
       removed. Bounded by the branch count and single-pass; the only [Lwt.catch]
       fences the per-branch head lookup, which can raise once pack GC has
       dropped a branch's head commit. *)
-  let reap (t : t) ~(ttl : Tea_core.Prim.Ttl.t) ~(now : int64) : int Lwt.t =
+  let reap ?(forget = fun (_ : Tea_core.Prim.Session_id.t) -> Lwt.return_unit)
+      (t : t) ~(ttl : Tea_core.Prim.Ttl.t) ~(now : int64) : int Lwt.t =
     let cutoff = Int64.sub now (Int64.of_float (Tea_core.Prim.Ttl.to_seconds ttl)) in
     let* names = S.Branch.list t.repo in
     Lwt_list.fold_left_s
@@ -483,7 +489,18 @@ struct
           in
           Option.fold head ~none:(Lwt.return reaped) ~some:(fun c ->
               if Int64.compare (S.Info.date (S.Commit.info c)) cutoff < 0 then
-                let* () = S.Branch.remove t.repo name in
+                (* Tombstone before removal (D16): a durable guard floor must
+                   die no later than its branch, else a replay onto the
+                   recreated branch reads Duplicate against a stale high
+                   water — the silent-loss path. A non-session branch name
+                   simply has no floor to tombstone. *)
+                let forget_victim () : unit Lwt.t =
+                  Tea_core.Prim.Session_id.of_string name
+                  |> Option.fold ~none:Lwt.return_unit ~some:forget
+                in
+                let remove_branch () : unit Lwt.t = S.Branch.remove t.repo name in
+                let* () = forget_victim () in
+                let* () = remove_branch () in
                 Lwt.return (reaped + 1)
               else Lwt.return reaped))
       0 names

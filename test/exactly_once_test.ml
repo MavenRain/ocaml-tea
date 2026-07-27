@@ -24,6 +24,14 @@ module Codec = Tea_core.Codec.Make (Counter_app.App)
 module Delivery = Tea_client.Delivery
 module Rebase = Tea_client.Rebase
 module Guard = Tea_server.Replay_guard
+module Dguard = Tea_server.Durable_guard
+
+(* An isolated mem-tier guard: null sink over empty floors, step-10 semantics
+   exactly. Sections that simulate a restart build theirs over a memory sink
+   instead. *)
+let mem_guard () : Dguard.t =
+  Dguard.v ~sessions:Guard.default_sessions ~tabs:Guard.default_tabs
+    ~sink:Tea_server.Guard_sink.null ~floors:Dguard.Floors.empty
 module Msg_seq = Tea_core.Prim.Msg_seq
 module App = Counter_app.App
 
@@ -128,7 +136,7 @@ let () =
      let* repo = Server.Store.create () in
      (* --- 1. The happy path: an accepted frame is acknowledged by seq ------ *)
      let* s = Server.Store.session repo (sid "happy") in
-     let guard = Guard.Cell.v ~sessions:Guard.default_sessions ~tabs:Guard.default_tabs in
+     let guard = mem_guard () in
      let l1 = link () in
      let session1 = Server.live_session ~guard s l1.transport in
      let d = Delivery.v ~tab:(tab_of 11) in
@@ -175,7 +183,7 @@ let () =
         Before D15 this message was in no queue at all: nothing replayed it, and
         the next Hello resync discarded the prediction. A silent lost edit. *)
      let* s2 = Server.Store.session repo (sid "lostedit") in
-     let guard2 = Guard.Cell.v ~sessions:Guard.default_sessions ~tabs:Guard.default_tabs in
+     let guard2 = mem_guard () in
      let dead = link () in
      let session_dead = Server.live_session ~guard:guard2 s2 dead.transport in
      let d = Delivery.v ~tab:(tab_of 13) in
@@ -218,7 +226,7 @@ let () =
         their own messages from 1. A guard keyed on the session alone drops the
         second tab's first edit forever. *)
      let* s3 = Server.Store.session repo (sid "twotabs") in
-     let guard3 = Guard.Cell.v ~sessions:Guard.default_sessions ~tabs:Guard.default_tabs in
+     let guard3 = mem_guard () in
      let l3 = link () in
      let session3 = Server.live_session ~guard:guard3 s3 l3.transport in
      let ta = Delivery.v ~tab:(tab_of 21) and tb = Delivery.v ~tab:(tab_of 42) in
@@ -247,4 +255,127 @@ let () =
         that closes it should redden this and [predictor_test] together. *)
      check "PIN: delivery retry neither widens nor narrows the D14 window"
        (App.value twice = 1);
+     (* --- 7. Across a process restart (roadmap step 11, D16) -------------- *)
+     (* Step 10's guard lived only in memory, so this exact script double
+        counted: the restarted process met a replay with an empty table and
+        called it Fresh. Here the take is recorded through a sink, and the next
+        life folds that record into its floors before answering its first
+        frame. The store branch is the SAME one across both lives, which is
+        what makes the second apply observable at all. *)
+     let* s4 = Server.Store.session repo (sid "restart") in
+     let sink, recorded = Tea_server.Guard_sink.memory () in
+     let guard_a =
+       Dguard.v ~sessions:Guard.default_sessions ~tabs:Guard.default_tabs ~sink
+         ~floors:Dguard.Floors.empty
+     in
+     let l4 = link () in
+     let session4 = Server.live_session ~guard:guard_a s4 l4.transport in
+     let d4 = Delivery.v ~tab:(tab_of 51) in
+     let d4, e4 = record d4 App.Increment in
+     l4.push (Some (frame_of d4 e4));
+     let* landed4 = await (fun () -> List.mem 1 (heads l4)) in
+     check "the pre-restart edit lands" landed4;
+     let* before_restart = Server.Store.load s4 in
+     check "the counter reads 1 before the restart" (App.value before_restart = 1);
+     (* The process dies. Every in-memory high water dies with it; only what the
+        sink accepted comes back. The client never absorbed the ack, so the edit
+        is still in its unacked queue - the honest at-least-once posture. *)
+     l4.push None;
+     let* (_ : unit) = session4 in
+     check "the take was recorded durably, once, for the consumed seq"
+       (List.length (recorded ()) = 1);
+     check "the client still holds the edit it was never told about"
+       (Delivery.pending d4 = 1);
+     let* history_pre = Server.Store.history s4 in
+     (* The new process: an EMPTY cell, floors folded from the record alone. *)
+     let guard_b =
+       Dguard.v ~sessions:Guard.default_sessions ~tabs:Guard.default_tabs ~sink
+         ~floors:(Dguard.Floors.of_events (recorded ()))
+     in
+     let l5 = link () in
+     let session5 = Server.live_session ~guard:guard_b s4 l5.transport in
+     List.iter (fun entry -> l5.push (Some (frame_of d4 entry))) (Delivery.unacked d4);
+     let* re_acked5 = await (fun () -> acks l5 <> []) in
+     check "the restarted server acks the replay, so the client stops retrying"
+       re_acked5;
+     let* after_restart = Server.Store.load s4 in
+     let* history_post = Server.Store.history s4 in
+     check
+       "EXACTLY-ONCE ACROSS THE RESTART: the replayed edit commits nothing the \
+        second time"
+       (App.value after_restart = 1
+       && List.length history_post = List.length history_pre);
+     l5.push None;
+     let* (_ : unit) = session5 in
+     (* --- 8. The converse, so section 7 cannot pass vacuously ------------- *)
+     (* Identical script with the journal thrown away (empty floors, null sink -
+        step 10 exactly). If this did NOT double count, section 7 would be
+        proving something about the app or the transport rather than about the
+        durable floor. Increment is not idempotent; that is the whole lever. *)
+     let* s5 = Server.Store.session repo (sid "norestore") in
+     let guard_c =
+       Dguard.v ~sessions:Guard.default_sessions ~tabs:Guard.default_tabs
+         ~sink:Tea_server.Guard_sink.null ~floors:Dguard.Floors.empty
+     in
+     let l6 = link () in
+     let session6 = Server.live_session ~guard:guard_c s5 l6.transport in
+     let d6 = Delivery.v ~tab:(tab_of 52) in
+     let d6, e6 = record d6 App.Increment in
+     l6.push (Some (frame_of d6 e6));
+     let* landed6 = await (fun () -> List.mem 1 (heads l6)) in
+     check "the pre-restart edit lands on the undurable server too" landed6;
+     l6.push None;
+     let* (_ : unit) = session6 in
+     let guard_d =
+       Dguard.v ~sessions:Guard.default_sessions ~tabs:Guard.default_tabs
+         ~sink:Tea_server.Guard_sink.null ~floors:Dguard.Floors.empty
+     in
+     let l7 = link () in
+     let session7 = Server.live_session ~guard:guard_d s5 l7.transport in
+     List.iter (fun entry -> l7.push (Some (frame_of d6 entry))) (Delivery.unacked d6);
+     let* doubled = await (fun () -> List.mem 2 (heads l7)) in
+     check
+       "ANTI-VACUITY: with no durable floor the same replay IS applied twice \
+        (counter reads 2)"
+       doubled;
+     let* undurable = Server.Store.load s5 in
+     check "the undurable counter really is at 2" (App.value undurable = 2);
+     l7.push None;
+     let* (_ : unit) = session7 in
+     (* --- 9. A failing sink costs neither the edit nor the ack ------------ *)
+     (* Durability is the thing that degrades, never the session: a sink that
+        refuses every record must still leave a working step-10 server. The
+        pump prints one line and carries on, and the client is acked, because
+        an unacked client retries forever. *)
+     let failing : Tea_server.Guard_sink.t =
+       { Tea_server.Guard_sink.append =
+           (fun (_ : Tea_server.Guard_sink.event) ->
+             Lwt.return (Error (Tea_server.Guard_sink.Io "disk full")))
+       }
+     in
+     let* s6 = Server.Store.session repo (sid "sinkdown") in
+     let guard_e =
+       Dguard.v ~sessions:Guard.default_sessions ~tabs:Guard.default_tabs
+         ~sink:failing ~floors:Dguard.Floors.empty
+     in
+     let l8 = link () in
+     let session8 = Server.live_session ~guard:guard_e s6 l8.transport in
+     let d8 = Delivery.v ~tab:(tab_of 53) in
+     let d8, e8 = record d8 App.Increment in
+     l8.push (Some (frame_of d8 e8));
+     let* acked_despite = await (fun () -> acks l8 <> []) in
+     check "a refusing sink still acks: durability degrades, the session does not"
+       acked_despite;
+     let* despite = Server.Store.load s6 in
+     check "and the edit itself is applied exactly once" (App.value despite = 1);
+     (* The mirror was raised before the append was attempted, so this process
+        still refuses the replay - the failure costs the NEXT life's knowledge,
+        not this one's. *)
+     List.iter (fun entry -> l8.push (Some (frame_of d8 entry))) (Delivery.unacked d8);
+     let* re_acked8 = await (fun () -> List.length (acks l8) >= 2) in
+     let* still_one = Server.Store.load s6 in
+     check "a failed append does not re-open the seq within the same process"
+       (re_acked8 && App.value still_one = 1);
+     l8.push None;
+     let* (_ : unit) = session8 in
      Lwt.return_unit)

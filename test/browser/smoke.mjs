@@ -34,17 +34,27 @@
  * that pin STALE - which is exactly how the fix came back through here, where
  * the D14 line is now an ordinary `transition` on the acting tab. No pins are
  * outstanding today; the primitive stays for the next one.
+ *
+ * Step 11 (D16) added the delivery scenarios: B1-B3 drive the step-10 replay
+ * guard on the mem tier through `page.routeWebSocket` (a dropped up-frame, a
+ * two-tab seq collision, a dropped Ack), and B4 restarts the pack-backed
+ * server binary over one TEA_ROOT to assert exactly-once ACROSS A PROCESS -
+ * the one claim every in-process test is structurally blind to.
  */
 
 import { chromium } from 'playwright'
 import { spawn } from 'node:child_process'
 import { existsSync } from 'node:fs'
-import { dirname, resolve } from 'node:path'
+import { mkdtemp, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const REPO = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..')
 const PORT_COUNTER = Number(process.env.SMOKE_PORT_COUNTER ?? 8137)
 const PORT_SHARED_DOC = Number(process.env.SMOKE_PORT_SHARED_DOC ?? 8138)
+const PORT_REPLAY = Number(process.env.SMOKE_PORT_REPLAY ?? 8139)
+const PORT_DURABLE = Number(process.env.SMOKE_PORT_DURABLE ?? 8140)
 const HEADED = process.env.SMOKE_HEADED === '1'
 const WAIT_MS = Number(process.env.SMOKE_TIMEOUT_MS ?? 15000)
 
@@ -92,13 +102,25 @@ const pin = (label, read, want, opts = {}) => transition(label, read, want, { ..
 
 /* Spawn a real compiled example server on one origin, so the static bundle,
    the WebSocket and the /rpc routes share a scheme/host/port - which is what
-   the same-origin gate and the shared Dream session cookie both require. */
-async function withServer({ name, exe, clientDir, port }, body) {
+   the same-origin gate and the shared Dream session cookie both require.
+
+   Split into spawnServer/stop (roadmap step 11, D16) because the durable
+   scenario needs what no `withServer` body can express: stop the server with
+   a CHOSEN signal (SIGTERM for the graceful path whose teardown closes the
+   pack store first and the guard journal second; SIGKILL if a scenario ever
+   needs the ungraceful one) and then start a second life on the same
+   TEA_ROOT. Environment hygiene is strict: TEA_ROOT is stripped from the
+   inherited environment and reinstated only through opts.env, so a variable
+   leaked by the calling shell cannot silently turn a mem-tier scenario into a
+   pack-tier one - the mem scenarios run with it genuinely UNSET, not "". */
+async function spawnServer({ name, exe, clientDir, port, env = {} }) {
   const exePath = resolve(REPO, exe)
   if (!existsSync(exePath)) throw new Error(`${name}: ${exe} is missing - run \`dune build\` first`)
+  const ambient = { ...process.env }
+  delete ambient.TEA_ROOT
   const proc = spawn(exePath, [], {
     cwd: REPO,
-    env: { ...process.env, PORT: String(port), CLIENT_DIR: resolve(REPO, clientDir) },
+    env: { ...ambient, PORT: String(port), CLIENT_DIR: resolve(REPO, clientDir), ...env },
     stdio: ['ignore', 'pipe', 'pipe'],
   })
   const log = []
@@ -106,22 +128,41 @@ async function withServer({ name, exe, clientDir, port }, body) {
   proc.stderr.on('data', (d) => log.push(String(d)))
   const base = `http://localhost:${port}`
   const tail = () => log.join('').split('\n').slice(-20).join('\n')
+  const exited = new Promise((r) => proc.on('exit', (code, signal) => r({ code, signal })))
+  const deadline = Date.now() + WAIT_MS
+  const ready = async () => {
+    if (proc.exitCode !== null) throw new Error(`${name} exited with ${proc.exitCode} before serving:\n${tail()}`)
+    const ok = await fetch(base + '/')
+      .then((r) => r.ok)
+      .catch(() => false)
+    if (ok) return
+    if (Date.now() >= deadline) throw new Error(`${name} never answered on ${base} within ${WAIT_MS}ms:\n${tail()}`)
+    await sleep(100)
+    return ready()
+  }
+  await ready()
+  return { name, proc, base, tail, exited }
+}
+
+/* Deliver `signal` and wait for the exit, escalating to SIGKILL at the
+   deadline so a wedged teardown cannot hang the harness. Returns the
+   {code, signal} the process exited with - the durable scenario asserts on
+   it, because exit 0 is the evidence the signal handler ran the documented
+   store-then-journal teardown rather than the process being torn down. */
+async function stop(handle, signal = 'SIGTERM') {
+  if (handle.proc.exitCode === null && handle.proc.signalCode === null) handle.proc.kill(signal)
+  const outcome = await Promise.race([handle.exited, sleep(WAIT_MS).then(() => null)])
+  if (outcome !== null) return outcome
+  handle.proc.kill('SIGKILL')
+  return handle.exited
+}
+
+async function withServer(opts, body) {
+  const srv = await spawnServer(opts)
   try {
-    const deadline = Date.now() + WAIT_MS
-    const ready = async () => {
-      if (proc.exitCode !== null) throw new Error(`${name} exited with ${proc.exitCode} before serving:\n${tail()}`)
-      const ok = await fetch(base + '/')
-        .then((r) => r.ok)
-        .catch(() => false)
-      if (ok) return
-      if (Date.now() >= deadline) throw new Error(`${name} never answered on ${base} within ${WAIT_MS}ms:\n${tail()}`)
-      await sleep(100)
-      return ready()
-    }
-    await ready()
-    return await body({ base })
+    return await body({ base: srv.base })
   } finally {
-    proc.kill('SIGTERM')
+    await stop(srv, 'SIGTERM')
   }
 }
 
@@ -252,6 +293,346 @@ async function sharedDocScenario(browser, base) {
   return [rpcStats, gate, integer, committed, check('shared_doc: no uncaught browser exception', errors.length === 0, errors.join(' | '))]
 }
 
+/* ------------------------------- scenarios 3-6: delivery (steps 10-11, D16) */
+
+/* The counter example again, but driven through `page.routeWebSocket` so the
+   harness can hold individual wire frames in its hand: drop an up-frame, drop
+   an Ack, watch a replay cross. The route survives the page's reconnects (a
+   re-dial matching the pattern lands in the same handler), so a tap's
+   counters span socket lives - which is exactly the span the delivery
+   guarantee is about.
+
+   These scenarios abort at their FIRST failing check (the `step` early
+   return): a mutation's earliest broken check is then the only red line it
+   prints, which is what test/browser/mutate.py names in expect_red. */
+
+/* Repr-JSON puts every wire frame on the socket as a one-key object -
+   {"apply": ...} up, {"hello" | "head" | "ack": ...} down - so the tag is
+   read by parsing, never by substring: a model payload can then never be
+   misread as a frame kind. */
+const frameTag = (message) => {
+  try {
+    const v = JSON.parse(String(message))
+    return v && typeof v === 'object' ? Object.keys(v)[0] : null
+  } catch {
+    return null
+  }
+}
+
+/* One tap = the observables and knobs for one routed page. `applies` counts
+   client->server apply frames as they ARRIVE at the route, dropped ones
+   included (an attempt is an attempt); `acks` counts server->client Acks
+   actually FORWARDED, because a dropped Ack never reached the client and must
+   not count as one. `socket` is the newest client-side route, so a scenario
+   can break the live link and let the reconnect ladder rebuild it. */
+function wsTap() {
+  const tap = { applies: 0, acks: 0, dropUps: 0, dropAcks: false, socket: null }
+  tap.handler = (ws) => {
+    tap.socket = ws
+    const server = ws.connectToServer()
+    ws.onMessage((message) => {
+      if (frameTag(message) === 'apply') {
+        tap.applies += 1
+        if (tap.dropUps > 0) {
+          tap.dropUps -= 1
+          return
+        }
+      }
+      server.send(message)
+    })
+    server.onMessage((message) => {
+      if (frameTag(message) === 'ack') {
+        if (tap.dropAcks) return
+        tap.acks += 1
+      }
+      ws.send(message)
+    })
+  }
+  return tap
+}
+
+const countOn = (page) => page.$eval('.counter .count', (el) => el.textContent)
+const plusOn = (page) => page.locator('.counter button').filter({ hasText: /^\+$/ })
+
+/* Same open discipline as the counter scenario: acting page FIRST (its
+   response installs the session cookie), observer second, and the route must
+   be registered before goto or the first socket escapes it. */
+const openCounter = async (ctx, base, errors, { tap } = {}) => {
+  const page = await ctx.newPage()
+  page.on('pageerror', (e) => errors.push(String(e)))
+  if (tap) await page.routeWebSocket(/\/ws$/, tap.handler)
+  await page.goto(`${base}/app/index.html`)
+  await page.waitForSelector('.counter .count', { timeout: WAIT_MS })
+  return page
+}
+
+/* B1 (D15): an up-frame dropped IN FLIGHT. The click is recorded in the tab's
+   delivery queue and sent; the route swallows the frame, so the server never
+   hears it. Breaking the socket forces the reconnect ladder, and the flush of
+   the unacked queue on reconnect is the only path by which the edit can still
+   land. Exactly-once is read off a pure observer tab, whose count can only
+   move server-side, and the follow-up click is the second probe: had the
+   replay double-applied, its wanted transition would already hold and report
+   VACUOUS. */
+async function dropUpScenario(browser, base) {
+  const ctx = await browser.newContext()
+  const errors = []
+  const tap = wsTap()
+  const out = []
+  const step = (r) => {
+    out.push(r)
+    return r.ok
+  }
+  try {
+    const a = await openCounter(ctx, base, errors, { tap })
+    const o = await openCounter(ctx, base, errors)
+    const preA = await countOn(a)
+    const preO = await countOn(o)
+    if (!step(check('replay B1: acting and observer tabs mount at 0', preA === '0' && preO === '0', `A=${preA} O=${preO}`))) return out
+
+    tap.dropUps = 1
+    if (!step(await transition(
+      "replay B1: the click's up-frame is captured in flight and dropped",
+      () => tap.applies,
+      (n) => n >= 1,
+      { act: () => plusOn(a).click() }
+    ))) return out
+    if (!step(check('replay B1: the dropped edit never reached the store (observer still 0)', (await countOn(o)) === '0'))) return out
+
+    if (!step(await transition(
+      'replay B1: breaking and reopening the socket replays the edit onto the store exactly once (observer 0 -> 1)',
+      () => countOn(o),
+      (v) => v === '1',
+      { act: () => tap.socket.close() }
+    ))) return out
+
+    if (!step(await transition(
+      'replay B1: a follow-up click moves the observer 1 -> 2 (no hidden double apply)',
+      () => countOn(o),
+      (v) => v === '2',
+      { act: () => plusOn(a).click() }
+    ))) return out
+
+    step(check('replay B1: no uncaught browser exception', errors.length === 0, errors.join(' | ')))
+    return out
+  } finally {
+    await ctx.close()
+  }
+}
+
+/* B2 (D15): two tabs, one session cookie, one replica - the (replica, tab)
+   guard key's whole reason to exist. Both tabs number their messages from
+   seq 1; a guard keyed on the replica alone would read the second tab's first
+   edit as the first tab's replay and swallow it. Each landing is asserted on
+   the OTHER tab, so it can only have travelled through the store. */
+async function twoTabScenario(browser, base) {
+  const ctx = await browser.newContext()
+  const errors = []
+  const out = []
+  const step = (r) => {
+    out.push(r)
+    return r.ok
+  }
+  try {
+    const a = await openCounter(ctx, base, errors)
+    const b = await openCounter(ctx, base, errors)
+    const preA = await countOn(a)
+    const preB = await countOn(b)
+    if (!step(check('replay B2: two tabs on one session cookie both mount at 0', preA === '0' && preB === '0', `A=${preA} B=${preB}`))) return out
+    if (!step(await transition(
+      "replay B2: tab A's first edit reaches tab B (0 -> 1)",
+      () => countOn(b),
+      (v) => v === '1',
+      { act: () => plusOn(a).click() }
+    ))) return out
+    if (!step(await transition(
+      "replay B2: tab B's first edit also lands - the (replica, tab) guard key keeps both tabs at seq 1 (A sees 2)",
+      () => countOn(a),
+      (v) => v === '2',
+      { act: () => plusOn(b).click() }
+    ))) return out
+    step(check('replay B2: no uncaught browser exception', errors.length === 0, errors.join(' | ')))
+    return out
+  } finally {
+    await ctx.close()
+  }
+}
+
+/* B3 (D15): the down-Ack is dropped, so the server has consumed seq 1 while
+   the client still holds it as unacked. The client's replay - the flush a
+   later server frame prompts, and again the flush the forced reconnect
+   prompts - re-sends a message the server has already applied; the guard must
+   answer Duplicate, acknowledge, and leave the count alone. The replay itself
+   is asserted on the wire (a second apply crossing the route), because
+   "nothing double counted" without "the replay actually happened" would be
+   vacuous. */
+async function dropAckScenario(browser, base) {
+  const ctx = await browser.newContext()
+  const errors = []
+  const tap = wsTap()
+  const out = []
+  const step = (r) => {
+    out.push(r)
+    return r.ok
+  }
+  try {
+    const a = await openCounter(ctx, base, errors, { tap })
+    const o = await openCounter(ctx, base, errors)
+    const preA = await countOn(a)
+    const preO = await countOn(o)
+    if (!step(check('replay B3: acting and observer tabs mount at 0', preA === '0' && preO === '0', `A=${preA} O=${preO}`))) return out
+
+    tap.dropAcks = true
+    const appliesBefore = tap.applies
+    if (!step(await transition(
+      'replay B3: the click lands while its Ack is dropped (observer 0 -> 1)',
+      () => countOn(o),
+      (v) => v === '1',
+      { pre: preO, act: () => plusOn(a).click() }
+    ))) return out
+
+    /* Dropping stops in the act, so the replay's Ack can finally drain the
+       queue; the break forces a reconnect flush even if no server frame has
+       prompted one yet. */
+    if (!step(await transition(
+      'replay B3: the client replays the already-consumed message (a second apply crosses the wire)',
+      () => tap.applies,
+      (n) => n >= appliesBefore + 2,
+      {
+        pre: appliesBefore,
+        act: () => {
+          tap.dropAcks = false
+          return tap.socket.close()
+        },
+      }
+    ))) return out
+
+    if (!step(await transition(
+      'replay B3: the replay is not double-applied - a follow-up click moves the observer 1 -> 2',
+      () => countOn(o),
+      (v) => v === '2',
+      { act: () => plusOn(a).click() }
+    ))) return out
+
+    step(check('replay B3: no uncaught browser exception', errors.length === 0, errors.join(' | ')))
+    return out
+  } finally {
+    await ctx.close()
+  }
+}
+
+/* B4, THE HEADLINE (step 11, D16): exactly-once across a real process
+   restart, which nothing in-process can prove. Life 1 commits click 1
+   (acknowledged, so it leaves the queue) and click 2 (its Ack dropped, so the
+   client still holds it), then dies by SIGTERM - the graceful path whose
+   teardown closes the pack store first and the guard journal second. Life 2
+   opens the same TEA_ROOT; the page's reconnect ladder re-dials, the client
+   replays its unacked seq 2, and the journal-seeded floor must answer
+   Duplicate: both tabs still read 2.
+
+   TWO clicks before the kill, not one, and that is load-bearing: with a
+   single unacked click, "reads 1 after the restart" is satisfied both by the
+   real guarantee and by a server that lost the store and merely re-applied
+   the replay (0 + 1 also reads 1) - the assertion could never distinguish
+   them, and mutate.py's fresh-root mutation could never go red. With 1
+   committed + 1 replayed-and-suppressed, the verdict 2 separates all three
+   worlds: 1 is the lost-store arm, 3 is the lost-floor (double apply) arm.
+
+   This is a positive test, not a pin: the durable sink exists now. */
+async function durableRestartScenario(browser) {
+  const root = await mkdtemp(join(tmpdir(), 'tea-smoke-b4-'))
+  const server = () =>
+    spawnServer({
+      name: 'durable counter server',
+      exe: '_build/default/examples/counter/server/main.exe',
+      clientDir: '_build/default/examples/counter/client',
+      port: PORT_DURABLE,
+      env: { TEA_ROOT: root },
+    })
+  let srv = null
+  let ctx = null
+  const errors = []
+  const tap = wsTap()
+  const out = []
+  const step = (r) => {
+    out.push(r)
+    return r.ok
+  }
+  try {
+    srv = await server()
+    ctx = await browser.newContext()
+    const a = await openCounter(ctx, srv.base, errors, { tap })
+    const o = await openCounter(ctx, srv.base, errors)
+    const preA = await countOn(a)
+    const preO = await countOn(o)
+    if (!step(check('durable B4: pack-backed tabs mount at 0', preA === '0' && preO === '0', `A=${preA} O=${preO}`))) return out
+
+    const acksBefore = tap.acks
+    if (!step(await transition(
+      'durable B4: first click commits and streams to the observer (0 -> 1)',
+      () => countOn(o),
+      (v) => v === '1',
+      { pre: preO, act: () => plusOn(a).click() }
+    ))) return out
+    if (!step(await transition(
+      "durable B4: the first click's Ack reaches the client (only the second click will ride the restart)",
+      () => tap.acks,
+      (n) => n > acksBefore,
+      { pre: acksBefore }
+    ))) return out
+
+    tap.dropAcks = true
+    if (!step(await transition(
+      'durable B4: second click commits while its Ack is dropped (observer 1 -> 2)',
+      () => countOn(o),
+      (v) => v === '2',
+      { act: () => plusOn(a).click() }
+    ))) return out
+
+    tap.dropAcks = false
+    const outcome = await stop(srv, 'SIGTERM')
+    if (!step(check(
+      'durable B4: SIGTERM stops the pack server gracefully (exit 0 runs the store-then-journal teardown)',
+      outcome.code === 0,
+      `exit=${show(outcome)}`
+    ))) return out
+
+    const acksAtRestart = tap.acks
+    srv = await server()
+    if (!step(await transition(
+      'durable B4: after the restart the client replays its unacked message and the server answers (a post-restart Ack arrives)',
+      () => tap.acks,
+      (n) => n > acksAtRestart,
+      { pre: acksAtRestart, timeout: WAIT_MS * 2 }
+    ))) return out
+
+    const postA = await countOn(a)
+    const postO = await countOn(o)
+    if (!step(check(
+      'durable B4: exactly-once across the restart - both tabs read 2 (not 1: lost store; not 3: double apply)',
+      postA === '2' && postO === '2',
+      `A=${postA} O=${postO}`
+    ))) return out
+
+    if (!step(await transition(
+      'durable B4: a follow-up click moves the count 2 -> 3 (the guard admits fresh edits after the restart)',
+      () => countOn(o),
+      (v) => v === '3',
+      { act: () => plusOn(a).click() }
+    ))) return out
+
+    step(check('durable B4: no uncaught browser exception', errors.length === 0, errors.join(' | ')))
+    return out
+  } finally {
+    if (ctx) await ctx.close().catch(() => {})
+    if (srv) await stop(srv, 'SIGTERM').catch(() => {})
+    /* The journal is a SIBLING of the pack root (serve_pack keeps it out of
+       irmin-pack's directory on purpose), so both must go. */
+    await rm(root, { recursive: true, force: true })
+    await rm(root + '.guard', { recursive: true, force: true })
+  }
+}
+
 /* -------------------------------------------------------------------- main */
 
 const main = async () => {
@@ -280,7 +661,27 @@ const main = async () => {
       },
       ({ base }) => guarded('shared_doc', () => sharedDocScenario(browser, base))
     )
-    return [...counter, ...sharedDoc]
+    /* B1-B3 share one mem-tier server: contexts isolate the sessions, so the
+       three scenarios land on three branches and three replica ids. TEA_ROOT
+       is genuinely unset here (spawnServer strips it), so this server is the
+       step-10 in-memory guard byte for byte. */
+    const replay = await withServer(
+      {
+        name: 'replay counter server',
+        exe: '_build/default/examples/counter/server/main.exe',
+        clientDir: '_build/default/examples/counter/client',
+        port: PORT_REPLAY,
+      },
+      async ({ base }) => [
+        ...(await guarded('replay B1', () => dropUpScenario(browser, base))),
+        ...(await guarded('replay B2', () => twoTabScenario(browser, base))),
+        ...(await guarded('replay B3', () => dropAckScenario(browser, base))),
+      ]
+    )
+    /* B4 owns its server lifecycle (it restarts it mid-scenario), so it is
+       not a withServer body. */
+    const durable = await guarded('durable B4', () => durableRestartScenario(browser))
+    return [...counter, ...sharedDoc, ...replay, ...durable]
   } finally {
     await browser.close()
   }
