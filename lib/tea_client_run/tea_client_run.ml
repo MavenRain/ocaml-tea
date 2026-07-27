@@ -131,27 +131,27 @@ struct
            | Subs.Spec_every (ms', f) -> if Int.equal ms ms' then dispatch (f now)
            | Subs.Spec_store (_ : A.model -> A.msg) -> ())
 
-  (* A model frame from the server: the committed head of this session's
-     branch. Every [Store_watch] leaf of the *current* subscriptions turns it
-     into a msg; decode failure is loud (it would mean codec drift, thesis
-     T3's one disallowed state  -  or R5, a Repr/jsoo divergence).
+  (* A down-frame from the server ({!Tea_core.Wire.down}). Every [Store_watch]
+     leaf of the *current* subscriptions turns the resulting head into a msg;
+     decode failure is loud (it would mean codec drift, thesis T3's one
+     disallowed state  -  or R5, a Repr/jsoo divergence).
 
-     D9: the head is REBASED onto the model this tab is holding before the
-     subscription ever sees it ({!Tea_client.Rebase.reconcile} under the app's
-     own [merge] policy). The server's head does not contain the edits still
-     sitting in {!live.outbox}, nor an optimistic edit still in flight, so
-     handing it over raw is a clobber. Under [Crdt_join] the fold is idempotent
-     and commutative, so a local edit replayed onto a newer head converges
-     however the two interleave. Before the app has mounted there is no local
-     model to rebase onto and the head passes through unchanged. *)
+     The whole decision - rebase a [Head] onto the local model (D9), or adopt
+     an identity and resync to a [Hello]'s head (D14) - lives in the pure
+     {!Tea_client.Rebase.absorb}, so it is unit-tested off the browser. What is
+     left here is the two effects that function cannot perform: rebinding the
+     tab's identity and dispatching into the mounted app. *)
   let on_frame (json : string) : unit =
-    Result.fold (Codec.model_of_json json)
-      ~ok:(fun incoming ->
-        let head =
-          Option.fold ~none:incoming
-            ~some:(fun local -> Tea_client.Rebase.reconcile A.merge ~local ~incoming)
-            (shared_model ())
+    Result.fold (Codec.down_of_json json)
+      ~ok:(fun down ->
+        let head, announced =
+          Tea_client.Rebase.absorb A.merge ~local:(shared_model ()) down
         in
+        (* Adopt before dispatching: the store-watch msg this frame becomes is
+           run through [A.update] like any other, and an app whose sync handler
+           mints a dot must mint it under the identity the frame just
+           announced, not the one it superseded. *)
+        Option.iter Tea_client.Identity.adopt announced;
         current_specs ()
         |> List.iter (fun (s : (A.model, A.msg) Subs.spec) ->
                match s with

@@ -10,9 +10,20 @@
     order they were made.
 
     Replay is send-once. A buffered message is by construction one the server
-    never received, so re-sending it cannot double-apply - and even if the
-    classification were wrong, every replicated field is a CRDT (D1), so a
-    re-delivered edit joins idempotently rather than counting twice.
+    never received, so re-sending it cannot double-apply.
+
+    That property is carried by send-once {b alone}. An earlier version of this
+    doc added "and even if the classification were wrong, every replicated
+    field is a CRDT (D1), so a re-delivered edit joins idempotently rather than
+    counting twice" - D14 falsified exactly that sentence. State {i join} is
+    idempotent; applying an {i operation} twice is not, whatever the merge
+    does, because the second [inc] moves the replica's own slot again. Sharing
+    a replica id with the server ({!absorb}) fixes the {i one} case where two
+    applies are one intent (the client's prediction and the server's
+    authoritative apply, which now land in the same slot and are reconciled by
+    [max]); it buys nothing at all against a genuinely duplicated delivery. If
+    a delivery-dedup story is ever wanted, it needs the seq-number acks §7
+    records as [deferred_beyond], not the CRDT layer.
 
     {2 Rebase: the head that arrives on top of them}
 
@@ -67,3 +78,35 @@ end
     silent divergence D9 exists to remove. *)
 val reconcile :
   'model Tea_core.Merge_spec.t -> local:'model -> incoming:'model -> 'model
+
+(** [absorb policy ~local down] is what a live-socket down-frame does to this
+    tab: the model the store-watch subscription should be handed, and the
+    replica id to adopt if the frame announced one (roadmap step 9, D14).
+
+    It is the whole boot-order decision, as one total function the runtime only
+    executes:
+
+    - {!Tea_core.Wire.Hello} - a (re)connect. Adopt the announced replica, and
+      resync to the head it carries {i without} folding [local] in. Nothing is
+      lost by that: an edit the server has not applied is either in the outbox
+      (replayed right after) or in flight, and both come back as heads. What
+      {i is} shed is a prediction made under the old identity, which is the
+      point - after a reconnect this tab may be applying under a replica id it
+      did not have before.
+    - {!Tea_core.Wire.Head} - a commit on the session's branch, reconciled onto
+      the local model exactly as before ({!reconcile}). [local] is [None] only
+      before the app has mounted, where there is nothing to reconcile against.
+
+    Note what this does {i not} do: it cannot erase dots the app already minted
+    under the provisional identity, because the subscription hands the result
+    to the app's own update, which joins. A CRDT state has no general
+    "un-mint" ({!Tea_core.Crdt.Lww} could not implement one - it has no
+    previous value to revert to), so the framework does not pretend to offer
+    one. Edits made before the first [Hello] therefore keep a provisional slot
+    for the life of the page; edits after it - which is every edit on a page
+    that reached its server - are counted exactly once. *)
+val absorb :
+  'model Tea_core.Merge_spec.t ->
+  local:'model option ->
+  'model Tea_core.Wire.down ->
+  'model * Tea_core.Crdt.Replica.t option

@@ -220,24 +220,51 @@ let () =
      in
      let session = Server.live_session s transport in
      let frames () = List.rev !sent in
-     (* (a) The session opens by announcing the current model. *)
+     (* Down-frames are the {!Tea_core.Wire.down} sum since D14, so every
+        assertion below says which {i kind} of frame it wants: a [Head] check
+        that a [Hello] would satisfy is a check that cannot see the
+        announcement go missing. *)
+     let decoded f : Counter_app.App.model Tea_core.Wire.down option =
+       Codec.down_of_json f
+       |> Result.fold
+            ~error:(fun (_ : Tea_core.Codec.err) -> None)
+            ~ok:(fun d -> Some d)
+     in
+     let head_value f : int option =
+       Option.bind (decoded f) (fun d ->
+           match d with
+           | Tea_core.Wire.Head m -> Some (Counter_app.App.value m)
+           | Tea_core.Wire.Hello
+               ((_ : Tea_core.Crdt.Replica.t), (_ : Counter_app.App.model)) ->
+             None)
+     in
+     let announced_replica f : Tea_core.Crdt.Replica.t option =
+       Option.bind (decoded f) (fun d ->
+           match d with
+           | Tea_core.Wire.Hello (r, (_ : Counter_app.App.model)) -> Some r
+           | Tea_core.Wire.Head (_ : Counter_app.App.model) -> None)
+     in
+     (* (a) The session opens by announcing the replica id it applies under
+        (D14) together with the current head. The expectation is built from the
+        session's own context, so an announcement that named some other replica
+        - a second derivation of the branch name, say - fails here. *)
      let* announced = await (fun () -> !sent <> []) in
-     check "live_session announces the current model first"
-       (announced && frames () = [ Codec.model_to_json (fst Counter_app.App.init) ]);
+     check "live_session announces this session's replica and head first"
+       (announced
+       && frames ()
+          = [ Codec.down_to_json
+                (Tea_core.Wire.Hello
+                   ( Tea_core.Crdt.Ctx.replica (Server.Store.ctx_of_session s)
+                   , fst Counter_app.App.init )) ]);
      (* (b) A Msg frame up is stepped, committed, and echoed down via the
-        store watch as a full model frame. *)
+        store watch as a [Head] frame - not a second announcement. *)
      push (Some (Codec.msg_to_json Counter_app.App.Increment));
      let* stepped =
-       await (fun () ->
-           List.exists
-             (fun f ->
-               Codec.model_of_json f
-               |> Result.fold
-                    ~error:(fun (_ : Tea_core.Codec.err) -> false)
-                    ~ok:(fun (m : Counter_app.App.model) -> Counter_app.App.value m = 1))
-             (frames ()))
+       await (fun () -> List.exists (fun f -> head_value f = Some 1) (frames ()))
      in
-     check "a Msg frame up yields the committed model frame down" stepped;
+     check "a Msg frame up yields the committed model as a Head frame down" stepped;
+     check "the replica is announced once per session, not once per commit"
+       (List.length (List.filter_map announced_replica (frames ())) = 1);
      (* (c) Peer close ends the session. *)
      push None;
      let* closed = closes_within session in
@@ -264,6 +291,25 @@ let () =
      let* after2 = Server.Store.load s2 in
      check "a garbage frame commits nothing"
        (hist2 = [] && Counter_app.App.value after2 = 0);
+     (* (e) A frame that is valid JSON but names a Msg constructor the app does
+        not have. [Repr.of_json_string] answers that one by RAISING, so before
+        {!Tea_core.Codec.of_json} was made total this crafted frame killed the
+        pump with an exception instead of closing the socket - reachable by
+        anyone who can open the ws. *)
+     let sid3 = Option.get (Tea_core.Prim.Session_id.of_string "craftedcase") in
+     let* s3 = Server.Store.session repo sid3 in
+     let incoming3, push3 = Lwt_stream.create () in
+     let transport3 =
+       { Server.send_frame = (fun (_ : string) -> Lwt.return_unit)
+       ; receive_frame = (fun () -> Lwt_stream.get incoming3)
+       }
+     in
+     push3 (Some {|{"Bogus":1}|});
+     let* closed3 = closes_within (Server.live_session s3 transport3) in
+     check "a frame naming an unknown Msg case ends the session (no exception)"
+       closed3;
+     let* hist3 = Server.Store.history s3 in
+     check "the crafted frame commits nothing" (hist3 = []);
      Printf.printf "\nThe live-view pump serves roadmap step 3, no socket needed.\n%!";
      Lwt.return_unit)
 

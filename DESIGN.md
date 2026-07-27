@@ -35,7 +35,9 @@ toolchain removes an entire tier lean-tea had to hand-write.
 | `lib/tea_client/reconnect` + `rebase` + `local_channel` - pure link state machine, outbox/rebase, client-local channel | **built, green** (roadmap step 8, D8/D9/D10-client) |
 | `lib/tea_core/local` - the `LOCAL` companion contract + the empty companion | **built, green** (roadmap step 8, D10) |
 | `test/client_reconnect_test`, `test/client_channel_test` - step-8 P6 suite | **passes** (confirmed by mutation) |
-| `test/browser/smoke.mjs` - Playwright end-to-end smoke over the real compiled server binaries | **passes, 8 ok / 1 xfail** (confirmed by mutation; roadmap step 8, D13) |
+| `test/browser/smoke.mjs` - Playwright end-to-end smoke over the real compiled server binaries | **passes, 9 ok / 0 xfail** (confirmed by mutation; roadmap step 8, D13 - its D14 pin went stale when step 9 fixed the bug, and is now an ordinary assertion) |
+| `Wire.down` + `Tea_client.Identity` - the server announces its session replica, the tab mints under it | **built, green** (roadmap step 9, D14) |
+| `test/predictor_test` - one intent, one replica slot, across both tiers in one process | **passes** (confirmed by mutation) |
 
 Toolchain: OCaml 5.3.0, dune 3.24, a dedicated opam switch (`irmin-tea` locally) with
 `irmin 3.11`, `dream 1.0.0~alpha8`, `repr 0.8`, `vdom 0.3`, `js_of_ocaml 6.4`.
@@ -324,8 +326,8 @@ nothing is lost.
   because a browser test is the easiest kind to write vacuously; each check is
   confirmed by `test/browser/mutate.py`.
 
-> **D14 - the acting tab double-counts its own PN-counter dot. Found by D13 on
-> its first run; open.** A locally-born msg is applied twice under two
+> **D14 - the acting tab double-counted its own PN-counter dot. Found by D13
+> on its first run; FIXED in step 9 (fix 1 below).** A locally-born msg was applied twice under two
 > *different* CRDT replica ids: once optimistically on the client, whose `ctx`
 > mints under the constant id `"client"` (`tea_client.ml`), and once on the
 > server, which applies the very same forwarded msg under the session-branch
@@ -360,6 +362,51 @@ nothing is lost.
 >    close: an in-flight edit flickers away until its own echo returns.
 > 3. **Don't apply forwarded msgs optimistically.** Correct, and it throws away
 >    the optimistic UI.
+>
+> **Shipped (step 9): fix 1.** `Wire.down` makes the down-channel a two-case
+> sum - `Hello (replica, head)` once per socket, `Head model` for every commit
+> after it - derived through the same `Repr` witness as everything else, so the
+> announcement cannot drift from the pushes. `live_session` takes the replica
+> from the session's *own* `ctx_of_session`, not a second derivation of the
+> branch name, so an announcement can never disagree with what the server
+> applies under. `Tea_client.Identity` holds the tab's replica in one
+> page-global cell that `Rebase.absorb` rebinds on every `Hello`, reconnects
+> included. One intent is now one replica slot, and `join` reconciles the
+> client's prediction with the server's apply by per-slot `max` instead of
+> summing them. Confirmed end-to-end: the D13 acting-tab pin went stale and now
+> asserts A settles at 1, same as the observer tab.
+>
+> **The boot-order decision** (the cost fix 1 was priced at): a tab that acts
+> *before* its `Hello` arrives has no id to predict into, so it mints under a
+> provisional replica and that one edit keeps a slot of its own. `absorb`
+> deliberately resyncs to the `Hello`'s head rather than folding the local
+> model in, which sheds the stale prediction - but it cannot *un-mint* the dot,
+> because the head is delivered through the app's own store-watch handler,
+> which joins. No CRDT here can offer an un-mint at all: `Lww` has no previous
+> value to revert to. So the window is narrowed to "edits made between mount
+> and the first frame" and pinned, in `test/predictor_test`, as behaviour that
+> is recorded and not blessed. The socket opens at mount, so on a page that
+> reaches its server the window is one round trip; a page that never reaches
+> one keeps the provisional id forever, which is sound precisely because it
+> also never forwards a msg for a server to apply a second time.
+>
+> **Known bound, newly load-bearing:** client and server now mint dots under
+> one replica id from *two* clocks, so `Dot` uniqueness is no longer carried by
+> construction. It holds on magnitudes: the client's wall source is `0`
+> (deliberately, R6 - it must lose every LWW tie to the server), so its stamps
+> are small counts while the server's are wall-seconds. A collision needs ~2^31
+> edits in one page life. Documented on `Crdt.Dot`; if the client ever gets a
+> real clock, this needs a per-tier tag in the dot instead.
+>
+> **Found while fixing it:** `Codec.of_json` was not total. `Repr.of_json_string`
+> answers a malformed document with `Error` but *raises*
+> `Invalid_argument "index out of bounds"` when a well-formed object names a
+> variant case the witness does not have - so `{"Bogus":1}` on the live socket
+> killed the pump instead of closing it, and the same frame through the form
+> post answered 500 where it meant 400. Reachable by anyone who can open the
+> socket, on a surface every caller reads as total because it returns a result.
+> Now caught at the one seam, with checks on both the frame witness and the msg
+> witness.
 
 ## 8. Shared RPC contract - built (roadmap step 7; hardened step 8, D11/D12)
 
@@ -640,7 +687,29 @@ Each lean-tea private-constructor primitive → an OCaml `.mli` boundary:
    P7 closes the oldest residual in this file, and it paid for itself on the
    first run by finding **D14** (§7): the acting tab double-counts its own
    PN-counter dot, because the client and the server apply one msg under two
-   different replica ids. Every in-process test passes, because no in-process
-   test can see both applications at once. That is the next phase, and the
-   smoke test pins the current behaviour as an `xfail` so the fix cannot land
-   without coming back through it.
+   different replica ids. Every in-process test passed, because no in-process
+   test ran both applications at once. The smoke test pinned that behaviour as
+   an `xfail` so the fix could not land without coming back through it.
+
+9. **D14 - the client as a predictor, not a replica.** **Done.** The server
+   announces the replica id it applies a session under (`Wire.Hello`, the
+   down-channel's new first frame), the tab adopts it (`Tea_client.Identity`),
+   and `Rebase.absorb` - one total function - decides what every down-frame
+   does: adopt-and-resync for a `Hello`, rebase for a `Head`. One user intent
+   is one replica slot on both tiers, so `join` reconciles by `max` instead of
+   summing. `test/predictor_test` is the test the previous eight steps could
+   not have written: it runs the client's optimistic apply *and* a real
+   `Store` session's apply of the same intent, then folds the pushed head back
+   through the app's own subscription handler - the composition only a browser
+   could reach before. The D13 pin went stale, as designed, and is now an
+   ordinary assertion: the acting tab settles at 1. Six mutations, six reds.
+   Fixed in passing, because the phase's own wire check tripped over it:
+   `Codec.of_json` raised instead of returning `Error` on a crafted variant
+   case (§7).
+
+   Left open, deliberately: the pre-announcement window (an edit made before
+   the first frame keeps a provisional slot - it needs an un-mint the CRDTs
+   cannot offer, and it is pinned rather than hidden); delivery dedup, which
+   still rests on send-once and would need the seq-number acks §7 records as
+   deferred; and `Dot` uniqueness across the two tiers, which is now a
+   magnitude argument rather than a construction (§7).

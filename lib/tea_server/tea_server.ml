@@ -135,8 +135,9 @@ struct
     ; receive_frame : unit -> string option Lwt.t
     }
 
-  (** One live session: register the store watch, announce the current model,
-      then pump incoming Msg frames through {!step} until the peer closes or
+  (** One live session: register the store watch, announce this session's
+      replica id and current model ({!Tea_core.Wire.Hello}, D14), then pump
+      incoming Msg frames through {!step} until the peer closes or
       breaks protocol (an undecodable frame or an exhausted loop ends the
       session — the socket close is the error signal). Every down-frame,
       including the reply to an accepted Msg, travels commit → watch → the
@@ -146,7 +147,10 @@ struct
       Transient reordering right after connect is possible (the initial
       announcement races frames for commits landing during registration); the
       stream converges on the newest head because later commits always fire
-      later watch callbacks. *)
+      later watch callbacks. That race is why the watch is registered {i
+      before} the [Hello] is pushed and not after: a [Head] arriving ahead of
+      the [Hello] costs a client one stale-identity fold that the [Hello] then
+      resyncs, whereas registering later would drop the commit entirely. *)
   let live_session ?(coalesce = Tea_core.Coalesce_spec.Keep_all) (s : St.session)
       (t : live_transport) : unit Lwt.t =
     (* One coalescer per socket (R1): a chatty client folds its own run of
@@ -157,11 +161,20 @@ struct
     let frames, push = Lwt_stream.create () in
     let* w =
       St.watch s (fun m ->
-          push (Some (Codec.model_to_json m));
+          push (Some (Codec.down_to_json (Tea_core.Wire.Head m)));
           Lwt.return_unit)
     in
     let* model0 = St.load s in
-    push (Some (Codec.model_to_json model0));
+    (* The opening frame announces the replica id this session applies under
+       (D14), so the client's optimistic edits predict the same slot instead of
+       minting a second one. It is the session's own context that is asked -
+       not a second derivation of the branch name - so an announcement can
+       never disagree with what [step_with] actually applies under. *)
+    push
+      (Some
+         (Codec.down_to_json
+            (Tea_core.Wire.Hello
+               (Tea_core.Crdt.Ctx.replica (St.ctx_of_session s), model0))));
     let rec pump () =
       let* frame = t.receive_frame () in
       match frame with

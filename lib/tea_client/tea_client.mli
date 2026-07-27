@@ -19,6 +19,47 @@ module Reconnect = Reconnect
 module Rebase = Rebase
 module Local_channel = Local_channel
 
+(** {2 This tab's CRDT identity}
+
+    Which replica the tab's optimistic edits are minted under (roadmap step 8,
+    D1; rebound by the server in step 9, D14).
+
+    The client is not a peer replica of the server - it is a {i predictor} of
+    one. Minting under an id of its own made every locally-born edit apply
+    twice under two different ids, and a [Pn_counter] join sums across replica
+    slots, so the acting tab double-counted its own increment (D14). The server
+    now announces the replica id it applies this session under
+    ({!Tea_core.Wire.Hello}), the tab adopts it, and the two applies of one
+    intent land in one slot where [join] is a [max].
+
+    Page-global mutable state, deliberately: a browser page is one tab is one
+    session is one identity, and threading it through [Vdom.app]'s update would
+    put a wire concern in every app's model. It is settled once per socket, by
+    the runtime, before the frame that carries it is dispatched. *)
+
+module Identity : sig
+  val provisional : Tea_core.Crdt.Replica.t
+  (** The id used before any announcement arrives - and for a page that never
+      opens a live socket at all, which is sound precisely because such a page
+      never forwards a msg for the server to apply a second time. Edits made in
+      that window keep a slot of their own; see {!Rebase.absorb}. *)
+
+  val replica : unit -> Tea_core.Crdt.Replica.t
+  val is_provisional : unit -> bool
+
+  val adopt : Tea_core.Crdt.Replica.t -> unit
+  (** Rebind the identity. Called by [Tea_client_run] on every [Hello],
+      including a reconnect's: a session whose branch changed underneath the
+      tab announces a different id, and the tab must follow it rather than keep
+      predicting into a slot nobody is authoritative for. *)
+
+  val ctx : unit -> Tea_core.Crdt.Ctx.t
+  (** The context handed to [A.update] for a locally-born msg: the current
+      replica over the page's one monotonic clock. The clock survives an
+      {!adopt} - resetting it could let two dots minted either side of the
+      announcement collide once the ids agree. *)
+end
+
 (** {2 Client command extensions}
 
     [Vdom.Cmd.t] is an open (extensible) type whose built-in constructors

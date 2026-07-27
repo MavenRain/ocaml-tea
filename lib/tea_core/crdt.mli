@@ -27,7 +27,17 @@ end
 (** A causally-unique event stamp: a monotonic {!Clock} stamp paired with the
     minting {!Replica}. Two updates never share a [Dot] — a replica's clock is
     strictly monotone, and distinct replicas differ in the replica component —
-    so the lexicographic [(stamp, replica)] order is total. *)
+    so the lexicographic [(stamp, replica)] order is total.
+
+    {b One caveat, load-bearing since D14.} A live client mints under the
+    replica its server session announced, so that id now has {i two} clocks
+    behind it: the server's (real wall-seconds) and the tab's (wall source [0],
+    deliberately, so a client write loses every LWW tie to the server — R6).
+    Uniqueness across the pair is therefore a magnitude argument, not a
+    construction: the tab's stamps are small counts and the server's are
+    wall-seconds, so a collision needs on the order of 2^31 edits in one page
+    life. If the client is ever given a real clock, the dot needs a tier tag
+    rather than this reasoning. *)
 module Dot : sig
   type t = private
     { stamp : int64

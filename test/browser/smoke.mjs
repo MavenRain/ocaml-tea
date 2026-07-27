@@ -27,7 +27,13 @@
  * `pin` is the third class: a characterization pin on a KNOWN BUG. It passes
  * (printed `xfail`) while the bug is present and FAILS once the behaviour
  * changes, so a fix cannot land without this file being revisited. A pin never
- * blesses the behaviour it records - see the D14 pin in the counter scenario.
+ * blesses the behaviour it records.
+ *
+ * It has already paid for itself once: this file's first run pinned D14 (the
+ * acting tab double-counting its own PN-counter dot), and step 9's fix turned
+ * that pin STALE - which is exactly how the fix came back through here, where
+ * the D14 line is now an ordinary `transition` on the acting tab. No pins are
+ * outstanding today; the primitive stays for the next one.
  */
 
 import { chromium } from 'playwright'
@@ -161,19 +167,21 @@ async function counterScenario(browser, base) {
     { pre: preB, act: () => plus.click() }
   )
 
-  /* KNOWN BUG (D14), found by this harness on its first run. The acting tab
-     ends up at 2, not 1: the client mints its optimistic PN-counter dot under
-     the constant replica id "client" (tea_client.ml `ctx`), while the server
-     applies the very same forwarded Msg under the session-branch replica id.
-     Two distinct replicas, one user intent, and `Rebase.reconcile` joins them
-     - so a PN-counter increment is counted twice on the tab that made it.
-     Characterized precisely: displayed = server truth + this tab's own local
-     dots, so the acting tab reads exactly 2x an observer tab, and a reload
-     (which discards the local dots) snaps it back to the truth. */
-  const d14 = await pin(
-    'counter: KNOWN BUG D14 - the acting tab double-counts its own dot (A settles at 2x B)',
+  /* D14, found by this harness on its first run and FIXED in step 9. The
+     acting tab used to settle at 2: it minted its optimistic PN-counter dot
+     under the constant replica id "client" while the server applied the very
+     same forwarded Msg under the session-branch id, so one user intent
+     occupied two replica slots and the join summed them. The server now
+     announces its replica id on the socket (Wire.Hello) and the tab mints
+     under it, making the two applies one slot that `join` reconciles by max.
+
+     This is the assertion the whole phase exists to move, and it is checked on
+     the ACTING tab - the one every in-process test was blind to, because no
+     in-process test ran both applications of one intent. */
+  const d14 = await transition(
+    'counter: D14 - the acting tab counts its own click ONCE (A settles at 1, same as B)',
     () => countOf(a),
-    (v) => v === '2',
+    (v) => v === '1',
     { pre: preA }
   )
 

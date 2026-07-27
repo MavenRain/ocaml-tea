@@ -91,20 +91,37 @@ module Subs = struct
     , List.filter (fun k -> not (List.exists (equal_key k) wanted)) active )
 end
 
-(* The client tab's single CRDT context (roadmap step 8, D1): one replica id
-   for every locally-born edit, minting dots from a local monotonic clock. The
-   wall source is [0] here (this half links natively and has no browser clock);
-   server stamps are real wall-seconds and therefore dominate, so a pushed
-   [Sync] head is authoritative on any LWW field (R6).
+(* The client tab's single CRDT identity (roadmap step 8, D1; rebound by the
+   server's announcement in step 9, D14): one replica id for every locally-born
+   edit, minting dots from a local monotonic clock. The wall source is [0] here
+   (this half links natively and has no browser clock); server stamps are real
+   wall-seconds and therefore dominate, so a pushed [Sync] head is
+   authoritative on any LWW field (R6).
 
    Hoisted out of {!Make} in D10 so {!Make_local} shares the identity rather
    than minting a second replica for the same tab: two contexts would make a
    tab's own local and shared halves look like distinct replicas to the CRDT
    layer. One tab, one replica, whatever it is mounted with. *)
-let ctx =
-  let clock = Tea_core.Clock.create ~now:(fun () -> 0L) in
-  let replica = Tea_core.Crdt.Replica.v (Tea_core.Prim.Session_id.v "client") in
-  Tea_core.Crdt.Ctx.v ~clock ~replica
+module Identity = struct
+  (* One clock for the life of the page, whatever the replica is: rebinding the
+     identity must not reset the stamp counter, or two dots minted either side
+     of the announcement could collide once the ids agree. *)
+  let clock = Tea_core.Clock.create ~now:(fun () -> 0L)
+
+  let provisional = Tea_core.Crdt.Replica.v (Tea_core.Prim.Session_id.v "client")
+  let cell = ref provisional
+  let replica () : Tea_core.Crdt.Replica.t = !cell
+  let adopt (r : Tea_core.Crdt.Replica.t) : unit = cell := r
+
+  let is_provisional () : bool =
+    Tea_core.Crdt.Replica.equal !cell provisional
+
+  (* Built per update rather than once, so an adoption is picked up by the very
+     next step without the {!Tea_core.Crdt.Ctx} record itself becoming mutable
+     state that the server tier would inherit. *)
+  let ctx () : Tea_core.Crdt.Ctx.t =
+    Tea_core.Crdt.Ctx.v ~clock ~replica:!cell
+end
 
 module Make (A : Tea_core.App.APP) = struct
   let app =
@@ -112,7 +129,7 @@ module Make (A : Tea_core.App.APP) = struct
     Vdom.app
       ~init:(model, cmd_to_vdom cmd)
       ~update:(fun model msg ->
-        let model', cmd = A.update ctx msg model in
+        let model', cmd = A.update (Identity.ctx ()) msg model in
         (model', cmd_to_vdom cmd))
       ~view:(fun model -> html_to_vdom (A.view model))
       ()
@@ -134,7 +151,7 @@ struct
      this msg up the socket?" decision. {!app} below drops it; the mounting
      runtime calls this instead. *)
   let step (msg : A.msg) (state : state) : state * A.msg Vdom.Cmd.t * Local_channel.channel =
-    let s = P.update ctx msg state in
+    let s = P.update (Identity.ctx ()) msg state in
     (s.P.state, cmd_to_vdom s.P.cmd, s.P.channel)
 
   let app =

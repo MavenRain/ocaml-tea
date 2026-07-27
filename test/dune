@@ -3,7 +3,7 @@
    clock_test dedup_test coalesce_test pack_test rpc_test pack_serve_test
    reaper_test retention_test archive_gc_test crdt_test exploded_test
    pack_crdt_test rpc_stream_test csrf_test client_reconnect_test
-   client_channel_test)
+   client_channel_test predictor_test)
  (libraries
   repr
   tea_core

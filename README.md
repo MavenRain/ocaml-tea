@@ -81,9 +81,13 @@ python3 test/browser/mutate.py     # confirm each check by mutation
 
 It opens two tabs on one session and asserts a click in one reaches the other
 purely over the live-view WebSocket, then round-trips a typed RPC through the
-compiled jsoo XHR path and a browser-issued same-origin mutating POST. One
-check is an `xfail` pinning a known bug (D14 in `DESIGN.md`, found by this
-test): the acting tab double-counts its own PN-counter dot.
+compiled jsoo XHR path and a browser-issued same-origin mutating POST.
+
+It has already earned its keep: its first run found D14 (`DESIGN.md` §7), where
+the acting tab double-counted its own PN-counter dot because the client and the
+server applied one msg under two different replica ids. It held that as an
+`xfail` pin until step 9 shared the replica id between the tiers, at which point
+the pin went stale and became the ordinary assertion it is today.
 
 If you're setting up from scratch on a new machine, create a switch (e.g. `opam switch create ocaml-tea 5.3.0`); it needs the system
 libraries `pkgconf`, `libev`, `libffi` (`brew install pkgconf libev libffi`),
