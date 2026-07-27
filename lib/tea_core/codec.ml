@@ -33,15 +33,31 @@ module Make (A : App.APP) = struct
      cannot drift from the [Head] pushes, nor from what the client decodes. *)
   let down_t : A.model Wire.down Repr.t =
     Repr.(
-      variant "down" (fun hello head -> function
+      variant "down" (fun hello head ack -> function
         | Wire.Hello (r, m) -> hello (r, m)
-        | Wire.Head m -> head m)
+        | Wire.Head m -> head m
+        | Wire.Ack n -> ack n)
       |~ case1 "hello" (pair Crdt.Replica.t A.model_t) (fun (r, m) -> Wire.Hello (r, m))
       |~ case1 "head" A.model_t (fun m -> Wire.Head m)
+      |~ case1 "ack" Prim.Msg_seq.t (fun n -> Wire.Ack n)
       |> sealv)
 
   let down_to_json (d : A.model Wire.down) : string = to_json down_t d
   let down_of_json (s : string) : (A.model Wire.down, err) result = of_json down_t s
+
+  (* The up-frame witness is derived from [A.msg_t] exactly as [down_t] is
+     derived from [A.model_t]: a new up-verb becomes a compile error in the
+     destructor below rather than silent drift between the tiers. *)
+  let up_t : A.msg Wire.up Repr.t =
+    Repr.(
+      variant "up" (fun apply -> function
+        | Wire.Apply { tab; seq; msg } -> apply (tab, seq, msg))
+      |~ case1 "apply" (triple string int A.msg_t) (fun (tab, seq, msg) ->
+             Wire.Apply { tab; seq; msg })
+      |> sealv)
+
+  let up_to_json (u : A.msg Wire.up) : string = to_json up_t u
+  let up_of_json (s : string) : (A.msg Wire.up, err) result = of_json up_t s
 
   (** A human-readable label for a message; used as the Irmin commit message so
       the commit log doubles as an event log. *)

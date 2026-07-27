@@ -1,29 +1,25 @@
 (** Surviving a disconnection without losing or clobbering edits (roadmap step
     8, D9). Two halves of one story, and neither is enough alone.
 
-    {2 Outbox: the edits made while the link was down}
+    {2 Outbox: replaced, in step 10}
 
-    Before D9 a locally-born message met a socket that was not [Open] and was
-    logged as "applied locally only": it changed the tab's model, the server
-    never saw it, and the next pushed head quietly reverted it. {!Outbox} holds
-    those messages until {!Reconnect} reaches [Up] and replays them in the
-    order they were made.
+    D9's [Outbox] held the messages born while the link was down and replayed
+    them on reconnect. Its membership rule — "born while the link was down" —
+    left a hole it could not see: a message handed to a socket that then died
+    was in no outbox at all, so nothing replayed it. That hole is closed by
+    {!Tea_client.Delivery}, which holds every shared message until the server
+    acknowledges it, and this module no longer owns a queue.
 
-    Replay is send-once. A buffered message is by construction one the server
-    never received, so re-sending it cannot double-apply.
-
-    That property is carried by send-once {b alone}. An earlier version of this
-    doc added "and even if the classification were wrong, every replicated
-    field is a CRDT (D1), so a re-delivered edit joins idempotently rather than
-    counting twice" - D14 falsified exactly that sentence. State {i join} is
-    idempotent; applying an {i operation} twice is not, whatever the merge
-    does, because the second [inc] moves the replica's own slot again. Sharing
-    a replica id with the server ({!absorb}) fixes the {i one} case where two
-    applies are one intent (the client's prediction and the server's
-    authoritative apply, which now land in the same slot and are reconciled by
-    [max]); it buys nothing at all against a genuinely duplicated delivery. If
-    a delivery-dedup story is ever wanted, it needs the seq-number acks §7
-    records as [deferred_beyond], not the CRDT layer.
+    The safety argument moved with it. D9's replay was safe by {i send-once}: a
+    buffered message was by construction one the server never received. A
+    retried message is not, so send-once is gone as an argument, and what makes
+    a retry safe now is the server's own de-duplication above [A.update]
+    ([Tea_server.Replay_guard]). The sentence D14 falsified — that a
+    re-delivered edit "joins idempotently rather than counting twice" — stays
+    false: state {i join} is idempotent, applying an {i operation} twice is
+    not, whatever the merge does. Sharing a replica id ({!absorb}) fixed the
+    {i one} case where two applies are one intent; it buys nothing against a
+    genuinely duplicated delivery, and never claimed to.
 
     {2 Rebase: the head that arrives on top of them}
 
@@ -36,28 +32,6 @@
     Under [Crdt_join] this is exactly right and needs no ancestor: the join is
     idempotent, commutative and associative, so replaying a local edit onto a
     newer head converges however the two interleave. *)
-
-module Outbox : sig
-  (** Messages awaiting a live socket, newest first. [private] so the internal
-      order can never be mistaken for send order - {!drain} is the only way
-      out, and it is the only thing that knows to reverse. *)
-  type 'msg t = private 'msg list
-
-  val empty : 'msg t
-
-  (** Prepend: O(1) per buffered message, which matters because this runs on
-      every keystroke of an offline editing session. *)
-  val buffer : 'msg -> 'msg t -> 'msg t
-
-  (** [drain o] is the buffered messages in the order they were made (FIFO),
-      paired with the emptied outbox. Returning the new outbox rather than
-      mutating in place keeps the apply-once discipline checkable: a caller
-      that forgets to store it has an outbox that still looks full. *)
-  val drain : 'msg t -> 'msg list * 'msg t
-
-  val pending : 'msg t -> int
-  val is_empty : 'msg t -> bool
-end
 
 (** [reconcile policy ~local ~incoming] folds a pushed store head into the
     model this tab is holding, under the app's own merge policy:
@@ -78,6 +52,22 @@ end
     silent divergence D9 exists to remove. *)
 val reconcile :
   'model Tea_core.Merge_spec.t -> local:'model -> incoming:'model -> 'model
+
+(** What a down-frame turns into. A {b sum}, not a record: an [Ack] carries no
+    model at all, and a shape that handed one back would have the runtime
+    dispatch a spurious store-watch message into the app on every
+    acknowledgement — for a [Crdt_join] app a join with itself, for an app
+    whose sync handler calls [Lww.set] a fresh dot per ack. The mistake is a
+    type error here instead of a review obligation there. *)
+type 'model absorbed =
+  | Resync of Tea_core.Crdt.Replica.t * 'model
+      (** [Hello]: adopt the announced identity and take its head as-is. *)
+  | Rebased of 'model
+      (** [Head]: the app's own {!Tea_core.Merge_spec.t} run first, so what the
+          subscription sees is the head {i joined with} local state. *)
+  | Acked of Tea_core.Prim.Msg_seq.t
+      (** [Ack]: no model changes; the delivery queue drops every message at or
+          below this sequence number (roadmap step 10, D15). *)
 
 (** [absorb policy ~local down] is what a live-socket down-frame does to this
     tab: the model the store-watch subscription should be handed, and the
@@ -109,4 +99,4 @@ val absorb :
   'model Tea_core.Merge_spec.t ->
   local:'model option ->
   'model Tea_core.Wire.down ->
-  'model * Tea_core.Crdt.Replica.t option
+  'model absorbed

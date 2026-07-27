@@ -12,7 +12,7 @@
     equality the implementation used. *)
 
 module Rc = Tea_client.Reconnect
-module Outbox = Tea_client.Rebase.Outbox
+module Delivery = Tea_client.Delivery
 module Merge_spec = Tea_core.Merge_spec
 
 let check name cond =
@@ -189,40 +189,58 @@ let () =
   check "stopping Waiting cancels the armed timer"
     (is_cancel_of t (Rc.waiting ~timer:t ~next:Rc.Backoff.initial))
 
-(* --- D9: the outbox ------------------------------------------------------ *)
+(* --- D9/D15: the queue that replaced the outbox --------------------------- *)
+
+let tab_id = Tea_core.Prim.Tab_id.of_draws (fun () -> 7)
+
+let record_all (msgs : string list) (d : string Delivery.t) : string Delivery.t =
+  List.fold_left
+    (fun acc m ->
+      Delivery.record m acc
+      |> Option.fold ~none:acc ~some:(fun (d', (_ : Tea_core.Prim.Msg_seq.t * string)) -> d'))
+    d msgs
+
+let sent_msgs (d : string Delivery.t) : string list =
+  List.map snd (Delivery.unacked d)
 
 let () =
-  print_endline "\n--- D9: outbox ordering and apply-once ---";
-  let o = Outbox.empty in
-  check "a fresh outbox is empty" (Outbox.is_empty o && Outbox.pending o = 0);
-  let o = Outbox.buffer "a" o in
-  let o = Outbox.buffer "b" o in
-  let o = Outbox.buffer "c" o in
-  check "three buffered edits are pending" (Outbox.pending o = 3);
-  check "a non-empty outbox is not empty" (not (Outbox.is_empty o));
-  let msgs, drained = Outbox.drain o in
-  check "drain replays in the order the edits were made (FIFO, not stack)"
-    (msgs = [ "a"; "b"; "c" ]);
-  check "drain empties the outbox: a replayed edit is never sent twice"
-    (Outbox.is_empty drained);
-  let again, (_ : string Outbox.t) = Outbox.drain drained in
-  check "draining twice yields nothing the second time" (again = []);
-  (* Partial flush: the link dies after "a" goes out. The survivors must keep
-     their relative order, which is what [Tea_client_run.flush_outbox] relies
-     on when [send_or_buffer] re-buffers the tail. *)
-  let sent = ref [] in
-  let leftover =
-    List.fold_left
-      (fun acc m ->
-        if List.length !sent < 1 then (
-          sent := m :: !sent;
-          acc)
-        else Outbox.buffer m acc)
-      Outbox.empty msgs
+  print_endline "\n--- D9/D15: delivery ordering and at-least-once ---";
+  let d = Delivery.v ~tab:tab_id in
+  check "a fresh delivery queue is empty" (Delivery.is_empty d && Delivery.pending d = 0);
+  let d = record_all [ "a"; "b"; "c" ] d in
+  check "three recorded edits are pending" (Delivery.pending d = 3);
+  check "a non-empty queue is not empty" (not (Delivery.is_empty d));
+  check "unacked replays in the order the edits were made (FIFO, not stack)"
+    (sent_msgs d = [ "a"; "b"; "c" ]);
+  (* The D15 inversion of D9's rule: reading the replay set does NOT empty it.
+     An entry leaves only when the server acknowledges its seq, which is what
+     makes an edit handed to a dying socket survivable. *)
+  check "reading the replay set does not empty it: at-least-once, not send-once"
+    (sent_msgs d = [ "a"; "b"; "c" ] && Delivery.pending d = 3);
+  let seq_of n =
+    Tea_core.Prim.Msg_seq.of_int n
+    |> Option.fold
+         ~none:(fun () ->
+           Printf.printf "FAIL - test setup: Msg_seq.of_int refused %d\n%!" n;
+           exit 1)
+         ~some:(fun s () -> s)
+    |> fun f -> f ()
   in
-  let replayed, (_ : string Outbox.t) = Outbox.drain leftover in
-  check "a flush interrupted mid-way re-buffers the tail in order"
-    (!sent = [ "a" ] && replayed = [ "b"; "c" ])
+  let d = Delivery.ack (seq_of 1) d in
+  check "a cumulative ack drops exactly the acknowledged prefix"
+    (sent_msgs d = [ "b"; "c" ]);
+  let d = Delivery.ack (seq_of 3) d in
+  check "acking the newest seq empties the queue" (Delivery.is_empty d);
+  (* The unification D15 bought: an edit that was sent but never acknowledged
+     and an edit born while the link was down are the same kind of entry, in one
+     queue, in the order they were made. Two queues would replay them out of
+     order, which under Last_write_wins flips the winner. *)
+  let d = record_all [ "sent-then-lost" ] d in
+  let d = record_all [ "born-offline" ] d in
+  check "an in-flight edit and an offline-born edit drain in one queue, in order"
+    (sent_msgs d = [ "sent-then-lost"; "born-offline" ]);
+  check "an ack for a seq this tab never sent leaves the queue untouched"
+    (sent_msgs (Delivery.ack (seq_of 2) d) = [ "sent-then-lost"; "born-offline" ])
 
 (* --- D9: rebase under each merge policy ---------------------------------- *)
 

@@ -70,7 +70,7 @@ struct
   module Client = Tea_client.Make_local (A) (L)
   module Codec = Tea_core.Codec.Make (A)
   module Rc = Tea_client.Reconnect
-  module Outbox = Tea_client.Rebase.Outbox
+  module Delivery = Tea_client.Delivery
   module Channel = Tea_client.Local_channel
 
   (* --- Live subscription state (one mount per page life) ------------------
@@ -86,10 +86,27 @@ struct
      edits made while [conn] could not send. Both are driven by pure state
      machines in [Tea_client]; everything below is the effect half. *)
 
+  (* The tab's delivery identity, minted once per page load (D15). A session
+     cookie names a session, not a sender: two tabs share one cookie, one branch
+     and one replica id, so without this both would number their messages from
+     1 and the server would read the second tab's first edit as the first tab's
+     replay.
+
+     [Random.self_init] is the entropy source rather than a [crypto] binding:
+     this value is a de-duplication key inside an already-authenticated session,
+     not a credential, so what it needs is collision-freedom between a handful
+     of tabs on one machine, not unpredictability against an attacker. Under
+     js_of_ocaml [self_init] seeds from the JS RNG. A collision would degrade
+     exactly to the two-tabs bug this closes, which is why the mint is one
+     expression with no fallback path to drift from. *)
+  let mint_tab () : Tea_core.Prim.Tab_id.t =
+    Random.self_init ();
+    Tea_core.Prim.Tab_id.of_draws (fun () -> Random.int 256)
+
   type live =
     { mutable app : (Client.state, A.msg) Vdom_blit.app option
     ; mutable conn : (WS.t, W.timeout_id) Rc.t
-    ; mutable outbox : A.msg Outbox.t
+    ; mutable delivery : A.msg Delivery.t
     ; mutable applying_remote : bool
     ; mutable intervals : (int * W.interval_id) list
     }
@@ -97,7 +114,7 @@ struct
   let live : live =
     { app = None
     ; conn = Rc.down
-    ; outbox = Outbox.empty
+    ; delivery = Delivery.v ~tab:(mint_tab ())
     ; applying_remote = false
     ; intervals = []
     }
@@ -141,22 +158,30 @@ struct
      {!Tea_client.Rebase.absorb}, so it is unit-tested off the browser. What is
      left here is the two effects that function cannot perform: rebinding the
      tab's identity and dispatching into the mounted app. *)
+  let to_subs (head : A.model) : unit =
+    current_specs ()
+    |> List.iter (fun (s : (A.model, A.msg) Subs.spec) ->
+           match s with
+           | Subs.Spec_store f -> dispatch_remote (f head)
+           | Subs.Spec_every ((_ : int), (_ : int -> A.msg)) -> ())
+
   let on_frame (json : string) : unit =
     Result.fold (Codec.down_of_json json)
       ~ok:(fun down ->
-        let head, announced =
-          Tea_client.Rebase.absorb A.merge ~local:(shared_model ()) down
-        in
+        match Tea_client.Rebase.absorb A.merge ~local:(shared_model ()) down with
         (* Adopt before dispatching: the store-watch msg this frame becomes is
            run through [A.update] like any other, and an app whose sync handler
            mints a dot must mint it under the identity the frame just
            announced, not the one it superseded. *)
-        Option.iter Tea_client.Identity.adopt announced;
-        current_specs ()
-        |> List.iter (fun (s : (A.model, A.msg) Subs.spec) ->
-               match s with
-               | Subs.Spec_store f -> dispatch_remote (f head)
-               | Subs.Spec_every ((_ : int), (_ : int -> A.msg)) -> ()))
+        | Tea_client.Rebase.Resync (replica, head) ->
+          Tea_client.Identity.adopt replica;
+          to_subs head
+        | Tea_client.Rebase.Rebased head -> to_subs head
+        (* An acknowledgement touches the delivery queue and nothing else: it
+           carries no model, so there is no store-watch msg to dispatch and no
+           dot to mint (D15). *)
+        | Tea_client.Rebase.Acked seq ->
+          live.delivery <- Delivery.ack seq live.delivery)
       ~error:(fun (Codec.Decode_failed reason) ->
         log ("tea_client_run: undecodable model frame: " ^ reason))
 
@@ -177,22 +202,38 @@ struct
      reconnect. [Rc.sendable] is [Some] in the [Up] state only, deliberately
      including CONNECTING under "buffer it": a [send] on a connecting socket
      raises in the browser. *)
-  let send_or_buffer (msg : A.msg) : unit =
-    Rc.sendable live.conn
-    |> Option.to_result ~none:()
-    |> Result.fold
-         ~ok:(fun ws -> WS.send ws (Codec.msg_to_json msg))
-         ~error:(fun () -> live.outbox <- Outbox.buffer msg live.outbox)
+  (* One frame, sent if the link can carry it. A send that cannot happen is not
+     an error and needs no branch: the entry is already recorded, so it stays in
+     the queue and the next reconnect replays it (D15). *)
+  let send_one ((seq : Tea_core.Prim.Msg_seq.t), (msg : A.msg)) : unit =
+    Option.iter
+      (fun ws ->
+        WS.send ws
+          (Codec.up_to_json
+             (Tea_core.Wire.Apply
+                { tab = Tea_core.Prim.Tab_id.to_string (Delivery.tab live.delivery)
+                ; seq = Tea_core.Prim.Msg_seq.to_int seq
+                ; msg
+                })))
+      (Rc.sendable live.conn)
 
-  (* Replay in the order the edits were made. [drain] empties the outbox
-     first, so a msg that cannot be sent after all (the link dropped again
-     mid-flush) is re-buffered by [send_or_buffer] rather than replayed twice
-      -  and the survivors keep their relative order, because re-buffering walks
-     the remaining list in the same direction. *)
-  let flush_outbox () : unit =
-    let msgs, emptied = Outbox.drain live.outbox in
-    live.outbox <- emptied;
-    List.iter send_or_buffer msgs
+  (* Record FIRST, send second. Before D15 this buffered only when the link was
+     down, so a message handed to a socket that then died was in no queue at all
+     and was lost silently. Now every shared message is recorded, and the only
+     thing the link state changes is whether the send happens now or on
+     reconnect. *)
+  let send_or_buffer (msg : A.msg) : unit =
+    Option.iter
+      (fun ((d : A.msg Delivery.t), (entry : Tea_core.Prim.Msg_seq.t * A.msg)) ->
+        live.delivery <- d;
+        send_one entry)
+      (Delivery.record msg live.delivery)
+
+  (* Replay in the order the edits were made, and do NOT empty the queue: an
+     entry leaves only when the server acknowledges it. Re-sending an entry the
+     server already has is safe because the server de-duplicates above
+     [A.update] ([Tea_server.Replay_guard]) - not because of anything here. *)
+  let flush_outbox () : unit = List.iter send_one (Delivery.unacked live.delivery)
 
   let forward (msg : A.msg) : unit =
     if not live.applying_remote then send_or_buffer msg

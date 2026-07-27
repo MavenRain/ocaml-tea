@@ -1,13 +1,3 @@
-module Outbox = struct
-  type 'msg t = 'msg list
-
-  let empty : 'msg t = []
-  let buffer (msg : 'msg) (o : 'msg t) : 'msg t = msg :: o
-  let drain (o : 'msg t) : 'msg list * 'msg t = (List.rev o, empty)
-  let pending (o : 'msg t) : int = List.length o
-  let is_empty (o : 'msg t) : bool = List.is_empty o
-end
-
 let reconcile (policy : 'model Tea_core.Merge_spec.t) ~(local : 'model)
     ~(incoming : 'model) : 'model =
   match policy with
@@ -20,18 +10,27 @@ let reconcile (policy : 'model Tea_core.Merge_spec.t) ~(local : 'model)
     |> Result.value ~default:incoming
   | Tea_core.Merge_spec.Last_write_wins -> incoming
 
+type 'model absorbed =
+  | Resync of Tea_core.Crdt.Replica.t * 'model
+  | Rebased of 'model
+  | Acked of Tea_core.Prim.Msg_seq.t
+
 let absorb (policy : 'model Tea_core.Merge_spec.t) ~(local : 'model option)
-    (down : 'model Tea_core.Wire.down) : 'model * Tea_core.Crdt.Replica.t option =
+    (down : 'model Tea_core.Wire.down) : 'model absorbed =
   match down with
   (* A [Hello] is a (re)connect: adopt the announced identity, and take the
      head it came with as-is rather than folding the local model into it. That
      local model predicts a session this tab may have fallen out of step with,
-     and every locally-born edit the server has not applied yet is either in
-     the outbox (replayed immediately after this) or already in flight — so
-     resyncing to the truth loses no intent, only a stale prediction. *)
-  | Tea_core.Wire.Hello (replica, head) -> (head, Some replica)
+     and every locally-born edit the server has not applied yet is still in the
+     delivery queue, unacknowledged, and replayed the moment the link is up —
+     so resyncing to the truth loses no intent, only a stale prediction.
+
+     Before D15 that sentence was a hope: a message already handed to the dead
+     socket was in no queue at all, and this line discarded it. *)
+  | Tea_core.Wire.Hello (replica, head) -> Resync (replica, head)
   | Tea_core.Wire.Head incoming ->
-    ( Option.fold ~none:incoming
-        ~some:(fun local -> reconcile policy ~local ~incoming)
-        local
-    , None )
+    Rebased
+      (Option.fold ~none:incoming
+         ~some:(fun local -> reconcile policy ~local ~incoming)
+         local)
+  | Tea_core.Wire.Ack seq -> Acked seq

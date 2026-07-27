@@ -236,13 +236,33 @@ let () =
            | Tea_core.Wire.Head m -> Some (Counter_app.App.value m)
            | Tea_core.Wire.Hello
                ((_ : Tea_core.Crdt.Replica.t), (_ : Counter_app.App.model)) ->
-             None)
+             None
+           | Tea_core.Wire.Ack (_ : Tea_core.Prim.Msg_seq.t) -> None)
      in
      let announced_replica f : Tea_core.Crdt.Replica.t option =
        Option.bind (decoded f) (fun d ->
            match d with
            | Tea_core.Wire.Hello (r, (_ : Counter_app.App.model)) -> Some r
+           | Tea_core.Wire.Head (_ : Counter_app.App.model) -> None
+           | Tea_core.Wire.Ack (_ : Tea_core.Prim.Msg_seq.t) -> None)
+     in
+     (* Step 10 (D15): the acknowledgement carried by a frame, if it is one. *)
+     let acked_seq f : Tea_core.Prim.Msg_seq.t option =
+       Option.bind (decoded f) (fun d ->
+           match d with
+           | Tea_core.Wire.Ack n -> Some n
+           | Tea_core.Wire.Hello
+               ((_ : Tea_core.Crdt.Replica.t), (_ : Counter_app.App.model)) ->
+             None
            | Tea_core.Wire.Head (_ : Counter_app.App.model) -> None)
+     in
+     let acks () = List.filter_map acked_seq (frames ()) in
+     (* An up-frame now carries its delivery header (D15). The tab id is a
+        literal of the real grammar, not a mint, so this file needs no browser
+        entropy source. *)
+     let tab_a = String.make 32 'a' in
+     let up ?(tab = tab_a) (seq : int) (msg : Counter_app.App.msg) : string =
+       Codec.up_to_json (Tea_core.Wire.Apply { tab; seq; msg })
      in
      (* (a) The session opens by announcing the replica id it applies under
         (D14) together with the current head. The expectation is built from the
@@ -258,13 +278,38 @@ let () =
                    , fst Counter_app.App.init )) ]);
      (* (b) A Msg frame up is stepped, committed, and echoed down via the
         store watch as a [Head] frame - not a second announcement. *)
-     push (Some (Codec.msg_to_json Counter_app.App.Increment));
+     push (Some (up 1 Counter_app.App.Increment));
      let* stepped =
        await (fun () -> List.exists (fun f -> head_value f = Some 1) (frames ()))
      in
      check "a Msg frame up yields the committed model as a Head frame down" stepped;
      check "the replica is announced once per session, not once per commit"
        (List.length (List.filter_map announced_replica (frames ())) = 1);
+     (* (b') D15: the same frame again is de-duplicated above [A.update] — the
+        model does not move, the branch gains no commit, and the duplicate is
+        acknowledged anyway so the client's retry terminates. *)
+     let* acked1 = await (fun () -> acks () <> []) in
+     check "an accepted up-frame is acknowledged by seq"
+       (acked1 && List.map Tea_core.Prim.Msg_seq.to_int (acks ()) = [ 1 ]);
+     let* history_before = Server.Store.history s in
+     push (Some (up 1 Counter_app.App.Increment));
+     let* acked_twice =
+       await (fun () -> List.length (acks ()) = 2)
+     in
+     check "a duplicate up-frame is acknowledged" acked_twice;
+     let* model_after = Server.Store.load s in
+     let* history_after = Server.Store.history s in
+     check "a replayed up-frame commits exactly once"
+       (Counter_app.App.value model_after = 1
+       && List.length history_after = List.length history_before);
+     (* (b'') A second tab on the SAME session shares the replica, so its own
+        seq 1 must not be mistaken for the first tab's replay. *)
+     push (Some (up ~tab:(String.make 32 'b') 1 Counter_app.App.Increment));
+     let* second_tab =
+       await (fun () -> List.exists (fun f -> head_value f = Some 2) (frames ()))
+     in
+     check "a second tab's own seq 1 is not read as the first tab's replay"
+       second_tab;
      (* (c) Peer close ends the session. *)
      push None;
      let* closed = closes_within session in

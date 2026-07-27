@@ -38,6 +38,8 @@ toolchain removes an entire tier lean-tea had to hand-write.
 | `test/browser/smoke.mjs` - Playwright end-to-end smoke over the real compiled server binaries | **passes, 9 ok / 0 xfail** (confirmed by mutation; roadmap step 8, D13 - its D14 pin went stale when step 9 fixed the bug, and is now an ordinary assertion) |
 | `Wire.down` + `Tea_client.Identity` - the server announces its session replica, the tab mints under it | **built, green** (roadmap step 9, D14) |
 | `test/predictor_test` - one intent, one replica slot, across both tiers in one process | **passes** (confirmed by mutation) |
+| `Wire.up` + `Tea_client.Delivery` + `Tea_server.Replay_guard` - sequenced up-frames, an unacknowledged queue, and per-(replica, tab) de-duplication above `update` | **built, green** (roadmap step 10, D15) |
+| `test/replay_test`, `test/delivery_test`, `test/exactly_once_test` - the guard, the queue, and both tiers with the socket killed mid-flight | **passes** (confirmed by mutation) |
 
 Toolchain: OCaml 5.3.0, dune 3.24, a dedicated opam switch (`irmin-tea` locally) with
 `irmin 3.11`, `dream 1.0.0~alpha8`, `repr 0.8`, `vdom 0.3`, `js_of_ocaml 6.4`.
@@ -291,9 +293,11 @@ merely performs:
 - **D9, `Rebase`.** A msg born while the link is not `Up` now waits in an
   outbox and is replayed in order on reconnect, instead of applying locally
   and being logged as lost. `Opening` deliberately does not count as sendable:
-  a `send` on a CONNECTING socket raises. Replay is send-once by construction
-  (a buffered msg is one the server never received) and idempotent anyway
-  under D1's joins. On the way in, a pushed head is `reconcile`d against the
+  a `send` on a CONNECTING socket raises. Replay was send-once by construction
+  (a buffered msg is one the server never received) — **that reasoning was
+  sound and still left a hole, which is D15 below: it classified only the msgs
+  born while the link was down, and said nothing about a msg already handed to
+  a socket that then died.** On the way in, a pushed head is `reconcile`d against the
   model this tab holds, under the app's own `Merge_spec.t`, before the
   `Store_watch` subscription ever sees it - the head does not contain the
   outbox's edits, so handing it over raw was a clobber.
@@ -407,6 +411,82 @@ nothing is lost.
 > socket, on a surface every caller reads as total because it returns a result.
 > Now caught at the one seam, with checks on both the frame witness and the msg
 > witness.
+
+> **D15 - a msg handed to a dying socket was lost, silently. FIXED in step 10.**
+> `send_or_buffer` wrote `WS.send ws (Codec.msg_to_json msg)` and forgot the
+> message. The outbox held only the msgs *born* while the link was down, so a
+> msg already handed to a socket that then died was in no queue at all: nothing
+> replayed it, and the next `Hello` made `absorb` resync to the server head,
+> discarding the prediction. No error, no log, no trace - the edit simply never
+> happened. D9's send-once reasoning was sound about the msgs it classified and
+> silent about this one, which is why no in-process test saw it: none of them
+> could kill a socket mid-flight.
+>
+> The fix is at-least-once delivery plus de-duplication, because retrying alone
+> would recreate D14's double count from the other direction - state *join* is
+> idempotent, replaying an *op* is not, and no CRDT here detects a re-applied
+> op (a re-executed msg re-mints its dot from the server's own clock).
+>
+> - **`Wire.up`** gives every up-frame a delivery header: `Apply {tab; seq; msg}`.
+>   The fields stay primitives, not newtypes, because the client chooses them:
+>   they become `Prim.Tab_id.t` / `Prim.Msg_seq.t` only after the server's own
+>   validators accept them. A `Repr` witness for an abstract type is total on
+>   decode and would admit inhabitants the newtype's constructor rejects.
+> - **`Prim.Tab_id`** is the identity the scheme needed, and the reason it is a
+>   *new* one is the trap: a replica id is minted from the session, and a session
+>   is a cookie, so **two tabs on one cookie share one replica id** (the D13
+>   smoke test drives exactly that). A guard keyed on the session alone answers
+>   "already seen" to the second tab's first edit and drops it forever - the very
+>   bug this closes, reintroduced by its own fix. A socket id will not do either:
+>   it dies precisely when de-duplication matters. So the key is per page load,
+>   minted client-side, and it is a de-duplication key, **not a credential**.
+> - **`Tea_client.Delivery` replaces `Rebase.Outbox`**, and the replacement is the
+>   point: membership is now "recorded when made, dropped when acknowledged"
+>   rather than "born while the link was down", so in-flight and offline-born
+>   edits stop being different cases. Keeping both queues would have been worse
+>   than keeping neither - two replay triggers at two different times means an
+>   offline-born edit reaches the server *ahead* of an older already-sent one,
+>   which under `Last_write_wins` flips the winner.
+> - **`Tea_server.Replay_guard`** is one integer per `(replica, tab)`, consulted
+>   *above* `A.update`. One integer suffices because a WebSocket delivers in
+>   order, so a dead socket truncates a *suffix*: what the server has consumed
+>   for a tab is always a prefix, and a prefix is one number.
+> - **The ack is minted by the pump, never by the watch.** The watch fires for
+>   every writer on the branch - a form post, an undo, the other tab - so a
+>   `Head` cannot stand in for an acknowledgement; and a msg whose update is a
+>   no-op produces no commit at all, so a watch-derived ack would never arrive
+>   and the client would retry that msg forever.
+> - **Consume before apply** is structural, not a convention: `Cell.take` is
+>   synchronous with no Lwt yield point before the step, so two live sockets for
+>   one tab cannot both see a seq as fresh, and a msg whose update exhausts fuel
+>   is attempted exactly once instead of killing the session on every reconnect.
+>
+> **The guarantee, stated exactly: exactly-once effect within one server process
+> lifetime and within the guard's bounds; at-least-once outside them.** The
+> bounds are honest, and every one of them degrades toward *duplicating*, never
+> toward losing, because the guard never invents a high water it did not observe:
+> an absent entry accepts anything. A server restart re-applies whatever is
+> replayed (in memory, deliberately not announced on the wire: on learning an
+> epoch changed, a client's only sound action is still to replay, so the frame
+> would change no behaviour). Eviction at the bounds does the same. The one path
+> to the *loss* side is a stale entry outliving its branch, which is why
+> `Replay_guard.forget` exists and why its precondition is written on it: any
+> future reaper loop must call it for every collected session.
+>
+> **Left open, deliberately:** the client's unacknowledged queue is unbounded,
+> exactly as the outbox was - and that is what lets the server refuse a gap
+> outright, since an honest client never skips a seq because it never discards
+> one. The RPC tier is not covered: `/rpc/*` is a non-idempotent POST with the
+> same problem and a different retry origin (the browser's, not this
+> framework's). A frame whose *envelope* cannot be decoded has no seq to consume
+> and still closes the session, which needs the two tiers' `up_t` witnesses to
+> disagree - a deploy skew, the state T3 calls disallowed.
+>
+> **What step 10 does *not* change:** the D14 pre-announcement window, exactly as
+> pinned. A replay is a re-send, never a second local apply, so it mints no new
+> client dot; de-duplication suppresses the second server apply, so it mints no
+> new server dot. `test/predictor_test`'s pin stands, and `exactly_once_test`
+> carries a sibling pin so a future fix reddens both rather than one.
 
 ## 8. Shared RPC contract - built (roadmap step 7; hardened step 8, D11/D12)
 
@@ -554,8 +634,10 @@ Each lean-tea private-constructor primitive → an OCaml `.mli` boundary:
 - **R6 (med) - optimistic client replay can diverge from server merge.**
   **Mitigation shipped** (roadmap step 8, D9): an incoming head is no longer
   applied raw. `Tea_client.Rebase.reconcile` folds it into the model the tab is
-  holding under the app's own `Merge_spec.t`, and edits made while the link was
-  down wait in an outbox and replay in order once it is back. Under `Crdt_join`
+  holding under the app's own `Merge_spec.t`, and unacknowledged edits wait in
+  `Tea_client.Delivery` and replay in order once it is back — which since step 10
+  (D15) means *every* edit the server has not confirmed, not just the ones born
+  while the link was down. Under `Crdt_join`
   the fold is lossless *and* idempotent, so replaying a local edit onto a newer
   head converges however the two interleave. The residual is now honest and
   policy-shaped rather than runtime-shaped: under `Last_write_wins` there is no
@@ -711,5 +793,33 @@ Each lean-tea private-constructor primitive → an OCaml `.mli` boundary:
    the first frame keeps a provisional slot - it needs an un-mint the CRDTs
    cannot offer, and it is pinned rather than hidden); delivery dedup, which
    still rests on send-once and would need the seq-number acks §7 records as
-   deferred; and `Dot` uniqueness across the two tiers, which is now a
-   magnitude argument rather than a construction (§7).
+   deferred (**closed in step 10**); and `Dot` uniqueness across the two tiers,
+   which is now a magnitude argument rather than a construction (§7).
+
+10. **D15 - delivery that survives the socket.** **Done.** A msg handed to a
+    dying socket used to vanish silently: the outbox held only the msgs *born*
+    while the link was down, so nothing replayed it and the next `Hello` resync
+    discarded the prediction. Closing that needs a retry, and a retry needs
+    de-duplication or it recreates D14's double count - so the two land
+    together. `Wire.up` carries a `(tab, seq)` delivery header; `Prim.Tab_id`
+    is the identity a session id cannot supply, because one cookie is one
+    replica shared by every tab on it; `Tea_client.Delivery` replaces
+    `Rebase.Outbox` with one queue whose members leave only on an
+    acknowledgement; `Tea_server.Replay_guard` keeps one integer per
+    `(replica, tab)` above `A.update`, which is enough because in-order
+    delivery makes the consumed set a prefix. The ack is minted by the pump,
+    never by the store watch - the watch fires for every writer on the branch,
+    and a no-op msg produces no commit to hang an ack on.
+
+    `test/exactly_once_test` is the file the previous nine steps could not
+    write: it runs a real store session, a real `live_session`, and the real
+    client queue over a transport it **kills and re-opens in the middle**, then
+    asserts which of the two asymmetric failures happened - a silent lost edit
+    or a visible double count. Fifteen mutations, fifteen reds.
+
+    Left open, deliberately: the guarantee is *exactly-once effect within one
+    server process lifetime and within the guard's bounds; at-least-once
+    outside them*, and every bound degrades toward duplicating rather than
+    losing (§7). The client's unacknowledged queue stays unbounded, which is
+    what makes refusing a gap free. The RPC tier is not covered. The D14
+    pre-announcement window is unchanged, and now pinned in two files.

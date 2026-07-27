@@ -225,3 +225,82 @@ module Status : sig
 
   val to_int : t -> int
 end
+
+module Tab_id : sig
+  (** A per-page-load delivery identity: 16 random bytes as 32 lowercase hex
+      characters (roadmap step 10, D15).
+
+      One Dream session cookie is one session, one branch and {i one}
+      {!Crdt.Replica} — the browser smoke test drives two tabs on exactly that
+      configuration — so a session cannot name a sender, and two tabs both
+      numbering their messages from {!Msg_seq.one} would collide. This can name
+      one: it is minted once per page, rides every up-frame, and therefore
+      survives socket loss without surviving a reload, which is exactly the
+      lifetime the client's unacked queue has.
+
+      It is a de-duplication key, {b not a credential}. Authority is the session
+      cookie; a tab id is scoped strictly inside one already-authenticated
+      session and confers nothing on its own. Unlike the framework-internal
+      newtypes there is no trusted [v] mint: every inhabitant arrives either
+      from the wire ({!of_string}) or from a browser entropy source
+      ({!of_bytes}), and both validate. *)
+  type t
+
+  type err =
+    | Wrong_length
+    | Invalid_char of char
+
+  val of_string : string -> (t, err) result
+  (** The wire path: exactly 32 characters, each in [0-9a-f]. The fixed length
+      is half of the server table's memory bound — a count bound over
+      unbounded keys bounds nothing. *)
+
+  val of_bytes : int list -> t option
+  (** Exactly 16 integers, each in [0..255], hex-encoded. [None] otherwise — a
+      caller that offered something unexpected gets a declined mint, never an
+      exception. Used by tests, which want the refusal to be observable. *)
+
+  val of_draws : (unit -> int) -> t
+  (** The runtime's mint path: draw 16 bytes from an entropy source. Total by
+      construction — the count is fixed here and each draw is masked into range
+      — so the browser tier has no refusal to handle, and therefore no reason
+      to reach for a constant id, which would be the tab-collision bug wearing
+      a fallback's clothes. *)
+
+  val to_string : t -> string
+
+  val compare : t -> t -> int
+  (** Total order ([String.compare] on {!to_string}), so the server's replay
+      guard can key a map on tab ids. *)
+
+  val t : t Repr.t
+  (** Repr witness (a plain string codec, the {!Session_id.t} framing reason).
+      Note it is {i total} on decode, which is why the pump validates with
+      {!of_string} rather than trusting a witness-decoded field. *)
+end
+
+module Msg_seq : sig
+  (** A per-tab message number, 1-based, assigned in the order the user made
+      the edits and never reused (roadmap step 10, D15).
+
+      Unique per {b tab}, never per session: two tabs on one cookie both start
+      at {!one}, and a server that deduplicated on a sequence number alone
+      would answer "already seen" to the second tab's first edit and drop it
+      forever. *)
+  type t
+
+  val one : t
+
+  val next : t -> t option
+  (** [None] at the end of the sequence space (the {!Fuel} precedent: a defined
+      arm, never a wraparound and never an exception). A tab that reaches it
+      has stopped sending; on jsoo's 31-bit integers that is ~10^9 edits in one
+      page life. *)
+
+  val of_int : int -> t option
+  (** The wire path: [n < 1] is [None]. *)
+
+  val to_int : t -> int
+  val compare : t -> t -> int
+  val t : t Repr.t
+end

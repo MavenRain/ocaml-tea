@@ -36,6 +36,19 @@ let check name cond =
     Printf.printf "FAIL - %s\n%!" name;
     exit 1)
 
+(* Step 10 (D15) widened [absorb] into a three-arm sum, because an [Ack] frame
+   carries no model. Every frame this file builds is a [Head] or a [Hello], so
+   the pair shape those checks were written against is recovered here rather
+   than in the library — where returning a model for an acknowledgement would
+   dispatch a spurious store-watch message into the app. *)
+let absorbed (local : App.model option) (d : App.model Wire.down) :
+    App.model * Crdt.Replica.t option =
+  match Rebase.absorb App.merge ~local d with
+  | Rebase.Resync (r, head) -> (head, Some r)
+  | Rebase.Rebased head -> (head, None)
+  | Rebase.Acked (_ : Prim.Msg_seq.t) ->
+    (Option.value local ~default:(fst App.init), None)
+
 (* --- 1. The identity of a tab nobody has spoken to yet -------------------- *)
 
 let () =
@@ -86,7 +99,7 @@ let () =
      let local_pre = click (Identity.ctx ()) (fst App.init) in
      let* head_pre = Store.apply pre App.Increment in
      let folded_pre, (_ : Crdt.Replica.t option) =
-       Rebase.absorb App.merge ~local:(Some local_pre) (Wire.Head head_pre)
+       absorbed (Some local_pre) (Wire.Head head_pre)
      in
      check "PIN: an edit made before the announcement keeps its provisional slot"
        (App.value (sync (Identity.ctx ()) folded_pre local_pre) = 2);
@@ -105,15 +118,13 @@ let () =
        (App.value local = 1);
      let* head = Store.apply s App.Increment in
      check "the server's own state counts that one intent once" (App.value head = 1);
-     let head', adopted = Rebase.absorb App.merge ~local:(Some local) (Wire.Head head) in
+     let head', adopted = absorbed (Some local) (Wire.Head head) in
      check "a Head frame announces no replica" (Option.is_none adopted);
      let displayed = sync (Identity.ctx ()) head' local in
      check "the ACTING tab settles at 1, not 2 (D14 fixed)" (App.value displayed = 1);
      (* An observer tab is the control: same head, no local action. Before the
         fix this read half the acting tab. *)
-     let observer = sync (Identity.ctx ()) (fst (Rebase.absorb App.merge
-                                                   ~local:(Some (fst App.init))
-                                                   (Wire.Head head)))
+     let observer = sync (Identity.ctx ()) (fst (absorbed (Some (fst App.init)) (Wire.Head head)))
          (fst App.init)
      in
      check "the acting tab and the observer tab agree"
@@ -122,7 +133,7 @@ let () =
      let local2 = click (Identity.ctx ()) displayed in
      let* head2 = Store.apply s App.Increment in
      let head2', (_ : Crdt.Replica.t option) =
-       Rebase.absorb App.merge ~local:(Some local2) (Wire.Head head2)
+       absorbed (Some local2) (Wire.Head head2)
      in
      check "a second click settles at 2 (the shared slot is not clamped)"
        (App.value (sync (Identity.ctx ()) head2' local2) = 2);
@@ -130,7 +141,7 @@ let () =
         server head of 2) is shed by [absorb]… *)
      let ahead = click (Identity.ctx ()) (sync (Identity.ctx ()) head2' local2) in
      let resynced, adopted2 =
-       Rebase.absorb App.merge ~local:(Some ahead) (Wire.Hello (announced, head2))
+       absorbed (Some ahead) (Wire.Hello (announced, head2))
      in
      check "a Hello hands back a replica to adopt"
        (Option.fold ~none:false ~some:(Crdt.Replica.equal announced) adopted2);
@@ -148,7 +159,7 @@ let () =
 (* --- 4. [absorb] as a total function, off any tier ------------------------ *)
 
 let () =
-  let head_only (d : App.model Wire.down) = fst (Rebase.absorb App.merge ~local:None d) in
+  let head_only (d : App.model Wire.down) = fst (absorbed None d) in
   let m1 = { App.count = Crdt.Pn_counter.inc (Crdt.Replica.v (Prim.Session_id.v "x")) Crdt.Pn_counter.bottom } in
   check "before the app mounts a Head passes straight through"
     (App.value (head_only (Wire.Head m1)) = 1);
@@ -158,12 +169,12 @@ let () =
      local model, so a local edit the head does not carry survives it. *)
   let local = { App.count = Crdt.Pn_counter.inc (Crdt.Replica.v (Prim.Session_id.v "y")) Crdt.Pn_counter.bottom } in
   let kept, (_ : Crdt.Replica.t option) =
-    Rebase.absorb App.merge ~local:(Some local) (Wire.Head m1)
+    absorbed (Some local) (Wire.Head m1)
   in
   check "a Head is reconciled onto the local model (D9 outbox edit survives)"
     (App.value kept = 2);
   let shed, (_ : Crdt.Replica.t option) =
-    Rebase.absorb App.merge ~local:(Some local) (Wire.Hello (Identity.provisional, m1))
+    absorbed (Some local) (Wire.Hello (Identity.provisional, m1))
   in
   check "a Hello ignores the local model entirely" (App.value shed = 1)
 
@@ -180,13 +191,15 @@ let () =
     Option.bind d (fun d ->
         match d with
         | Wire.Hello (r, m) -> Some (r, App.value m)
-        | Wire.Head (_ : App.model) -> None)
+        | Wire.Head (_ : App.model) -> None
+        | Wire.Ack (_ : Prim.Msg_seq.t) -> None)
   in
   let as_head (d : App.model Wire.down option) =
     Option.bind d (fun d ->
         match d with
         | Wire.Head m -> Some (App.value m)
-        | Wire.Hello ((_ : Crdt.Replica.t), (_ : App.model)) -> None)
+        | Wire.Hello ((_ : Crdt.Replica.t), (_ : App.model)) -> None
+        | Wire.Ack (_ : Prim.Msg_seq.t) -> None)
   in
   check "a Hello round-trips with its replica and head intact"
     (as_hello (round (Wire.Hello (r, m)))

@@ -35,6 +35,18 @@ module Make (A : App.APP) : sig
       socket frame: a bare model cannot say whether it arrived with an identity
       attached. It stays for the paths that genuinely carry a model alone. *)
 
+  val up_t : A.msg Wire.up Repr.t
+  (** The live socket's up-frame witness (roadmap step 10, D15): derived from
+      [A.msg_t] exactly as {!down_t} is derived from [A.model_t]. *)
+
+  val up_to_json : A.msg Wire.up -> string
+
+  val up_of_json : string -> (A.msg Wire.up, err) result
+  (** What the live-session pump calls on every received frame. {!msg_of_json}
+      stays for the SSR form-post path, which carries a message with no
+      delivery header and needs none: an HTTP POST is not retried by this
+      framework. *)
+
   val msg_to_label : A.msg -> string
   (** A human-readable label for a message; used as the Irmin commit message
       so the commit log doubles as an event log. *)

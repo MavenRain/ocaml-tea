@@ -10,13 +10,15 @@
 
 (** {2 Pure client-tier logic}
 
-    Three modules that own decisions the runtime used to make inline against
+    Four modules that own decisions the runtime used to make inline against
     live browser objects, and that are therefore now testable off the browser:
     when to reconnect a dropped socket, what to do with edits made while it was
-    down, and how a client-local companion splits the message stream. *)
+    down, which edits the server has actually taken delivery of, and how a
+    client-local companion splits the message stream. *)
 
 module Reconnect = Reconnect
 module Rebase = Rebase
+module Delivery = Delivery
 module Local_channel = Local_channel
 
 (** {2 This tab's CRDT identity}

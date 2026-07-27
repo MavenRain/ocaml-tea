@@ -225,3 +225,53 @@ module Status = struct
   let is_success t = t >= 200 && t <= 299
   let to_int t = t
 end
+
+module Tab_id = struct
+  type t = string
+
+  type err =
+    | Wrong_length
+    | Invalid_char of char
+
+  (* 16 bytes as lowercase hex. The length is fixed on the decode path because
+     this value is client-chosen and becomes a key in a bounded server-side
+     table: a count bound only bounds memory if each key's size is bounded. *)
+  let hex_length = 32
+  let byte_count = 16
+  let is_hex c = is_digit c || (c >= 'a' && c <= 'f')
+
+  let of_string s =
+    if Int.equal (String.length s) hex_length then
+      first_where (fun c -> not (is_hex c)) s
+      |> Option.fold ~none:(Ok s) ~some:(fun c -> Error (Invalid_char c))
+    else Error Wrong_length
+
+  let of_bytes bs =
+    if
+      Int.equal (List.length bs) byte_count
+      && List.for_all (fun b -> b >= 0 && b <= 255) bs
+    then Some (String.concat "" (List.map (fun b -> Printf.sprintf "%02x" b) bs))
+    else None
+
+  (* Total by construction: the count is fixed here and every draw is masked
+     into range, so there is no refusal for a caller to handle with a constant
+     id — which would be the tab-collision bug wearing a fallback's clothes. *)
+  let of_draws draw =
+    String.concat ""
+      (List.init byte_count (fun (_ : int) -> Printf.sprintf "%02x" (draw () land 0xff)))
+
+  let to_string t = t
+  let compare = String.compare
+  let t = Repr.string
+end
+
+module Msg_seq = struct
+  type t = int
+
+  let one = 1
+  let next t = if t >= max_int then None else Some (t + 1)
+  let of_int n = if n < 1 then None else Some n
+  let to_int t = t
+  let compare = Int.compare
+  let t = Repr.int
+end

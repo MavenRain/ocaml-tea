@@ -17,6 +17,11 @@
     socket, a form post, or another tab — comes back down as a full Repr-JSON
     model frame via the Irmin watch. *)
 
+(** The replay guard (roadmap step 10, D15), re-exported because the library's
+    own name module is what callers see: [server_test] and [exactly_once_test]
+    build an isolated guard to hand [live_session]. *)
+module Replay_guard = Replay_guard
+
 (** The backend-generic handler bodies (roadmap step 8, D2): every current
     handler, router, step, and WS pump, functorized over any
     {!Tea_persist.Store_core.CORE}. [Make] instantiates it over the in-memory
@@ -151,8 +156,17 @@ struct
       before} the [Hello] is pushed and not after: a [Head] arriving ahead of
       the [Hello] costs a client one stale-identity fold that the [Hello] then
       resyncs, whereas registering later would drop the commit entirely. *)
-  let live_session ?(coalesce = Tea_core.Coalesce_spec.Keep_all) (s : St.session)
-      (t : live_transport) : unit Lwt.t =
+  (* One guard per functor application, process-lifetime: it must outlive the
+     socket, because a socket dying is precisely the case de-duplication exists
+     to handle. A guard minted per [live_session] would forget everything at the
+     moment its knowledge becomes load-bearing. [?guard] is for tests, which
+     drive [live_session] directly and want an isolated table. *)
+  let guard : Replay_guard.Cell.cell =
+    Replay_guard.Cell.v ~sessions:Replay_guard.default_sessions
+      ~tabs:Replay_guard.default_tabs
+
+  let live_session ?(coalesce = Tea_core.Coalesce_spec.Keep_all) ?(guard = guard)
+      (s : St.session) (t : live_transport) : unit Lwt.t =
     (* One coalescer per socket (R1): a chatty client folds its own run of
        Msgs into one amended commit, and can never amend a commit some other
        writer minted — a form post, a merge, or an undo ends the run. *)
@@ -170,22 +184,68 @@ struct
        minting a second one. It is the session's own context that is asked -
        not a second derivation of the branch name - so an announcement can
        never disagree with what [step_with] actually applies under. *)
-    push
-      (Some
-         (Codec.down_to_json
-            (Tea_core.Wire.Hello
-               (Tea_core.Crdt.Ctx.replica (St.ctx_of_session s), model0))));
+    let replica = Tea_core.Crdt.Ctx.replica (St.ctx_of_session s) in
+    push (Some (Codec.down_to_json (Tea_core.Wire.Hello (replica, model0))));
+    (* An acknowledgement is minted by the PUMP, never by the store watch
+       (roadmap step 10, D15). The watch fires for every writer on the branch —
+       a form post, an undo, the other tab on the same cookie — so a [Head]
+       cannot stand in for one; and a message whose update is a no-op produces
+       no commit at all, so a watch-derived ack would never arrive and the
+       client would retry it forever. *)
+    let ack (n : Tea_core.Prim.Msg_seq.t) : unit =
+      push (Some (Codec.down_to_json (Tea_core.Wire.Ack n)))
+    in
+    (* Validate the client-chosen header, then consume. [None] is a header this
+       session could not read at all — a length or alphabet violation, or a
+       non-positive sequence number — which our own client cannot produce. *)
+    let admit ~(tab : string) ~(seq : int) : Replay_guard.verdict option =
+      Result.fold (Tea_core.Prim.Tab_id.of_string tab)
+        ~error:(fun (_ : Tea_core.Prim.Tab_id.err) -> None)
+        ~ok:(fun tab ->
+          Option.map
+            (fun seq -> Replay_guard.Cell.take guard ~replica ~tab ~seq)
+            (Tea_core.Prim.Msg_seq.of_int seq))
+    in
     let rec pump () =
       let* frame = t.receive_frame () in
       match frame with
       | None -> Lwt.return_unit
       | Some json ->
-        Result.fold (Codec.msg_of_json json)
-          ~ok:(fun msg ->
-            let* stepped = step_ws s msg in
-            Result.fold stepped
-              ~ok:(fun (_ : step_outcome) -> pump ())
-              ~error:(fun (Loop.Fuel_exhausted : Loop.err) -> Lwt.return_unit))
+        Result.fold (Codec.up_of_json json)
+          ~ok:(fun (Tea_core.Wire.Apply { tab; seq; msg }) ->
+            (* [~none:] is eager, and deliberately a value with no effect here:
+               a resolved promise constant, so evaluating it always is free.
+               An unreadable delivery header ends the session, exactly as an
+               undecodable frame does — it is the same protocol break. *)
+            Option.fold ~none:Lwt.return_unit
+              ~some:(fun (v : Replay_guard.verdict) ->
+                match v with
+                (* Consume-before-apply is structural, not a convention:
+                   [Cell.take] is synchronous and there is no Lwt yield point
+                   between deciding a seq is fresh and recording it, so two live
+                   sockets for one tab cannot both see it as fresh. It also
+                   means the high water records "this seq was taken", not "this
+                   seq was applied", so a message whose update exhausts fuel is
+                   attempted exactly once instead of killing the session on
+                   every reconnect forever. *)
+                | Replay_guard.Fresh n ->
+                  let* stepped = step_ws s msg in
+                  Result.fold stepped
+                    ~ok:(fun (_ : step_outcome) ->
+                      ack n;
+                      pump ())
+                    ~error:(fun (Loop.Fuel_exhausted : Loop.err) -> Lwt.return_unit)
+                | Replay_guard.Duplicate n ->
+                  (* Acknowledge without applying. An unacknowledged duplicate
+                     is a replay loop that never terminates. *)
+                  ack n;
+                  pump ()
+                | Replay_guard.Gapped ->
+                  (* Ignore it, and do NOT end the session: ending it would hand
+                     a same-session tab a socket-kill primitive against its
+                     sibling. An honest client cannot produce a gap. *)
+                  pump ())
+              (admit ~tab ~seq))
           ~error:(fun (Codec.Decode_failed (_ : string)) -> Lwt.return_unit)
     in
     Lwt.finalize

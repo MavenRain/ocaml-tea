@@ -7,6 +7,7 @@ module Prim = Tea_core.Prim
    of a library that has a module of its own name). *)
 module Reconnect = Reconnect
 module Rebase = Rebase
+module Delivery = Delivery
 module Local_channel = Local_channel
 
 type 'msg Vdom.Cmd.t +=
