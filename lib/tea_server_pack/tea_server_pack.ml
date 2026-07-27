@@ -70,18 +70,32 @@ module Make_pack (A : Tea_core.App.APP) = struct
   let handler_pack ?client_dir ?(rpc = []) ?coalesce ?retention (repo : Store.t) : Dream.handler =
     handler ?client_dir ~rpc:(checkpoint_route ?retention repo :: rpc) ?coalesce repo
 
-  (** Blocking entry point for a durable pack server. A SIGINT resolves Dream's
-      [~stop] promise; once Dream returns, the repo is closed so the pack suffix
-      is flushed to disk — mutation survival across a restart depends on this
-      teardown close. *)
+  (** Blocking entry point for a durable pack server. A stop signal resolves
+      Dream's [~stop] promise; once Dream returns, the repo is closed so the
+      pack suffix is flushed to disk — mutation survival across a restart
+      depends on this teardown close.
+
+      Both SIGINT and SIGTERM are handled, and the second one matters as much as
+      the first: SIGINT is what a terminal sends, but SIGTERM is what every
+      supervisor sends — including the browser harness, which restarts this
+      binary to observe that de-duplication survives a restart. A SIGTERM that
+      bypassed this handler would kill the process before the teardown close,
+      so the reopened store would be missing its most recent suffix and the
+      scenario would be measuring a lost store rather than a lost delivery
+      record. The wake is guarded by [is_sleeping], so a second signal (or both
+      signals) resolves the promise once. *)
   let serve_pack ?(interface = "localhost") ?(port = 8080) ?client_dir ?rpc ?coalesce ?retention
       ?lower_root ~(root : Root.t) () : unit =
     let repo = Lwt_main.run (Store.create ?lower_root root) in
     let stop, wake = Lwt.wait () in
-    let (_ : Lwt_unix.signal_handler_id) =
-      Lwt_unix.on_signal Sys.sigint (fun (_ : int) ->
-          if Lwt.is_sleeping stop then Lwt.wakeup_later wake ())
-    in
+    List.iter
+      (fun signal ->
+        let (_ : Lwt_unix.signal_handler_id) =
+          Lwt_unix.on_signal signal (fun (_ : int) ->
+              if Lwt.is_sleeping stop then Lwt.wakeup_later wake ())
+        in
+        ())
+      [ Sys.sigint; Sys.sigterm ];
     Lwt_main.run
       (Dream.serve ~interface ~port ~stop
          (Dream.logger (handler_pack ?client_dir ?rpc ?coalesce ?retention repo)));

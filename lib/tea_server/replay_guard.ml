@@ -124,6 +124,18 @@ let high_water (t : t) ~(replica : Tea_core.Crdt.Replica.t)
   |> Fun.flip Option.bind (Tab_map.find_opt tab)
   |> Option.map (fun (e : entry) -> e.high)
 
+(* Raise-the-floor only. Written with a closure on both branches and applied
+   once, rather than an eager [~none:], so the insert is not built in the case
+   that discards it — the [Option.fold] discipline this project keeps for
+   effects, kept here for allocation too. *)
+let seed (t : t) ~(replica : Tea_core.Crdt.Replica.t) ~(tab : Tea_core.Prim.Tab_id.t)
+    ~(high : Msg_seq.t) : t =
+  let insert () = record t ~replica ~tab ~high in
+  high_water t ~replica ~tab
+  |> Option.fold ~none:insert ~some:(fun (existing : Msg_seq.t) () ->
+         if Msg_seq.compare high existing > 0 then insert () else t)
+  |> fun adopt -> adopt ()
+
 let sessions (t : t) : int = Rep_map.cardinal t.live
 
 let tabs (t : t) ~(replica : Tea_core.Crdt.Replica.t) : int =
@@ -140,6 +152,10 @@ module Cell = struct
     let t, verdict = take !c ~replica ~tab ~seq in
     c := t;
     verdict
+
+  let seed (c : cell) ~(replica : Tea_core.Crdt.Replica.t) ~(tab : Tea_core.Prim.Tab_id.t)
+      ~(high : Msg_seq.t) : unit =
+    c := seed !c ~replica ~tab ~high
 
   let forget (c : cell) ~(replica : Tea_core.Crdt.Replica.t) : unit =
     c := forget !c ~replica

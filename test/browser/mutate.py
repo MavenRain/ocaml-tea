@@ -31,9 +31,17 @@ MUTATIONS = [
         "file": "examples/counter/counter_app.ml",
         "old": "let subscriptions _model = Sub.store_watch (fun m -> Sync m)",
         "new": "let subscriptions _model = Sub.none",
-        # Killing the subscription also kills the echo the acting tab needs to
-        # reach 2, so the D14 pin correctly stops holding as well.
-        "expect_red": ["purely via the WS live frame", "KNOWN BUG D14"],
+        # Only tab B's check reddens. This entry used to also name the D14 PIN's
+        # label, which was correct while D14 was a bug: killing the subscription
+        # killed the echo the acting tab needed to reach 2, so the pin stopped
+        # holding. Step 9 fixed D14 and rewrote that pin as an ordinary
+        # transition on A settling at 1 — and A reaches 1 by its own OPTIMISTIC
+        # apply, which needs no frame at all, so this mutation leaves it green.
+        # The stale entry named a label no run can print, and since a missed
+        # expectation is a failure, M1 could not pass. Confirmed statically:
+        # "KNOWN BUG" survives in this harness only inside smoke.mjs's header
+        # comment, never as a check label.
+        "expect_red": ["purely via the WS live frame"],
     },
     {
         "id": "M2",

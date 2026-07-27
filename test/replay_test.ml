@@ -223,3 +223,63 @@ let () =
     && Option.fold ~none:false
          ~some:(fun n -> Int.equal (Msg_seq.to_int n) 2)
          (Msg_seq.next (seq 1)))
+
+(* --- 8. seed: adopting a high water this process never observed (D16) ------ *)
+
+(* The pure half of durability. [seed] is the only way a fresh table can know
+   about a sequence number some earlier process consumed, and it is the one
+   direction in this module that can cause a LOSS, so its floor discipline is
+   pinned here rather than left to the wiring that calls it. *)
+let () =
+  let r = replica "seed" in
+  let t = tab 1 in
+  let g = Guard.seed (fresh_guard ()) ~replica:r ~tab:t ~high:(seq 3) in
+  check "seed on an empty table adopts the durable high water"
+    (Option.fold ~none:false
+       ~some:(fun h -> Int.equal (Msg_seq.to_int h) 3)
+       (Guard.high_water g ~replica:r ~tab:t));
+  let (_ : Guard.t), replayed = Guard.take g ~replica:r ~tab:t ~seq:(seq 3) in
+  check "a seeded high water answers Duplicate to the seq a dead process consumed"
+    (is_duplicate replayed ~high:3);
+  let (_ : Guard.t), next = Guard.take g ~replica:r ~tab:t ~seq:(seq 4) in
+  check "a seeded tab resumes in order at the seq after the durable one"
+    (is_fresh next ~at:4)
+
+let () =
+  let r = replica "floor" in
+  let t = tab 1 in
+  (* The in-memory table is always at least as advanced as the durable record,
+     because the durable write happens after the effect commits. A seed that
+     would LOWER an entry is therefore stale by construction, and believing it
+     would re-open a consumed sequence number. *)
+  let g, (_ : Guard.verdict) = Guard.take (fresh_guard ()) ~replica:r ~tab:t ~seq:(seq 1) in
+  let g, (_ : Guard.verdict) = Guard.take g ~replica:r ~tab:t ~seq:(seq 2) in
+  let g = Guard.seed g ~replica:r ~tab:t ~high:(seq 1) in
+  check "seed never lowers an entry the running process already advanced"
+    (Option.fold ~none:false
+       ~some:(fun h -> Int.equal (Msg_seq.to_int h) 2)
+       (Guard.high_water g ~replica:r ~tab:t));
+  let (_ : Guard.t), stale = Guard.take g ~replica:r ~tab:t ~seq:(seq 2) in
+  check "a lowering seed does not re-open a consumed seq" (is_duplicate stale ~high:2);
+  let g' = Guard.seed g ~replica:r ~tab:t ~high:(seq 5) in
+  check "seed does raise an entry when the durable record is ahead"
+    (Option.fold ~none:false
+       ~some:(fun h -> Int.equal (Msg_seq.to_int h) 5)
+       (Guard.high_water g' ~replica:r ~tab:t));
+  (* Seeding one tab must not answer for its sibling: the whole reason the key is
+     a pair is that two tabs on one cookie both start at one. *)
+  let (_ : Guard.t), sibling = Guard.take g' ~replica:r ~tab:(tab 2) ~seq:(seq 1) in
+  check "seeding one tab leaves its sibling's first seq fresh" (is_fresh sibling ~at:1)
+
+let () =
+  let r = replica "seedcell" in
+  let t = tab 1 in
+  let c = Guard.Cell.v ~sessions:Guard.default_sessions ~tabs:Guard.default_tabs in
+  Guard.Cell.seed c ~replica:r ~tab:t ~high:(seq 2);
+  (* Two live sockets for one tab can both seed before either takes, so seeding
+     twice must not admit the same sequence number twice. *)
+  Guard.Cell.seed c ~replica:r ~tab:t ~high:(seq 2);
+  let first = Guard.Cell.take c ~replica:r ~tab:t ~seq:(seq 3) in
+  let second = Guard.Cell.take c ~replica:r ~tab:t ~seq:(seq 3) in
+  check "Cell.seed is idempotent and take still admits a seq exactly once"
+    (is_fresh first ~at:3 && is_duplicate second ~high:3)

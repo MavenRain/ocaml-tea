@@ -114,6 +114,26 @@ val take :
     retrying — the only tab whose entry matters — is by construction the last to
     be evicted. *)
 
+val seed :
+  t ->
+  replica:Tea_core.Crdt.Replica.t ->
+  tab:Tea_core.Prim.Tab_id.t ->
+  high:Tea_core.Prim.Msg_seq.t ->
+  t
+(** Adopt a high water this process did not observe — the durable record read
+    back after a restart (roadmap step 11, D16).
+
+    {b It raises the floor and never lowers it}, the {!Tea_persist.Clock.seed}
+    discipline exactly: an in-memory entry is always at least as advanced as the
+    durable one, because the durable write happens after the effect commits, so
+    a seed that could lower an entry is reading something older than what this
+    process already knows and must be ignored rather than believed. Lowering
+    would re-open a consumed sequence number, i.e. re-apply an operation, which
+    is the one thing this module exists to prevent.
+
+    Seeding touches recency, because the only reason to seed is that a frame for
+    [(replica, tab)] just arrived. *)
+
 val forget : t -> replica:Tea_core.Crdt.Replica.t -> t
 (** Drop every tab entry for one replica.
 
@@ -158,6 +178,19 @@ module Cell : sig
     tab:Tea_core.Prim.Tab_id.t ->
     seq:Tea_core.Prim.Msg_seq.t ->
     verdict
+
+  val seed :
+    cell ->
+    replica:Tea_core.Crdt.Replica.t ->
+    tab:Tea_core.Prim.Tab_id.t ->
+    high:Tea_core.Prim.Msg_seq.t ->
+    unit
+  (** {!seed} on the shell. The pump calls this {i before} {!take}, on the frame
+      that first mentions a [(replica, tab)] this process has not heard from, so
+      the durable read is the only step that yields and {!take} remains the one
+      synchronous decision point. Two sockets that both seed before either takes
+      is harmless: seeding cannot lower an entry, and [take] still admits
+      exactly one of them. *)
 
   val forget : cell -> replica:Tea_core.Crdt.Replica.t -> unit
   val snapshot : cell -> t
