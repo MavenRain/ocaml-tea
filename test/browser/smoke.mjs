@@ -40,12 +40,32 @@
  * two-tab seq collision, a dropped Ack), and B4 restarts the pack-backed
  * server binary over one TEA_ROOT to assert exactly-once ACROSS A PROCESS -
  * the one claim every in-process test is structurally blind to.
+ *
+ * Step 12 (D17) turned B4's identity pin into the positive check (serve_pack
+ * now defaults to a durable identity minted at <root>.secret) and added B5,
+ * the different-secret converse: Dream's fallback secret is process-global,
+ * so only a run that CHANGES the secret and watches identity reset can
+ * attribute B4's green to the configured secret rather than to the tester's
+ * environment.
+ *
+ * B6 and B7 are the REFUSAL scenarios, and they drive the server binary raw
+ * with no browser at all, because the entire claim is that the process exits
+ * before it ever serves. B6 points TEA_ROOT at an unusable root (an existing
+ * empty directory, the likeliest operator mistake). B7 points it at a root
+ * that does NOT exist while its <root>.guard sibling survives, the shape a
+ * partial wipe or a partial restore leaves behind. Both must produce one
+ * audible stderr line AND a non-zero exit: an uncaught Pack_error is the old
+ * bug, and a clean-looking exit 0 is unreadable to a supervisor (systemd
+ * Restart=on-failure, k8s restartPolicy: OnFailure, a CI gate). B7 is the
+ * silent-LOSS direction specifically: with the floors alive and the store
+ * gone, a returning tab's replay is judged Duplicate and dropped onto a model
+ * that materialised empty, so serving at all is worse than refusing.
  */
 
 import { chromium } from 'playwright'
 import { spawn } from 'node:child_process'
-import { existsSync } from 'node:fs'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { existsSync, statSync } from 'node:fs'
+import { mkdir, mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -55,6 +75,11 @@ const PORT_COUNTER = Number(process.env.SMOKE_PORT_COUNTER ?? 8137)
 const PORT_SHARED_DOC = Number(process.env.SMOKE_PORT_SHARED_DOC ?? 8138)
 const PORT_REPLAY = Number(process.env.SMOKE_PORT_REPLAY ?? 8139)
 const PORT_DURABLE = Number(process.env.SMOKE_PORT_DURABLE ?? 8140)
+const PORT_SECRET = Number(process.env.SMOKE_PORT_SECRET ?? 8141)
+/* B7's server must never listen. It gets its own port anyway, so that when a
+   mutation DOES let it serve, it collides with nothing and its red is about
+   the missing refusal alone. */
+const PORT_ORPHAN = Number(process.env.SMOKE_PORT_ORPHAN ?? 8142)
 const HEADED = process.env.SMOKE_HEADED === '1'
 const WAIT_MS = Number(process.env.SMOKE_TIMEOUT_MS ?? 15000)
 
@@ -120,12 +145,18 @@ const pinValue = (label, ok, detail = '') => ({ label, ok, detail, kind: 'pin' }
    TEA_ROOT. Environment hygiene is strict: TEA_ROOT is stripped from the
    inherited environment and reinstated only through opts.env, so a variable
    leaked by the calling shell cannot silently turn a mem-tier scenario into a
-   pack-tier one - the mem scenarios run with it genuinely UNSET, not "". */
+   pack-tier one - the mem scenarios run with it genuinely UNSET, not "".
+   TEA_SECRET and TEA_SECRET_FILE are stripped for the same reason (step 12,
+   D17): the durable identity B4 asserts must come from the <root>.secret file
+   the server minted, never from the tester's shell - with either leaked, B4
+   can go green through the environment. */
 async function spawnServer({ name, exe, clientDir, port, env = {} }) {
   const exePath = resolve(REPO, exe)
   if (!existsSync(exePath)) throw new Error(`${name}: ${exe} is missing - run \`dune build\` first`)
   const ambient = { ...process.env }
   delete ambient.TEA_ROOT
+  delete ambient.TEA_SECRET
+  delete ambient.TEA_SECRET_FILE
   const proc = spawn(exePath, [], {
     cwd: REPO,
     env: { ...ambient, PORT: String(port), CLIENT_DIR: resolve(REPO, clientDir), ...env },
@@ -631,8 +662,25 @@ async function durableRestartScenario(browser) {
       { pre: 0 }
     ))) return out
 
-    tap.dropAcks = false
+    /* Life 1's identity, captured BEFORE the stop: the cookie is what life 2
+       must decrypt, and the pid is what proves life 2 is a different process.
+       Without the cookie in hand, the adoption check below could pass against
+       a context that never held a session at all. */
+    const cookieBefore = (await ctx.cookies(srv.base)).find((c) => c.name === 'dream.session')?.value ?? ''
+    const pidBefore = srv.proc.pid
+    if (!step(check('durable B4: life 1 issued a session cookie to capture', cookieBefore !== '', 'no dream.session cookie in the context'))) return out
     const outcome = await stop(srv, 'SIGTERM')
+    /* Only AFTER the process is dead may the tap stop dropping acks. The
+       client retransmits its unacked seq 2 every few tens of milliseconds,
+       and the still-alive server re-acks every retransmit; a single re-ack
+       FORWARDED in the gap between un-dropping and the SIGTERM dequeues
+       seq 2 and silently destroys the scenario's premise - the restart must
+       carry an unacked message. (Measured, not theoretical: one awaited
+       ctx.cookies() call in that gap was enough to lose the race
+       deterministically.) Between the death and life 2 no server exists, so
+       nothing can be wrongly dropped here; the un-drop is what lets the
+       POST-restart ack through to the counter below. */
+    tap.dropAcks = false
     if (!step(check(
       'durable B4: SIGTERM stops the pack server gracefully (exit 0 runs the store-then-journal teardown)',
       outcome.code === 0,
@@ -641,6 +689,24 @@ async function durableRestartScenario(browser) {
 
     const acksAtRestart = tap.acks
     srv = await server()
+    step(check('durable B4: life 2 is a NEW process (the restart really happened)', srv.proc.pid !== pidBefore, `pid ${pidBefore} -> ${srv.proc.pid}`))
+    step(check(
+      'durable B4: life 2 did NOT fall back to an ephemeral secret',
+      !srv.tail().includes('session secret unavailable'),
+      srv.tail()
+    ))
+    const secretMode = (() => {
+      try {
+        return statSync(`${root}.secret`).mode & 0o777
+      } catch {
+        return null
+      }
+    })()
+    step(check(
+      'durable B4: the durable secret is on disk at <root>.secret, mode 0600',
+      secretMode === 0o600,
+      `mode=${secretMode === null ? 'MISSING' : secretMode.toString(8)}`
+    ))
     if (!step(await transition(
       'durable B4: after the restart the client replays its unacked message and the server answers (a post-restart Ack arrives)',
       () => tap.acks,
@@ -648,9 +714,9 @@ async function durableRestartScenario(browser) {
       { pre: acksAtRestart, timeout: WAIT_MS * 2 }
     ))) return out
 
-    /* Ask the SERVER what it holds, FIRST, because it is the only reading here
-       that separates the three worlds: 2 is the guarantee, 1 is the lost-store
-       arm, 3 is the double-apply arm.
+    /* Ask the SERVER what it holds, FIRST, because it is the only reading
+       here that separates the worlds: 2 is the guarantee, 0 or 1 is the
+       lost-identity or lost-store arm, 3 is the double-apply arm.
 
        A client-rendered count cannot make that distinction. A tab's model
        already holds 2, and the reconnect Hello is JOINED into it rather than
@@ -658,40 +724,52 @@ async function durableRestartScenario(browser) {
        never pulls a tab back down. mut-b4-fresh-root proved exactly that by
        scoring ZERO reds against the client-count assertion.
 
-       So: a new page in the SAME context (same session cookie, therefore the
-       same branch) on the SSR route, which runs no client logic at all, so
-       what it renders IS the stored model. */
-    const ssr = await ctx.newPage()
-    await ssr.goto(`${srv.base}/`)
-    const served = await countOn(ssr)
-    await ssr.close()
+       So: the SSR route, which runs no client logic at all, requested with
+       the CAPTURED life-1 cookie pinned in the header. Pinned, not a page in
+       the context, because the read must race nothing: the open tabs'
+       reconnect handshakes hit life 2 first, and a server that refuses the
+       old cookie reissues a fresh one on the upgrade response, silently
+       swapping the context's cookie between the capture and this read. With
+       the header pinned, both checks below are deterministic statements
+       about life 1's identity, whatever the tabs got up to in between.
 
-    /* KNOWN GAP, pinned rather than asserted, because the honest reading is
-       that the end-to-end guarantee does not hold yet and the reason is NOT
-       the guard.
+       headersArray, NOT headers(): headers() joins duplicate Set-Cookie
+       headers into one string, and a joined absence test could miss a
+       reissue hiding behind another cookie. Dream emits Set-Cookie only when
+       the session is dirty, and a cookie it could not decrypt yields a fresh
+       dirty pre-session - so the ABSENCE of a dream.session Set-Cookie here
+       is positive proof the presented cookie was decrypted and adopted. */
+    const resp = await ctx.request.get(`${srv.base}/`, {
+      headers: { cookie: `dream.session=${cookieBefore}` },
+    })
+    const reissued = (await resp.headersArray())
+      .filter((h) => h.name.toLowerCase() === 'set-cookie' && h.value.startsWith('dream.session='))
+    step(check(
+      'durable B4: life 2 ADOPTS the presented session cookie (200 with no Set-Cookie reissue), so the identity itself survived',
+      resp.ok() && reissued.length === 0,
+      `status=${resp.status()} reissued=${reissued.length}`
+    ))
+    const served = (await resp.text()).match(/class="count"[^>]*>([^<]*)</)?.[1] ?? 'UNPARSED'
 
-       The server holds 1, not 2. The guard journal survived the restart
-       exactly as designed, but nothing ever consults it, because the identity
-       it is keyed to did not survive: [Tea_server] runs on
-       [Dream.memory_sessions], and the session id (tea_server.ml, [hex
-       (Dream.session_id request)]) is what derives BOTH the branch name AND
-       the replica id. A restart therefore mints a fresh session id, so the
-       reconnecting tab lands on a NEW branch (empty model, hence the replay
-       applying onto 0 and reading 1) under a NEW replica (so the journalled
-       floor is looked up under a key that can never match).
+    /* Step 12 (D17) closed B4's KNOWN GAP, and this check sits where the pin
+       used to. The journal (D16) was never the missing piece: what a restart
+       lost was the session id, which derives BOTH the branch name AND the
+       replica id, so life 2 used to land on a fresh branch under a fresh
+       replica and the journalled floor was looked up under a key that could
+       never match. serve_pack now defaults to cookie sessions under a secret
+       resolved from <root>.secret, so life 2 decrypts life 1's cookie, lands
+       on the SAME branch under the SAME replica, and the journal-seeded floor
+       answers Duplicate.
 
-       Durable floors need a durable identity. Until session identity survives
-       a restart (cookie-backed sessions with a stable secret, or an
-       app-managed durable session cookie), exactly-once across a restart is
-       reachable in process, where the tests construct the same replica across
-       both lives, but not through the real binary.
-
-       This is a PIN: it asserts the CURRENT broken value. The day identity
-       becomes durable this goes stale and reddens, which is the alarm. */
-    step(pinValue(
-      'durable B4 PIN (KNOWN GAP): the restarted server holds 1, not 2 - memory_sessions loses the session id, so the restart lands on a new branch and a new replica and the durable floor is never consulted',
-      served === '1',
-      `server-rendered count=${served} (2 would mean the gap is closed: update this pin)`
+       The verdict 2 separates three worlds: 1 is the lost-store OR
+       lost-identity arm (the replay applies onto an empty model), 3 is the
+       lost-floor arm (the replay double-applies). The adoption check above is
+       the identity witness that attributes a 2 here to the survived session
+       rather than to any accident of client state. */
+    step(check(
+      'durable B4: the RESTARTED SERVER itself holds 2 (one committed click plus one replayed-and-suppressed click)',
+      served === '2',
+      `server-rendered count=${served} (0 = the identity was lost, 1 = the store was lost, 3 = the floor was lost)`
     ))
 
     step(check('durable B4: no uncaught browser exception', errors.length === 0, errors.join(' | ')))
@@ -702,6 +780,242 @@ async function durableRestartScenario(browser) {
     /* The journal is a SIBLING of the pack root (serve_pack keeps it out of
        irmin-pack's directory on purpose); both live under the temp parent, so
        removing the parent takes the store and the journal together. */
+    await rm(parent, { recursive: true, force: true })
+  }
+}
+
+/* B5, the different-secret converse (step 12, D17). B4 alone cannot attribute
+   its evidence: an in-process probe found that Dream's fallback secret is
+   lazily minted and PROCESS-GLOBAL, so any mechanism that happens to carry
+   identity across lives - the tester's shell exporting TEA_SECRET, a shared
+   fallback, a cached cookie - satisfies "B4 reads 2" just as well as the
+   configured secret does. B5 is the converse that pins the attribution: one
+   TEA_ROOT, two lives, DIFFERENT explicit secrets. If the configured secret is
+   what carries identity, life 2 must REFUSE life 1's cookie (a Set-Cookie
+   reissue) and the server-rendered count must reset to exactly 0 - the store
+   still holds life 1's commit, but under a branch this fresh session cannot
+   name. A count of exactly 0 and a 200 are both required: "not 2" would also
+   be satisfied by a crashed life 2. */
+async function secretConverseScenario(browser) {
+  const parent = await mkdtemp(join(tmpdir(), 'tea-smoke-b5-'))
+  const root = join(parent, 'store')
+  /* Valid per Secret.of_string (32-512 chars of [A-Za-z0-9_-]), differing in
+     more than one character so no single bit flip could confuse them. */
+  const secretOne = 'b5_life_one_secret_0123456789_0123456789_A'
+  const secretTwo = 'b5_life_two_secret_9876543210_9876543210_B'
+  const server = (secret) =>
+    spawnServer({
+      name: 'secret-converse counter server',
+      exe: '_build/default/examples/counter/server/main.exe',
+      clientDir: '_build/default/examples/counter/client',
+      port: PORT_SECRET,
+      env: { TEA_ROOT: root, TEA_SECRET: secret },
+    })
+  let srv = null
+  let ctx = null
+  const errors = []
+  const out = []
+  const step = (r) => {
+    out.push(r)
+    return r.ok
+  }
+  try {
+    srv = await server(secretOne)
+    ctx = await browser.newContext()
+    /* Actor and observer, as in B4: the ACTING tab renders its click
+       optimistically, so only the observer's move proves the commit reached
+       the store - and a committed count of 1 under secret one is the
+       anti-vacuity floor for "resets to 0" below. */
+    const a = await openCounter(ctx, srv.base, errors)
+    const o = await openCounter(ctx, srv.base, errors)
+    const preA = await countOn(a)
+    const preO = await countOn(o)
+    if (!step(check('secret B5: pack-backed tabs mount at 0', preA === '0' && preO === '0', `A=${preA} O=${preO}`))) return out
+    if (!step(await transition(
+      'secret B5: life 1 commits one click under its own secret (observer 0 -> 1)',
+      () => countOn(o),
+      (v) => v === '1',
+      { pre: preO, act: () => plusOn(a).click() }
+    ))) return out
+    await a.close()
+    await o.close()
+
+    const outcome = await stop(srv, 'SIGTERM')
+    if (!step(check(
+      'secret B5: SIGTERM stops life 1 gracefully (exit 0 flushes the committed click to disk)',
+      outcome.code === 0,
+      `exit=${show(outcome)}`
+    ))) return out
+
+    srv = await server(secretTwo)
+    const ssr = await ctx.newPage()
+    const resp = await ssr.goto(`${srv.base}/`)
+    const reissued = (await resp.headersArray())
+      .filter((h) => h.name.toLowerCase() === 'set-cookie' && h.value.startsWith('dream.session='))
+    step(check(
+      'secret B5: life 2 with a different TEA_SECRET reissues a Set-Cookie, so the presented cookie was refused',
+      reissued.length > 0,
+      `status=${resp.status()} reissued=${reissued.length}`
+    ))
+    const served = await countOn(ssr)
+    await ssr.close()
+    step(check(
+      'secret B5: two lives with different TEA_SECRET do NOT share the session (the server-rendered count resets to 0)',
+      resp.ok() && served === '0',
+      `status=${resp.status()} server-rendered count=${served} (1 would mean identity survived a secret change)`
+    ))
+
+    step(check('secret B5: no uncaught browser exception', errors.length === 0, errors.join(' | ')))
+    return out
+  } finally {
+    if (ctx) await ctx.close().catch(() => {})
+    if (srv) await stop(srv, 'SIGTERM').catch(() => {})
+    await rm(parent, { recursive: true, force: true })
+  }
+}
+
+/* B6, the pack-root preflight (step 12, separable): an unusable TEA_ROOT must
+   be refused with one audible stderr line, never an uncaught
+   Pack_error "Invalid_layout". Raw spawn, NOT spawnServer: the entire point
+   is that the process exits before serving, which spawnServer's ready loop
+   treats as a failure. The refused dir is exactly the shape mkdtemp hands
+   out - an existing empty directory - which is also the likeliest operator
+   mistake (pointing TEA_ROOT at a directory they just created). */
+async function packRootPreflightScenario() {
+  const out = []
+  const step = (r) => {
+    out.push(r)
+    return r.ok
+  }
+  const dir = await mkdtemp(join(tmpdir(), 'tea-smoke-b6-'))
+  try {
+    const exePath = resolve(REPO, '_build/default/examples/counter/server/main.exe')
+    const ambient = { ...process.env }
+    delete ambient.TEA_ROOT
+    delete ambient.TEA_SECRET
+    delete ambient.TEA_SECRET_FILE
+    const proc = spawn(exePath, [], {
+      cwd: REPO,
+      env: { ...ambient, TEA_ROOT: dir },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+    let log = ''
+    proc.stdout.on('data', (d) => { log += String(d) })
+    proc.stderr.on('data', (d) => { log += String(d) })
+    const exit = await Promise.race([
+      new Promise((r) => proc.on('exit', (code) => r({ exited: true, code }))),
+      sleep(WAIT_MS).then(() => ({ exited: false, code: null })),
+    ])
+    if (!exit.exited) proc.kill('SIGKILL')
+    step(check(
+      'preflight B6: an unusable TEA_ROOT is refused with an audible line, not an uncaught Pack_error',
+      exit.exited && log.includes('pack root unusable') && !log.includes('Fatal error: exception'),
+      `exited=${exit.exited} code=${exit.code} log=${log.split('\n').slice(0, 3).join(' | ')}`
+    ))
+    /* The STATUS, not just the line. This refusal used to print its stderr
+       and return unit, which ended the binary at 0, and a supervisor (systemd
+       Restart=on-failure, k8s restartPolicy: OnFailure, a CI gate) cannot
+       tell a root the server never opened from a clean shutdown. Integer code
+       required: a process we had to SIGKILL exits with code null, and null
+       must not read as non-zero. */
+    step(check(
+      'preflight B6: the refusal exits NON-ZERO, so a supervisor restarts it instead of reading a clean shutdown',
+      exit.exited && Number.isInteger(exit.code) && exit.code !== 0,
+      `exited=${exit.exited} code=${show(exit.code)}`
+    ))
+    /* The refusal happens BEFORE secret resolution and the journal open, so
+       a refused root must gain neither durability sibling - this is the
+       ordering claim serve_pack's error arm makes, observed from outside. */
+    step(check(
+      'preflight B6: the refused root gained no .secret or .guard sibling',
+      !existsSync(`${dir}.secret`) && !existsSync(`${dir}.guard`),
+      `${existsSync(`${dir}.secret`) ? 'found .secret ' : ''}${existsSync(`${dir}.guard`) ? 'found .guard' : ''}`
+    ))
+    return out
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+}
+
+/* B7, the orphaned guard journal. The three durability siblings (<root>,
+   <root>.guard, <root>.secret) are three separate paths with no
+   cross-binding, so a wipe or a restore can keep some and drop others. One
+   direction is silent LOSS rather than the duplicate this system always
+   degrades towards: with the pack root gone but the journal surviving, a
+   returning tab's cookie still decrypts to its old session id, hence its old
+   branch name and its old replica id, hence its old guard key. The branch is
+   gone so the model materialises empty, but the surviving floor judges the
+   replayed message Duplicate and drops it onto that empty model - a loss no
+   client can see and no later commit repairs. serve_pack must refuse the pair
+   before the preflight ever runs.
+
+   Raw spawn like B6, for the same reason: the process is supposed to die
+   before it serves, which spawnServer's ready loop would report as a harness
+   failure rather than as the assertion it is. The setup is the wipe shape
+   exactly - a root INSIDE a fresh temp dir that does not exist, beside a
+   <root>.guard directory that does. */
+async function orphanedJournalScenario() {
+  const out = []
+  const step = (r) => {
+    out.push(r)
+    return r.ok
+  }
+  const parent = await mkdtemp(join(tmpdir(), 'tea-smoke-b7-'))
+  const root = join(parent, 'store')
+  try {
+    /* The journal without its store. `parent` exists, so the root is missing
+       for the only reason under test - it was wiped - and NOT because its
+       parent is missing, which the preflight would refuse for its own
+       unrelated reason and hide the orphan check behind. */
+    await mkdir(`${root}.guard`)
+    const exePath = resolve(REPO, '_build/default/examples/counter/server/main.exe')
+    const ambient = { ...process.env }
+    delete ambient.TEA_ROOT
+    delete ambient.TEA_SECRET
+    delete ambient.TEA_SECRET_FILE
+    const proc = spawn(exePath, [], {
+      cwd: REPO,
+      env: { ...ambient, PORT: String(PORT_ORPHAN), TEA_ROOT: root },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+    let log = ''
+    proc.stdout.on('data', (d) => { log += String(d) })
+    proc.stderr.on('data', (d) => { log += String(d) })
+    const exit = await Promise.race([
+      new Promise((r) => proc.on('exit', (code) => r({ exited: true, code }))),
+      sleep(WAIT_MS).then(() => ({ exited: false, code: null })),
+    ])
+    if (!exit.exited) proc.kill('SIGKILL')
+    const head = log.split('\n').slice(0, 3).join(' | ')
+    step(check(
+      'orphan B7: a surviving <root>.guard beside a missing pack root is refused with an audible line',
+      log.includes('guard journal orphaned'),
+      head
+    ))
+    step(check(
+      'orphan B7: the refusal exits NON-ZERO, so a supervisor restarts it instead of reading a clean shutdown',
+      exit.exited && Number.isInteger(exit.code) && exit.code !== 0,
+      `exited=${exit.exited} code=${show(exit.code)}`
+    ))
+    /* A refusal, not a crash: an uncaught exception would exit non-zero and
+       print a line too, so without this the two checks above are equally
+       satisfied by the failure mode the refusal exists to replace. */
+    step(check(
+      'orphan B7: the refusal is a diagnosis, not an uncaught exception',
+      !log.includes('Fatal error: exception'),
+      head
+    ))
+    /* Same "did not listen" evidence B6 uses: the process ended within the
+       deadline instead of running on as a server. Serving the orphaned pair
+       at all is the silent-loss outcome, so this is the check that says the
+       loss window never opened. */
+    step(check(
+      'orphan B7: the server never became usable - it exited instead of serving over the orphaned journal',
+      exit.exited,
+      `exited=${exit.exited} code=${show(exit.code)}`
+    ))
+    return out
+  } finally {
     await rm(parent, { recursive: true, force: true })
   }
 }
@@ -754,7 +1068,10 @@ const main = async () => {
     /* B4 owns its server lifecycle (it restarts it mid-scenario), so it is
        not a withServer body. */
     const durable = await guarded('durable B4', () => durableRestartScenario(browser))
-    return [...counter, ...sharedDoc, ...replay, ...durable]
+    const secret = await guarded('secret B5', () => secretConverseScenario(browser))
+    const preflight = await guarded('preflight B6', () => packRootPreflightScenario())
+    const orphan = await guarded('orphan B7', () => orphanedJournalScenario())
+    return [...counter, ...sharedDoc, ...replay, ...durable, ...secret, ...preflight, ...orphan]
   } finally {
     await browser.close()
   }

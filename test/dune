@@ -4,7 +4,8 @@
    reaper_test retention_test archive_gc_test crdt_test exploded_test
    pack_crdt_test rpc_stream_test csrf_test client_reconnect_test
    client_channel_test predictor_test replay_test exactly_once_test delivery_test
-   guard_sink_test durable_guard_test guard_file_test fuel_durable_test)
+   guard_sink_test durable_guard_test guard_file_test fuel_durable_test
+   session_secret_test session_identity_test pack_root_test)
  (libraries
   repr
   tea_core

@@ -84,6 +84,73 @@ module Make (A : Tea_core.App.APP) = struct
     in
     Lwt.bind (Pack.Repo.v config) (v ~now ?exploded)
 
+  type open_error =
+    | Root_parent_missing of string
+    | Root_not_a_directory of string
+    | Root_not_a_pack_store of string
+    | Backend_failed of string
+
+  (* The preflight cannot be complete (irmin-pack's failures are an open
+     polymorphic variant, and the filesystem can change between classify and
+     open), so the [Lwt.catch] seam is load-bearing even when every preflight
+     arm passes: it is what turns the unclassifiable residue into a value
+     instead of a process kill. *)
+  let open_root ?now ?lower_root ?exploded (root : Root.t) :
+      (t, open_error) result Lwt.t =
+    let s = Root.to_string root in
+    let classify = Irmin_pack_unix.Io.Unix.classify_path in
+    let is_file (path : string) : bool =
+      match classify path with
+      | `File -> true
+      | `Directory | `No_such_file_or_directory | `Other -> false
+    in
+    let attempt () : (t, open_error) result Lwt.t =
+      Lwt.catch
+        (fun () -> Lwt.map Result.ok (create ?now ?lower_root ?exploded root))
+        (fun (exn : exn) ->
+          Lwt.return (Error (Backend_failed (Printexc.to_string exn))))
+    in
+    match classify s with
+    | `File | `Other -> Lwt.return (Error (Root_not_a_directory s))
+    | `No_such_file_or_directory -> (
+      (* The backend does exactly one [mkdir], so the parent must already be
+         a directory for the create path to succeed. *)
+      match classify (Filename.dirname s) with
+      | `Directory -> attempt ()
+      | `File | `Other | `No_such_file_or_directory ->
+        Lwt.return (Error (Root_parent_missing (Filename.dirname s))))
+    | `Directory ->
+      (* An existing directory is a pack root only if it carries a control
+         file (v3+) or a bare pack file (v1/v2, kept openable so irmin-pack's
+         auto-migration stays reachable). Anything else - notably an EMPTY
+         existing directory, the exact shape [mkdtemp] hands out - is the
+         Invalid_layout raise waiting to happen. *)
+      if
+        is_file (Irmin_pack.Layout.V4.control ~root:s)
+        || is_file (Irmin_pack.Layout.V1_and_v2.pack ~root:s)
+      then attempt ()
+      else Lwt.return (Error (Root_not_a_pack_store s))
+
+  (* One sentence per constructor, and the match lives HERE so a new
+     constructor is a compile error in one place rather than a caller that
+     silently renders it as something else. Each arm names the path it carries,
+     because the payloads are not all the same kind of path: [Root_parent_missing]
+     carries the PARENT, and a caller that pasted every payload into one "pack
+     root unusable (%s)" template would name a directory the operator never
+     configured. The two directory refusals also want opposite remedies, so
+     they must not render alike. *)
+  let explain (e : open_error) : string =
+    match e with
+    | Root_parent_missing parent ->
+      Printf.sprintf "its parent directory %s does not exist (create it, or point TEA_ROOT elsewhere)" parent
+    | Root_not_a_directory path ->
+      Printf.sprintf "%s exists and is not a directory (remove it, or point TEA_ROOT elsewhere)" path
+    | Root_not_a_pack_store path ->
+      Printf.sprintf
+        "%s is an existing directory with no pack store in it (point TEA_ROOT at the store, or at a path that does not exist yet so it can be created)"
+        path
+    | Backend_failed reason -> Printf.sprintf "irmin-pack refused to open it (%s)" reason
+
   (** Whether GC on this store archives discarded data to a lower layer
       ([`Archive], a [lower_root] was configured) or deletes it ([`Delete]).
       Exposed so archive retention is observable without running a GC. *)

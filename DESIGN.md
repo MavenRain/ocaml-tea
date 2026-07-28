@@ -42,6 +42,8 @@ toolchain removes an entire tier lean-tea had to hand-write.
 | `test/replay_test`, `test/delivery_test`, `test/exactly_once_test` - the guard, the queue, and both tiers with the socket killed mid-flight | **passes** (confirmed by mutation) |
 | `Tea_server.Guard_sink` + `Durable_guard` + `Tea_server_pack.Guard_file` - durable floor mirror behind the in-memory guard, CRC-framed append-only journal on the pack tier | **built, green** (roadmap step 11, D16) |
 | `test/guard_sink_test`, `test/durable_guard_test`, `test/guard_file_test` + extended `exactly_once_test`/`replay_test`/`reaper_test` - codec totality, restart re-seed, torn-tail fold, tombstone-before-removal | **passes** |
+| `Tea_server.Session_secret` + `?sessions` threaded through `handler`/`handler_pack`/`serve_pack` (deliberately NOT the mem tier's `serve`, so identity durability cannot outrun model durability) + `Store_pack.open_root` - durable session identity on the pack tier (`TEA_SECRET`/`TEA_SECRET_FILE`/`<root>.secret` resolver), per-process `memory` everywhere else | **built, green** (roadmap step 12, D17) |
+| `test/session_secret_test`, `test/session_identity_test`, `test/pack_root_test` + browser B4/B5/B6/B7 - secret resolution, sealed composition, cookie adoption across restart, different-secret converse, typed pack-root failures (refused audibly AND non-zero), orphaned guard journal over a wiped root | **passes** (confirmed by mutation) |
 
 Toolchain: OCaml 5.3.0, dune 3.24, a dedicated opam switch (`irmin-tea` locally) with
 `irmin 3.11`, `dream 1.0.0~alpha8`, `repr 0.8`, `vdom 0.3`, `js_of_ocaml 6.4`.
@@ -559,6 +561,70 @@ nothing is lost.
 > - The two-clocks-behind-one-replica-id note (step 9) and the D14
 >   pre-announcement window are unchanged by this step.
 
+> **D17 - durable session identity (roadmap step 12).** Step 11's journalled
+> floor worked and nothing consulted it. `Tea_server.Handlers.handler` ran the
+> router under `Dream.memory_sessions`, and `hex (Dream.session_id request)`
+> derives BOTH the Irmin branch name AND the CRDT replica id, so a restart
+> minted a fresh session id and a reconnecting tab landed on a NEW branch (empty
+> model) under a NEW replica, where the journalled floor is looked up under a
+> key that can never match. Durable floors need a durable identity, and the
+> browser harness pinned exactly that: after SIGTERM plus restart the server
+> held 1, not 2.
+>
+> The fix is one string made to survive an `execve`. `Tea_server.Session_secret`
+> owns the session back end as a sealed sum: `memory` is `Dream.memory_sessions`
+> verbatim (the default of every handler, and the correct pairing for a volatile
+> store, because identity durability must never exceed MODEL durability - a
+> durable id over a dead store is the reads-1 loss arm), and `durable` is
+> `Dream.cookie_sessions` under `Dream.set_secret`. The module hands out ONE
+> composite middleware and never the two halves, because the nesting is
+> load-bearing and silently catastrophic when inverted: `set_secret` installs
+> the key by mutating the request on the way IN, so a session back end wrapped
+> around it loads with Dream's process-global fallback and stores with the
+> configured secret, minting a fresh session on every request. `hex` is kept
+> exactly as it is: removing it would rename every branch (`session-<hex>` to
+> `session-<raw>`) and lose every session on upgrade, `Branch_name.of_session`
+> does not validate, and `hex`'s output is a subset of both the `Session_id` and
+> `Branch_name` alphabets, so the derivation cannot produce an inadmissible ref
+> name.
+>
+> `serve_pack` is the one place the default flips, because it is the one tier
+> whose model is itself durable. The secret is resolved synchronously from
+> `TEA_SECRET`, else `TEA_SECRET_FILE`, else `<root>.secret` - a SIBLING of the
+> pack root, the same discipline and the same argument as `<root>.guard` -
+> minted on first boot with `O_EXCL` mode `0600` and fsynced, so two boots
+> racing on one root cannot clobber each other (the loser's `EEXIST` re-reads
+> the winner's bytes). Every failure is a typed value the wiring site folds
+> over, one stderr line, and a fall back to per-process identity: never an
+> abort, never silence. Note the degradation direction differs from the guard
+> journal's - a lost journal DUPLICATES, a lost secret ORPHANS every existing
+> session branch, and with no reaper wired those branches are never reclaimed.
+>
+> What the browser harness now measures: B4 asserts the restarted server holds 2
+> and, on the same request, that life 2 ADOPTS the presented cookie (200 with no
+> `Set-Cookie` reissue - Dream emits the cookie only when the session is dirty,
+> and a cookie it could not decrypt yields a fresh dirty pre-session, so absence
+> is positive proof of adoption), that life 2 is a new pid, and that
+> `<root>.secret` is mode 0600. B5 is the converse that makes B4 attributable:
+> two lives with DIFFERENT secrets do not share the session. `mut-b4-fresh-root`
+> and `mut-journal-unwired`, both blocked since step 11 because the identity gap
+> made them unobservable, are now unblocked and distinguishable - fresh root
+> reads 1, unwired journal reads 3.
+>
+> Left open here and recorded in section 10: the durable cookie is an
+> unrevocable bearer credential with a sliding lifetime (R13); the secret is the
+> system's only credential and the id space it protects is enumerable from disk
+> (R14); `Guard_file`'s cap eviction now evicts LIVE clients (R15, amending
+> R12); the cookie session payload is rollback-able the day anything is put in
+> it (R16); Dream's own cookie loader has two residual raises past a successful
+> decrypt (R17); behind a TLS-terminating proxy the durable cookie ships
+> without `Secure` and without the `__Host-` prefix, and the exposure is no
+> longer bounded by process lifetime (R19); and the three durability siblings
+> (`<root>`, `<root>.guard`, `<root>.secret`) can be restored out of step,
+> where losing the pack store alone turns the surviving floors into silent loss
+> (R20 - the outright-wipe case is refused at boot, a rollback to an older pack
+> snapshot under a newer journal is not).
+
 ## 8. Shared RPC contract - built (roadmap step 7; hardened step 8, D11/D12)
 
 lean-tea kept its tiers aligned by convention: route strings and encode/decode
@@ -795,6 +861,133 @@ Each lean-tea private-constructor primitive → an OCaml `.mli` boundary:
   hostile cookie-minting client grows it without limit. Known gap, recorded in
   D16's residuals (§7); a bound here needs the same eviction-direction
   argument the Cell already carries.
+- **R13 (med) - a durable session cookie is an unrevocable bearer credential
+  with a sliding lifetime.** Step 12 replaces `Dream.memory_sessions` with
+  `cookie_sessions` + `set_secret` on the pack tier, which removes an ACCIDENTAL
+  safety property: a restart used to invalidate every session. It does not any
+  more. The whole session travels in an AEAD cookie, Dream refreshes it (id
+  preserved) once it is half-expired, so a stolen cookie exercised at least once
+  per half-lifetime never expires, and `cookie_sessions` has NO server-side
+  revocation - `Dream.invalidate_session` re-issues client-side only, and a copy
+  of the old cookie stays valid until its own `expires_at`. The levers, all
+  coarse, are: rotate the secret (invalidates every session at once), shorten
+  the lifetime (threaded as `?lifetime` on `Session_secret.durable` and
+  defaulted to 7 days, half of Dream's default), or an app-level deny-list keyed
+  on `Dream.session_id`. Accepted rather than fixed because ocaml-tea has no
+  user identity to revoke TO: the session IS the principal and the branch it
+  names IS its data. Any app adding authentication must add revocation and must
+  call `Dream.invalidate_session` at the auth boundary - there is no
+  session-fixation defence today, and the pre-auth branch's fate is that app's
+  question to answer.
+- **R14 (med) - the session secret is the system's only credential, and the id
+  space it protects is public.** Anything that reads the secret can mint a
+  cookie for ANY session id, and therefore read and write any session branch
+  (nothing downstream of `Dream.session_id` authorizes: the id IS the
+  capability), and can mint CSRF tokens under the same key. It needs no search:
+  branch names under `$TEA_ROOT` are literally `session-<hex>` and the
+  world-readable `$TEA_ROOT.guard/journal` records the replica string in every
+  `Advance`/`Forget`, so a local read enumerates every live id. The session id's
+  144 bits defend against guessing only. Consequences, all implemented: the
+  secret file is `0600`, created `O_EXCL`, refused if it is not a regular file,
+  if any group or other permission bit is set, or if it exceeds 4096 bytes, and
+  it is NEVER rewritten on a validation failure (an unreadable secret may be a
+  transient mount problem; overwriting it would permanently orphan every
+  existing branch). Honest limits: `lstat`-then-`open` is a TOCTOU because
+  OCaml's `Unix` has no `O_NOFOLLOW`, but winning that race requires write
+  access to the DIRECTORY holding `<root>.secret`, and anyone with that access
+  can already unlink the file and drop in a secret of their own choosing, which
+  the `0600` and regular-file checks would then happily accept. The real
+  security boundary is therefore ownership of the secret's directory, not the
+  file checks; the checks defend only a directory that is already trustworthy.
+  The race is strictly weaker than the precondition it lives under, which is
+  why it is documented rather than closed with an inode recheck. A process
+  running as root can still be pointed at a file an unprivileged user owns (no
+  `st_uid` check); and an
+  environment variable is a weaker home than a file (`/proc/<pid>/environ`,
+  `ps e`, container inspection, crash dumps, inheritance by every child), which
+  is why `TEA_SECRET` is an override and `<root>.secret` is the default.
+- **R15 (low) - amends R12.** Step 12 leaves the in-process floor mirror's
+  growth RATE unchanged (it is driven by accepted messages, not by minted
+  cookies), but it changes what cap eviction COSTS. `Guard_file`'s drop-oldest
+  victims used to be ids no client could ever return to, because a restart
+  rotated identity; they are now LIVE sessions, so a flood of distinct
+  `(replica, tab)` pairs is a way to force an honest client's replay back onto
+  the duplicate side across a restart. Still the accept/duplicate direction,
+  never loss, but now reachable on purpose. In the other direction step 12
+  removes an unbounded table this register never named on the pack tier:
+  `memory_sessions` retains a hashtable entry per minted session and sweeps it
+  only on explicit invalidation or on presenting an already-expired id.
+- **R16 (low today, high on first use) - the cookie session payload is
+  rollback-able.** `cookie_sessions` stores the whole session client-side; AEAD
+  proves the server issued SOME version, never that it issued the LATEST, and
+  there is no server-side copy to compare against. ocaml-tea reads only
+  `Dream.session_id`, and the id is identical across every version a client may
+  replay, so nothing is exposed today - that safety is an accident of non-use
+  (`session_field`, `set_session_field`, and `session_expires_at` have zero
+  callers in this repo). The day an app calls `Dream.set_session_field`,
+  anything whose monotonicity matters must NOT go there: roles and entitlements
+  (rollback restores a revoked privilege), consumed one-time tokens (rollback is
+  replay), counters and quotas (rollback is a reset), consent flags. Monotone
+  state belongs on the session's Irmin branch, which is server-held and
+  versioned by construction - that is the branch's whole purpose.
+- **R17 (low) - Dream's cookie session loader has two raises we deliberately do
+  not catch.** `Cookie.load` calls `Yojson.Basic.from_string` unguarded and
+  `failwith "Bad payload"` on a non-string payload value (Dream's own source
+  marks both TODO). Both are reachable ONLY after a successful authenticated
+  decrypt, i.e. only if a future Dream changes the payload schema under our own
+  secret; a tampered or foreign cookie is rejected by AEAD first and degrades
+  silently to a fresh pre-session. We do not wrap the session middleware in
+  `Lwt.catch`, because the wrapper would necessarily also enclose the
+  application handler and would replace Dream's own logging error handler with a
+  bare 500 - a diagnostics regression paid for a schema-change hazard. Accepted;
+  the mitigation is pinning the Dream version.
+- **R18 (low) - exactly one process may own a pack root.** irmin-pack 3.11 takes
+  no inter-process lock on the root and `Guard_file` takes none on the journal,
+  so a second writer corrupts the store and journal compaction (a rename over
+  the path) silently discards the other process's appended floors. This was
+  previously self-limiting: a second process minted different session ids, so no
+  client crossed over. A shared secret makes both processes mutually
+  intelligible to the same client, which is exactly what lets a load balancer,
+  or a systemd restart overlapping a still-draining process, route one client
+  into both. A load-balanced pair over one root is a data-loss configuration,
+  not a scaling one. A lock file is out of scope for this step.
+- **R19 (med) - a durable session cookie behind a TLS-terminating proxy is
+  emitted without `Secure` and without the `__Host-` prefix.**
+  `Dream.cookie_sessions` marks the cookie `Secure` only when Dream itself
+  terminates TLS. Behind a reverse proxy that terminates TLS - a very common
+  deployment - Dream sees plain http, so the cookie goes out unmarked, and any
+  plaintext request to the same host discloses it. Step 12 raises the stakes
+  rather than creating the gap: an intercepted cookie used to die at the next
+  restart, and now it does not, so the exposure window is no longer bounded by
+  process lifetime. The framework cannot tell the two deployments apart from
+  inside the handler. The mitigations are deployment-side: terminate TLS in
+  Dream, or make the proxy refuse http. Documented at the `serve_pack` call
+  site in `lib/tea_server_pack/tea_server_pack.mli`; the register entry exists
+  so the deployment posture is a named decision rather than a doc-comment
+  aside.
+- **R20 (med) - the three durability siblings can be restored out of step, and
+  step 12 makes that silent loss.** `<root>`, `<root>.guard` and
+  `<root>.secret` are three separate paths with no cross-binding, so a backup,
+  a restore, or a manual wipe can easily keep some and drop others. The
+  dangerous direction is losing the pack store while keeping the other two:
+  returning tabs present cookies that `<root>.secret` still decrypts, so
+  `Dream.session_id` yields the same id, hence the same branch name and the
+  same CRDT replica id, hence the same guard key. The branch is gone, so the
+  model materialises at `bottom`, but `<root>.guard` still holds that session's
+  high-water floor, so the next replayed message is judged `Duplicate` and
+  dropped onto an empty model. That is the loss side of the guard, reached with
+  no reaper involved, and it inverts the standing "degradation is duplicate,
+  never loss" direction. Before step 12 the same wipe was harmless because
+  identity was per-process: a returning tab got a fresh id, a fresh floor key,
+  and `Fresh`. Implemented now: `serve_pack` refuses to boot, loudly and with a
+  non-zero exit, when the pack root does not exist but `<root>.guard` does,
+  which covers the outright-wipe case. The residue, stated rather than hidden:
+  a rollback to an OLDER pack snapshot with a NEWER journal is NOT covered by
+  that check, because the root exists. Closing it properly needs a
+  store-identity token written into the pack root at create time and stamped
+  into the guard journal header, so that `Guard_file.open_` can start from
+  empty floors audibly when the token does not match. That token is the named
+  future fix, not step-12 work.
 
 ## 11. Roadmap
 
@@ -948,3 +1141,17 @@ Each lean-tea private-constructor primitive → an OCaml `.mli` boundary:
     path `Replay_guard.forget`'s precondition names; the step-9
     two-clocks-behind-one-replica-id note and the D14 pre-announcement window
     are untouched.
+
+12. **Durable session identity** - `Tea_server.Session_secret` (the secret
+    newtype with no elimination form, the sealed `memory`/`durable` back-end
+    sum, the sealed `set_secret`-outside-`cookie_sessions` composition, and a
+    total synchronous resolver over `TEA_SECRET` / `TEA_SECRET_FILE` /
+    `<root>.secret` with `O_EXCL` 0600 minting); `?sessions` threaded through
+    `handler`, `serve`, `handler_pack`, and `serve_pack`, defaulting to today's
+    `memory_sessions` everywhere except `serve_pack`, the one tier whose model
+    is itself durable. **Done** (`session_secret_test`, `session_identity_test`,
+    browser B4 turned from a pin into a check at 2, new B5 secret converse,
+    `mut-b4-fresh-root` and `mut-journal-unwired` unblocked, every new check
+    confirmed by mutation). Optional companion landed with it:
+    `Store_pack.open_root`, so an unusable `TEA_ROOT` is an audible typed
+    failure rather than an uncaught `Pack_error` (`pack_root_test`, browser B6).

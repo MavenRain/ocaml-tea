@@ -10,7 +10,15 @@
 
     This module is the entry point only: port and bundle discovery, then
     [Dream.run]. Everything routable lives in {!Shared_doc_serve}, which the
-    test suite links directly. *)
+    test suite links directly.
+
+    This binary calls [Dream.run] directly on [Shared_doc_serve.handler] and is
+    a MEM-tier server, so its session identity is deliberately per-process
+    (roadmap step 12, D17): the model dies with the process, and a durable
+    identity over a volatile store would send a reconnecting tab to a branch
+    name that resolves to an empty branch. Identity durability must never
+    exceed model durability. A durable shared_doc would need the pack tier
+    first. *)
 
 module Server = Shared_doc_serve.Server
 

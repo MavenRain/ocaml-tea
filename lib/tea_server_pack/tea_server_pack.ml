@@ -15,6 +15,7 @@ module Guard_file = Guard_file
 module Guard_sink = Tea_server.Guard_sink
 module Durable_guard = Tea_server.Durable_guard
 module Replay_guard = Tea_server.Replay_guard
+module Session_secret = Tea_server.Session_secret
 
 module Make_pack (A : Tea_core.App.APP) = struct
   module Store = Tea_persist_pack.Store_pack.Make (A)
@@ -71,10 +72,23 @@ module Make_pack (A : Tea_core.App.APP) = struct
   (** The full pack request pipeline: the mem tier's {!handler} with
       [POST /admin/checkpoint] folded into the RPC route list, so it inherits
       the session and security-header middleware like every other route. *)
-  let handler_pack ?client_dir ?(rpc = []) ?coalesce ?retention ?guard
+  let handler_pack ?client_dir ?(rpc = []) ?coalesce ?retention ?guard ?sessions
       (repo : Store.t) : Dream.handler =
     handler ?client_dir ~rpc:(checkpoint_route ?retention repo :: rpc) ?coalesce
-      ?guard repo
+      ?guard ?sessions repo
+
+  (** The two durability siblings are named off the root, never nested inside
+      it. [Root.v] keeps its string verbatim, so a root spelled with a trailing
+      separator ([TEA_ROOT=/data/store/], one keystroke) would otherwise put
+      [.secret] and [.guard] INSIDE the directory irmin-pack owns, which is
+      exactly the bet the journal comment in {!serve_pack} refuses to make.
+      Paths without a trailing separator are concatenated byte for byte, as
+      before. *)
+  let sibling (root : Root.t) (ext : string) : string =
+    let s = Root.to_string root in
+    if String.ends_with ~suffix:Filename.dir_sep s then
+      Filename.concat (Filename.dirname s) (Filename.basename s ^ ext)
+    else s ^ ext
 
   (** Blocking entry point for a durable pack server. A stop signal resolves
       Dream's [~stop] promise; once Dream returns, the repo is closed so the
@@ -91,15 +105,72 @@ module Make_pack (A : Tea_core.App.APP) = struct
       record. The wake is guarded by [is_sleeping], so a second signal (or both
       signals) resolves the promise once. *)
   let serve_pack ?(interface = "localhost") ?(port = 8080) ?client_dir ?rpc ?coalesce ?retention
-      ?lower_root ~(root : Root.t) () : unit =
-    let repo = Lwt_main.run (Store.create ?lower_root root) in
+      ?lower_root ?sessions ~(root : Root.t) () : unit =
+    (* The three durability siblings are three separate paths with no
+       cross-binding, so a restore or a manual wipe can keep some and drop
+       others (DESIGN R20). One direction is silent LOSS rather than the
+       duplicate this system always degrades towards: with the pack root gone
+       but [.guard] and [.secret] surviving, a returning tab's cookie still
+       decrypts to its old session id, hence its old branch name and its old
+       replica id, hence its old guard key. The branch is gone so the model
+       materialises at bottom, but the floor is still there, so the next
+       replayed message is judged Duplicate and dropped onto an empty model.
+       Refusing loudly is the whole fix for the wipe case. A rollback to an
+       OLDER pack snapshot under a NEWER journal is NOT caught here (the root
+       exists), and wants the store-identity token R20 names. *)
+    let guard_dir = sibling root ".guard" in
+    if (not (Sys.file_exists (Root.to_string root))) && Sys.file_exists guard_dir then (
+      Printf.eprintf
+        "tea_server_pack: guard journal orphaned: %s holds delivery floors but the pack root %s does not exist; not serving, because serving would drop returning clients' replays onto empty branches. Remove %s to start clean, or restore the pack root beside it.\n%!"
+        guard_dir (Root.to_string root) guard_dir;
+      exit 1)
+    else
+    (* The preflight (roadmap step 12): an unusable root - a plain existing
+       directory, a missing parent, a file - used to reach irmin-pack raw and
+       die as an uncaught [Pack_error "Invalid_layout"] on this very first
+       line. Refusal is one audible stderr line, no listen, and a NON-ZERO
+       exit: this function returning [unit] would otherwise end the binary at
+       status 0, and a supervisor (systemd [Restart=on-failure], k8s
+       [restartPolicy: OnFailure], a CI gate) cannot tell a root it never
+       opened from a clean shutdown. The raw [Pack_error] it replaced at least
+       exited non-zero. Nothing is created beside a root that was refused, so
+       the error path leaves no .secret and no .guard sibling behind. *)
+    Lwt_main.run (Store.open_root ?lower_root root)
+    |> Result.fold
+         ~error:(fun (e : Store.open_error) ->
+           Printf.eprintf "tea_server_pack: pack root unusable (%s): %s; not serving\n%!"
+             (Root.to_string root) (Store.explain e);
+           exit 1)
+         ~ok:(fun (repo : Store.t) ->
+    (* Resolved AFTER the store opens (an unusable root never leaves a stray
+       .secret beside it) and BEFORE the guard journal, its durability sibling.
+       Both arms are closures applied exactly once: Option.fold's [~none:] is
+       eager, and an eager arm here would mint a secret file even when the
+       caller supplied a back end. Degradation is one audible line and a
+       per-process identity - the same direction as the journal below: a
+       server without durability beats no server. *)
+    let sessions =
+      Option.fold sessions
+        ~none:(fun () ->
+          Session_secret.resolve ~file:(sibling root ".secret") ()
+          |> Result.fold
+               ~ok:(fun (s : Session_secret.t) -> s)
+               ~error:(fun (e : Session_secret.err) ->
+                 Printf.eprintf
+                   "tea_server_pack: session secret unavailable (%s); identity is PER-PROCESS, so a restart lands every tab on a fresh branch\n%!"
+                   (Session_secret.explain e);
+                 Session_secret.memory))
+        ~some:(fun (s : Session_secret.t) () -> s)
+        ()
+    in
+    Printf.eprintf "tea_server_pack: %s\n%!" (Session_secret.describe sessions);
     (* The guard journal lives in a SIBLING directory of the pack root, never
        inside it: whether irmin-pack 3.11 tolerates a foreign file in its root
        across GC and migration is not a bet worth making. A failed open is one
        audible line and a null-sink guard — a server without durability beats
        no server, and the degradation direction is duplicate, never loss. *)
     let guard, journal =
-      Lwt_main.run (Guard_file.open_ ~dir:(Root.to_string root ^ ".guard") ~cap:32768)
+      Lwt_main.run (Guard_file.open_ ~dir:guard_dir ~cap:32768)
       |> Result.fold
            ~ok:(fun
                ((sink, floors, jf) :
@@ -134,7 +205,7 @@ module Make_pack (A : Tea_core.App.APP) = struct
     Lwt_main.run
       (Dream.serve ~interface ~port ~stop
          (Dream.logger
-            (handler_pack ?client_dir ?rpc ?coalesce ?retention ~guard repo)));
+            (handler_pack ?client_dir ?rpc ?coalesce ?retention ~guard ~sessions repo)));
     (* The REPO first, then the journal — the order is load-bearing. Both
        fsync on this path, and a crash between the two closes must land on
        the duplicate side: repo-first leaves commits durable and floors
@@ -147,5 +218,5 @@ module Make_pack (A : Tea_core.App.APP) = struct
     Lwt_main.run
       (let open Lwt.Syntax in
        let* () = Store.close repo in
-       Option.fold journal ~none:Lwt.return_unit ~some:Guard_file.close)
+       Option.fold journal ~none:Lwt.return_unit ~some:Guard_file.close))
 end

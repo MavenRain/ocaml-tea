@@ -24,6 +24,12 @@ module Replay_guard = Replay_guard
 module Guard_sink = Guard_sink
 module Durable_guard = Durable_guard
 
+(** Where a browser's identity lives and for how long (roadmap step 12, D17),
+    re-exported for the same reason: the session id names the Irmin branch and
+    {i is} the CRDT replica id, so choosing a back end is choosing how long a
+    model, its undo history, and its replay floor survive. *)
+module Session_secret = Session_secret
+
 (** The backend-generic handler bodies (roadmap step 8, D2): every current
     handler, router, step, and WS pump, functorized over any
     {!Tea_persist.Store_core.CORE}. [Make] instantiates it over the in-memory
@@ -446,9 +452,23 @@ struct
 
   (** The full request pipeline: session middleware over the security-headers
       middleware over the router. Exposed so tests can drive it with
-      [Dream.test] against an in-memory repo. *)
-  let handler ?client_dir ?rpc ?coalesce ?guard (repo : St.t) : Dream.handler =
-    Dream.memory_sessions
+      [Dream.test] against an in-memory repo.
+
+      [?sessions] chooses where a browser's identity is kept (roadmap step 12,
+      D17). The default is {!Session_secret.memory}, which is
+      [Dream.memory_sessions] - the byte-for-byte step-11 behaviour, so every
+      existing [Dream.test] suite keeps minting a fresh id per process. A
+      durable back end is what makes a session id (hence the Irmin branch name
+      and the CRDT replica id) outlive the process that first issued it. Note
+      that this is a {i per-application} default, not a per-request one: the
+      middleware is built once, when the handler is, so a caller cannot change
+      back ends mid-flight and strand the branches already minted. *)
+  let handler ?client_dir ?rpc ?coalesce ?guard ?(sessions = Session_secret.memory)
+      (repo : St.t) : Dream.handler =
+    (* Sessions OUTSIDE the security headers, exactly as before: the header
+       middleware decorates whatever response comes back, including the
+       redirects and 403s the session layer itself can produce. *)
+    Session_secret.middleware sessions
       (secure_headers (router ?client_dir ?rpc ?coalesce ?guard repo))
 
   (** Blocking entry point for a native server binary. [?coalesce] is the
@@ -464,9 +484,21 @@ module Make (A : Tea_core.App.APP) = struct
   module Store = Tea_persist.Store.Make (A)
   include Handlers (A) (Store)
 
-  let serve ?(interface = "localhost") ?(port = 8080) ?client_dir ?rpc ?coalesce () : unit =
+  (** Deliberately NO [?sessions] (roadmap step 12, D17). "Identity durability
+      must never exceed model durability" is the rule, and this is the one
+      entry point where the two could be paired the wrong way round: a durable
+      cookie over a store that dies with the process would hand a returning tab
+      back its old session id, hence its old branch name and its old CRDT
+      replica id, over a store rebuilt empty, reusing a replica id against a
+      reset causal clock. Leaving the argument off makes the rule structural
+      here rather than merely a default. {!Handlers.handler} keeps [?sessions],
+      because {!Tea_server_pack.Make_pack.serve_pack} genuinely needs it and
+      {!Tea_server_pack.Make_pack} pairs it with a durable store. *)
+  let serve ?(interface = "localhost") ?(port = 8080) ?client_dir ?rpc ?coalesce ()
+      : unit =
     let repo = Lwt_main.run (Store.create ()) in
-    Dream.run ~interface ~port (Dream.logger (handler ?client_dir ?rpc ?coalesce repo))
+    Dream.run ~interface ~port
+      (Dream.logger (handler ?client_dir ?rpc ?coalesce repo))
 end
 
 (** Request-body admission (roadmap step 8, D11): a size cap enforced {i while}

@@ -47,6 +47,53 @@ module Make (A : Tea_core.App.APP) : sig
       pre-checkpoint commits stay readable ([Gc.behaviour] becomes [`Archive]).
       Omitted, GC deletes (D5). *)
 
+  type open_error =
+    | Root_parent_missing of string
+        (** the root's parent directory is absent (payload: the parent), so
+            the single [mkdir] the backend does would fail with ENOENT. *)
+    | Root_not_a_directory of string
+        (** the root path exists and is a regular file or other
+            non-directory. *)
+    | Root_not_a_pack_store of string
+        (** the directory exists but holds neither [store.control] nor
+            [store.pack], so irmin-pack answers [Invalid_layout] by raising. *)
+    | Backend_failed of string
+        (** [Printexc.to_string] of anything irmin-pack still raised past the
+            preflight (corrupt control file, migration needed, a store from
+            the future, or a lost classification race). The payload is a
+            string for the same reason [Guard_file.open_err]'s is: irmin-pack's
+            own error type is an OPEN polymorphic variant with 40-odd cases,
+            which no exhaustive match can consume. *)
+
+  val open_root :
+    ?now:(unit -> int64) ->
+    ?lower_root:string ->
+    ?exploded:exploder ->
+    Root.t ->
+    (t, open_error) result Lwt.t
+  (** {!create} with a total preflight and a catching seam, so an unusable
+      root is a value rather than an uncaught [Pack_error] killing the
+      process (roadmap step 12). Behaviour on every working path
+      (parent-exists/leaf-missing create, reopen, an existing [lower_root])
+      is bit-identical to {!create}, which is left in place unchanged for
+      the tests that own their scratch roots.
+
+      The preflight classifies with [Irmin_pack_unix.Io.Unix.classify_path]
+      (total, never raises) and accepts an existing directory only if
+      [store.control] or [store.pack] is a file - the [store.pack] arm keeps
+      today's v1/v2 auto-migration reachable. The [Lwt.catch] is required
+      {i as well as} the preflight: classification is racy and several
+      irmin-pack failures are unclassifiable from outside. *)
+
+  val explain : open_error -> string
+  (** One operator-facing sentence per constructor, each naming the path it
+      carries and the remedy it wants. Keeping the match here means a new
+      constructor is a compile error in one place, and it keeps callers from
+      pasting every payload into a single template: [Root_parent_missing]
+      carries the PARENT, not the root, and the two directory refusals want
+      opposite fixes. The sentence is a fragment, meant to be embedded (the
+      caller supplies the subject and the consequence). *)
+
   val gc_behaviour : t -> [ `Archive | `Delete ]
   (** [`Archive] when a [lower_root] was configured (GC moves discarded data to
       the lower layer), [`Delete] otherwise. Observable without running a GC. *)

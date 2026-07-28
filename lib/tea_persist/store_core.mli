@@ -150,15 +150,25 @@ module type CORE = sig
       Returns the number removed (D3).
 
       [?forget] is called with each victim's session id {i before} its branch
-      is removed (default: nothing — today's behaviour exactly). {b Hard
-      precondition when a durable replay guard is live} (roadmap step 11,
-      D16): a server wiring [reap] in {b must} pass
-      [Tea_server.Durable_guard.forget] here, because a guard floor that
+      is removed (default: nothing, today's behaviour exactly, and the
+      {b unsafe} default). {b Hard precondition when a durable replay guard
+      is live} (roadmap step 11, D16): a server wiring [reap] in {b must}
+      pass [Tea_server.Durable_guard.forget] here, because a guard floor that
       outlives its branch converts every replay onto the recreated branch
       into a [Duplicate] against a stale high water — total silent loss onto
       an empty model, the one loss-side path in the guard's degradation
       (stated on [Tea_server.Replay_guard.forget], closed here by ordering:
-      tombstone first, then removal). *)
+      tombstone first, then removal).
+
+      Since roadmap step 12 made session identity durable, this precondition
+      is LIVE rather than theoretical: a client can now return to a branch
+      that was reaped weeks earlier. [?forget] defaulting to a no-op therefore
+      makes the UNSAFE wiring the SHORTER one. Reap without forget leaves a
+      floor over a branch that no longer exists, and the returning client's
+      replay is judged [Duplicate] against an empty model - total silent loss.
+      Reap WITH forget is sound but not free of surprise: the replay reads
+      [Fresh] (a first sighting is accepted whatever its seq) and applies once
+      onto [bottom], so the client observes a rollback followed by one edit. *)
 
   (** Commit coalescing (R1): fold a run of chatty Msgs into one commit by
       amending the head — same parents, new tree, relabelled — while the

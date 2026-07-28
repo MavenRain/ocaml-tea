@@ -13,8 +13,12 @@ Each mutation names the checks it is expected to break; anything else going red
   python3 test/browser/mutate.py          # run every mutation
   python3 test/browser/mutate.py M2       # run one
 
-Restores the tree with `git checkout --` after each mutation, so an interrupted
-run leaves at most one mutation live - check `git status` if it dies.
+Restores each mutated file from an in-memory copy of its pre-mutation bytes,
+NEVER `git checkout --`: on a working tree carrying uncommitted work, checkout
+restores the HEAD version and silently destroys the unstaged changes (measured,
+not theoretical - it reverted an uncommitted tea_server_pack.ml mid-sweep). An
+interrupted run still leaves at most one mutation live - check `git status`
+if it dies.
 """
 
 import re
@@ -51,6 +55,7 @@ MUTATIONS = [
             "tab A's first edit reaches tab B",
             "the click lands while its Ack is dropped",
             "first click commits and streams to the observer",
+            "life 1 commits one click under its own secret",
         ],
     },
     {
@@ -80,13 +85,14 @@ MUTATIONS = [
         "old": 'class_ "count"',
         "new": 'class_ "count-renamed"',
         # The count element is the mount gate for EVERY counter-based scenario,
-        # so renaming its class strands B1-B4 at their own mount waits as well.
+        # so renaming its class strands B1-B5 at their own mount waits as well.
         "expect_red": [
             "counter: scenario ran to completion",
             "replay B1: scenario ran to completion",
             "replay B2: scenario ran to completion",
             "replay B3: scenario ran to completion",
             "durable B4: scenario ran to completion",
+            "secret B5: scenario ran to completion",
         ],
     },
     # --- step 11 (D16): the delivery scenarios B1-B4 -------------------------
@@ -138,15 +144,35 @@ MUTATIONS = [
         # 0 + a replayed 1 is indistinguishable from the real guarantee.
         "old": "Pack_server.serve_pack ~port ?client_dir ~root:(Tea_server_pack.Root.v root) ())",
         "new": 'Pack_server.serve_pack ~port ?client_dir ~root:(Tea_server_pack.Root.v (Random.self_init (); root ^ "-" ^ string_of_int (Random.int 1000000))) ())',
-        # BLOCKED on the session-identity gap that B4 now pins. A restart
-        # already lands on a fresh branch under a fresh replica (Dream's
-        # memory-backed sessions lose the session id), so the honest world and
-        # this mutated one BOTH leave the restarted server holding 1: the
-        # mutation is currently unobservable, and running it would report a
-        # MISS that says nothing about vacuity. Unblocks the day session
-        # identity survives a restart, which is also the day B4's pin reddens.
-        "blocked": "session identity is not durable; see B4's PIN in smoke.mjs",
-        "expect_red": ["the RESTARTED SERVER itself holds 2"],
+        # UNBLOCKED by step 12 (D17): session identity is durable, so the
+        # restarted server consults the journal and this mutation is finally
+        # observable. It is now COMPOUND: the fresh root moves <root>.secret
+        # too (serve_pack resolves the secret beside the root), so life 2 also
+        # mints a fresh secret and refuses life 1's cookie - its red means
+        # "store OR identity lost", and mut-journal-unwired is the
+        # discriminating half. Every red must be named or the driver calls it
+        # STRAY: the secret is no longer at <root>.secret (the harness stats
+        # the unsuffixed path), the SSR read with the pinned life-1 cookie is
+        # refused (Set-Cookie reissue), the verdict lands on the lost-identity
+        # arm (0), and B6's existing empty dir gains a random-suffixed leaf
+        # whose parent exists, so the preflight rightly accepts it and B6's
+        # refusal never prints - which costs B6 its exit-status check too,
+        # since an accepted root SERVES rather than exiting.
+        # B7 is collateral for the same reason: its TEA_ROOT gains a suffix,
+        # so the surviving <root>.guard is no longer the mutated root's
+        # sibling, the orphan pair is not recognised, and the server serves.
+        # Its "not a crash" check is the one B7 check that stays green (a
+        # server that runs prints no uncaught exception).
+        "expect_red": [
+            "the durable secret is on disk at <root>.secret",
+            "life 2 ADOPTS the presented session cookie",
+            "the RESTARTED SERVER itself holds 2",
+            "preflight B6: an unusable TEA_ROOT is refused",
+            "preflight B6: the refusal exits NON-ZERO",
+            "orphan B7: a surviving <root>.guard beside a missing pack root is refused",
+            "orphan B7: the refusal exits NON-ZERO",
+            "orphan B7: the server never became usable",
+        ],
     },
     {
         "id": "mut-journal-unwired",
@@ -159,17 +185,98 @@ MUTATIONS = [
         # their path - so they MUST stay green under this mutation.
         "old": "~tabs:Replay_guard.default_tabs ~sink ~floors",
         "new": "~tabs:Replay_guard.default_tabs ~sink:(ignore sink; Guard_sink.null) ~floors:(ignore floors; Durable_guard.Floors.empty)",
-        # BLOCKED on the same session-identity gap as mut-b4-fresh-root, and
-        # for a sharper reason: a restart already lands on a fresh replica, so
-        # the journalled floor is never consulted no matter what sink wrote it.
-        # Unwiring the journal is therefore unobservable end to end (measured:
-        # zero reds). It DID score a red in the first sweep, but only against
-        # B4's old client-rendered assertion, which the join makes unreliable -
-        # that red was not evidence either. The journal's effect is covered in
-        # process instead, where durable_guard_test/exactly_once_test pin it and
-        # the OCaml sweep confirmed it. Unblocks when B4's pin reddens.
-        "blocked": "session identity is not durable, so no restart consults the journal; see B4's PIN",
+        # UNBLOCKED by step 12 (D17). This is the DISCRIMINATING half of the
+        # B4 verdict: the store and the identity both survive (same root, same
+        # <root>.secret, cookie adopted with no reissue), only the floor is
+        # lost, so the replayed seq 2 reads Fresh and double-applies - the
+        # restarted server reads 3, the lost-floor arm. Exactly one check
+        # reddens; adoption and the on-disk secret stay green, which is what
+        # separates this red from mut-b4-fresh-root's compound one.
         "expect_red": ["the RESTARTED SERVER itself holds 2"],
+    },
+    # --- step 12 (D17): durable session identity ----------------------------
+    {
+        "id": "mut-secret-per-boot",
+        "why": "B4's identity really rides ONE on-disk secret: a per-boot secret path is the D16 bug wearing a hat",
+        "file": "lib/tea_server_pack/tea_server_pack.ml",
+        # Each life resolves (and mints) its own <root>.secret-<pid>, so life 2
+        # cannot decrypt life 1's cookie and the restart loses identity while
+        # the store and the journal both survive - exactly the pre-step-12
+        # world. The harness stats the unsuffixed <root>.secret, so that check
+        # reddens too, and every red must be named or it counts as STRAY.
+        # The path is built by the [sibling] helper now (it keeps .secret and
+        # .guard OUTSIDE a root spelled with a trailing separator), so the
+        # anchor follows it there. The mutation is unchanged in intent: suffix
+        # the resolved file with the pid so every life mints its own.
+        "old": 'Session_secret.resolve ~file:(sibling root ".secret") ()',
+        "new": 'Session_secret.resolve ~file:(sibling root ".secret" ^ "-" ^ string_of_int (Unix.getpid ())) ()',
+        "expect_red": [
+            "the durable secret is on disk at <root>.secret",
+            "life 2 ADOPTS the presented session cookie",
+            "the RESTARTED SERVER itself holds 2",
+        ],
+    },
+    {
+        "id": "mut-secret-env-ignored",
+        "why": "B5's anti-vacuity partner: with TEA_SECRET ignored both lives fall to one file and identity wrongly survives a secret change",
+        "file": "lib/tea_server/session_secret.ml",
+        # B5 sets DIFFERENT explicit TEA_SECRET values per life; ignoring the
+        # variable drops both lives onto the same <root>.secret file, so life 2
+        # adopts the cookie it was meant to refuse: no Set-Cookie reissue and
+        # the server-rendered count survives as 1 instead of resetting to 0.
+        # B4 never sets TEA_SECRET (the harness strips it), so B4 stays green -
+        # which is the point: this red belongs to B5 alone.
+        # The source reads the variable through its own [env_opt] alias
+        # (which maps "" to None), not Sys.getenv_opt directly.
+        "old": "env_opt env_var",
+        "new": "(ignore env_var; None)",
+        "expect_red": [
+            "life 2 with a different TEA_SECRET reissues a Set-Cookie",
+            "two lives with different TEA_SECRET do NOT share the session",
+        ],
+    },
+    # --- the refusal scenarios B6 and B7 ------------------------------------
+    #
+    # Both refusals are two claims, not one: the audible stderr line AND the
+    # non-zero status. The line alone is what an operator reads; the status is
+    # what a supervisor reads, and it is the half a `unit`-returning arm
+    # silently drops. So each gets a mutation that leaves one half intact and
+    # kills the other, which is what keeps the two checks from covering for
+    # each other.
+    {
+        "id": "mut-preflight-exit-zero",
+        "why": "B6's status check is real: a preflight that prints and returns unit ends the binary at 0, and no supervisor can tell that from a clean shutdown",
+        "file": "lib/tea_server_pack/tea_server_pack.ml",
+        # There are TWO `exit 1)` in this file now (the orphan refusal above it
+        # and this one), so the anchor carries the preceding Printf argument
+        # line to stay unique - apply_mutation refuses anything that matches
+        # more than once, but a silently-relocated mutation would be worse.
+        # The eprintf is deliberately KEPT: the stderr check must stay green,
+        # so the only red is the status one.
+        "old": "             (Root.to_string root) (Store.explain e);\n           exit 1)",
+        "new": "             (Root.to_string root) (Store.explain e);\n           ())",
+        "expect_red": ["preflight B6: the refusal exits NON-ZERO"],
+    },
+    {
+        "id": "mut-orphan-check-disabled",
+        "why": "B7 is real: with the orphan check disabled the server happily serves a surviving journal over a wiped store, which is the SILENT LOSS path (a replay judged Duplicate against an empty model)",
+        "file": "lib/tea_server_pack/tea_server_pack.ml",
+        # `false &&` rather than deleting the branch: guard_dir and root stay
+        # used, so the mutation cannot die at compile time and prove typing
+        # instead of observation (the M2 lesson).
+        "old": "if (not (Sys.file_exists (Root.to_string root))) && Sys.file_exists guard_dir then (",
+        "new": "if false && (not (Sys.file_exists (Root.to_string root))) && Sys.file_exists guard_dir then (",
+        # With the check disabled the root is merely missing under an existing
+        # parent, which the preflight rightly ACCEPTS (it creates the store),
+        # so the server serves: no orphan line, no exit at all. Three of B7's
+        # four checks redden. The fourth ("not an uncaught exception") stays
+        # green by construction - a server that runs prints no Fatal error -
+        # which is exactly why it is a separate check rather than a conjunct.
+        "expect_red": [
+            "orphan B7: a surviving <root>.guard beside a missing pack root is refused",
+            "orphan B7: the refusal exits NON-ZERO",
+            "orphan B7: the server never became usable",
+        ],
     },
 ]
 
@@ -186,12 +293,14 @@ def smoke():
 
 
 def apply_mutation(m):
+    """Apply and return (original_text, error): the caller restores from the
+    returned text, never from git."""
     path = REPO / m["file"]
     src = path.read_text()
     if src.count(m["old"]) != 1:
-        return f"anchor {m['old']!r} occurs {src.count(m['old'])} times in {m['file']}, expected 1"
+        return None, f"anchor {m['old']!r} occurs {src.count(m['old'])} times in {m['file']}, expected 1"
     path.write_text(src.replace(m["old"], m["new"]))
-    return None
+    return src, None
 
 
 def main():
@@ -217,7 +326,7 @@ def main():
 
     verdicts = []
     for m in chosen:
-        err = apply_mutation(m)
+        original, err = apply_mutation(m)
         try:
             if err:
                 verdicts.append((m["id"], False, err))
@@ -239,7 +348,8 @@ def main():
                 detail += f"; STRAY {[s[:60] for s in stray]}"
             verdicts.append((m["id"], ok, detail))
         finally:
-            run(["git", "checkout", "--", m["file"]])
+            if original is not None:
+                (REPO / m["file"]).write_text(original)
 
     run(["opam", "exec", "--switch=irmin-tea", "--", "dune", "build"])
     print()
