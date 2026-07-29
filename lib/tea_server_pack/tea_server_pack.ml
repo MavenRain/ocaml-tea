@@ -116,8 +116,14 @@ module Make_pack (A : Tea_core.App.APP) = struct
        materialises at bottom, but the floor is still there, so the next
        replayed message is judged Duplicate and dropped onto an empty model.
        Refusing loudly is the whole fix for the wipe case. A rollback to an
-       OLDER pack snapshot under a NEWER journal is NOT caught here (the root
-       exists), and wants the store-identity token R20 names. *)
+       OLDER pack snapshot under a NEWER journal leaves the root present, so
+       this preflight cannot see it; that case is caught below instead, at
+       guard-open time: every floor carries the store water it was taken
+       under, and the boot filter drops floors the restored branch heads no
+       longer cover — an audible drop, after which the replays land Fresh
+       (visible duplicates, never silent loss). What ordering cannot answer
+       is IDENTITY: a DIFFERENT store whose same-named branch stands at a
+       newer head passes the filter (DESIGN R20a residual). *)
     let guard_dir = sibling root ".guard" in
     if (not (Sys.file_exists (Root.to_string root))) && Sys.file_exists guard_dir then (
       Printf.eprintf
@@ -170,12 +176,41 @@ module Make_pack (A : Tea_core.App.APP) = struct
        audible line and a null-sink guard — a server without durability beats
        no server, and the degradation direction is duplicate, never loss. *)
     let guard, journal =
-      Lwt_main.run (Guard_file.open_ ~dir:guard_dir ~cap:32768)
+      Lwt_main.run
+        (let open Lwt.Syntax in
+         (* One branch_waters read, taken between the store open and the
+            guard open, feeds the boot filter: the journal's floors are
+            checked against the heads THIS boot will actually serve from. *)
+         let* waters = Store.branch_waters repo in
+         Guard_file.open_ ~dir:guard_dir ~cap:32768
+           ~head_water:(Guard_file.head_water_of_list waters))
       |> Result.fold
            ~ok:(fun
-               ((sink, floors, jf) :
-                 Guard_sink.t * Durable_guard.Floors.t * Guard_file.t)
+               ((sink, floors, verdict, jf) :
+                 Guard_sink.t
+                 * Durable_guard.Floors.t
+                 * Guard_file.verdict
+                 * Guard_file.t)
              ->
+             let { Guard_file.kept = (_ : int)
+                 ; dropped_behind
+                 ; dropped_no_branch
+                 ; unwitnessed
+                 } =
+               verdict
+             in
+             (if dropped_behind > 0 then
+                Printf.eprintf
+                  "tea_server_pack: dropped %d delivery floor(s) standing ABOVE their branch heads: the pack root is OLDER than the guard journal (a restored snapshot, a rolled-back store); the affected replays will re-apply as visible duplicates rather than be silently lost\n%!"
+                  dropped_behind);
+             (if dropped_no_branch > 0 then
+                Printf.eprintf
+                  "tea_server_pack: dropped %d delivery floor(s) with an unreadable or absent branch head — a collected, reaped, or never-written branch (routine after checkpoint GC), or a pack root restored from BEFORE the branch existed; either way the affected replays re-apply as visible duplicates rather than be silently lost\n%!"
+                  dropped_no_branch);
+             (if unwitnessed > 0 then
+                Printf.eprintf
+                  "tea_server_pack: adopted %d delivery floor(s) with no store witness (pre-step-13 journal); this boot is NOT protected against a restored-older pack root\n%!"
+                  unwitnessed);
              ( Durable_guard.v ~sessions:Replay_guard.default_sessions
                  ~tabs:Replay_guard.default_tabs ~sink ~floors
              , Some jf ))

@@ -17,6 +17,7 @@ module Codec = Sink.Codec
 module Msg_seq = Tea_core.Prim.Msg_seq
 module Tab_id = Tea_core.Prim.Tab_id
 module Replica = Tea_core.Crdt.Replica
+module Water = Tea_core.Prim.Store_water
 
 let check (name : string) (cond : bool) : unit =
   if cond then Printf.printf "ok   - %s\n%!" name
@@ -49,21 +50,26 @@ let tab (n : int) : Tab_id.t =
 let seq (n : int) : Msg_seq.t =
   must (Printf.sprintf "Msg_seq.of_int refused %d" n) (Msg_seq.of_int n)
 
+(** A non-bottom store water, so the quad round-trips below actually pin the
+    stamp and not just its default. *)
+let water (n : int) : Water.t = Water.of_date (Int64.of_int n)
+
 (** Structural event equality, every constructor pair spelled out. *)
 let event_equal (a : Sink.event) (b : Sink.event) : bool =
   match (a, b) with
-  | ( Sink.Advance { replica = ra; tab = ta; seq = sa },
-      Sink.Advance { replica = rb; tab = tb; seq = sb } ) ->
+  | ( Sink.Advance { replica = ra; tab = ta; seq = sa; water = wa },
+      Sink.Advance { replica = rb; tab = tb; seq = sb; water = wb } ) ->
     Replica.equal ra rb
     && Int.equal (Tab_id.compare ta tb) 0
     && Int.equal (Msg_seq.to_int sa) (Msg_seq.to_int sb)
+    && Water.equal wa wb
   | Sink.Forget { replica = ra }, Sink.Forget { replica = rb } ->
     Replica.equal ra rb
-  | Sink.Advance { replica = _; tab = _; seq = _ }, Sink.Forget { replica = _ }
-    ->
+  | ( Sink.Advance { replica = _; tab = _; seq = _; water = _ },
+      Sink.Forget { replica = _ } ) ->
     false
-  | Sink.Forget { replica = _ }, Sink.Advance { replica = _; tab = _; seq = _ }
-    ->
+  | ( Sink.Forget { replica = _ },
+      Sink.Advance { replica = _; tab = _; seq = _; water = _ } ) ->
     false
 
 (** [Ok] with exactly this event and this next offset. *)
@@ -160,20 +166,27 @@ let () =
     (Int32.equal (local_crc32 "123456789") 0xCBF43926l);
   let frame =
     Codec.to_bytes
-      (Sink.Advance { replica = replica "crc-pin"; tab = tab 1; seq = seq 7 })
+      (Sink.Advance
+         { replica = replica "crc-pin"; tab = tab 1; seq = seq 7; water = water 70 })
   in
   let total = String.length frame in
   let body = String.sub frame 4 (total - 8) in
   check "the length header counts exactly tag plus payload"
     (Int.equal (Int32.to_int (String.get_int32_be frame 0)) (total - 8));
   check "the trailing crc equals an independent crc32 of the body span"
-    (Int32.equal (String.get_int32_be frame (total - 4)) (local_crc32 body))
+    (Int32.equal (String.get_int32_be frame (total - 4)) (local_crc32 body));
+  (* C3: the writer's tag byte itself. Round-trips and the legacy pin both
+     pass under a codec that quietly kept WRITING tag-1 triples; only the
+     leading body byte says the wire really carries the quad frame. *)
+  check "an encoded Advance leads with tag 3, never the legacy triple"
+    (String.starts_with ~prefix:"\003" body)
 
 (* --- 2. Round-trips -------------------------------------------------------- *)
 
 let () =
   let adv =
-    Sink.Advance { replica = replica "round"; tab = tab 2; seq = seq 41 }
+    Sink.Advance
+      { replica = replica "round"; tab = tab 2; seq = seq 41; water = water 410 }
   in
   let fadv = Codec.to_bytes adv in
   check "Advance round-trips and next lands on the frame end"
@@ -195,6 +208,7 @@ let gen_event (state : int64 ref) : Sink.event =
       { replica = r
       ; tab = tab (draw state ~bound:1000)
       ; seq = seq (1 + draw state ~bound:1_000_000)
+      ; water = water (draw state ~bound:1_000_000)
       }
 
 (** Decode a whole stream by threading [next]; [None] on any error. *)
@@ -227,9 +241,15 @@ let () =
    performs. *)
 
 let () =
-  let e1 = Sink.Advance { replica = replica "torn-a"; tab = tab 11; seq = seq 3 } in
+  let e1 =
+    Sink.Advance
+      { replica = replica "torn-a"; tab = tab 11; seq = seq 3; water = water 30 }
+  in
   let e2 = Sink.Forget { replica = replica "torn-b" } in
-  let e3 = Sink.Advance { replica = replica "torn-c"; tab = tab 12; seq = seq 9 } in
+  let e3 =
+    Sink.Advance
+      { replica = replica "torn-c"; tab = tab 12; seq = seq 9; water = water 90 }
+  in
   let f1 = Codec.to_bytes e1 in
   let f2 = Codec.to_bytes e2 in
   let f3 = Codec.to_bytes e3 in
@@ -268,7 +288,8 @@ let () =
 let () =
   let frame =
     Codec.to_bytes
-      (Sink.Advance { replica = replica "flip"; tab = tab 21; seq = seq 5 })
+      (Sink.Advance
+         { replica = replica "flip"; tab = tab 21; seq = seq 5; water = water 50 })
   in
   (* Index 6 sits inside the payload (body starts at 4, tag at 4). *)
   let flipped =
@@ -294,10 +315,10 @@ let () =
 
    The decode path re-validates the client-chosen fields through the same
    mints the pump uses, so a corrupt-but-CRC-valid journal cannot hand the
-   guard an inhabitant the wire could not. We craft Advance bodies with the
-   same Repr triple the codec uses (a drift in that witness breaks the
-   round-trip pins above, so borrowing it here is safe) and plant one field
-   each mint must refuse: a non-positive seq, a non-hex tab. *)
+   guard an inhabitant the wire could not. We craft bodies under the LEGACY
+   tag 1 triple (the pre-step-13 Advance: decoded forever, written never) and
+   plant one field each mint must refuse — both Advance arms share one
+   validator, so the refusals pinned here cover the tag 3 quad too. *)
 
 let advance_body_t : (Replica.t * string * int) Repr.t =
   Repr.(triple Replica.t string int)
@@ -316,7 +337,19 @@ let () =
     frame_of_body ("\001" ^ encode_advance_raw (r, "not-32-hex-chars", 5))
   in
   check "a crafted Advance with a non-hex tab is Bad_field tab"
-    (is_bad_field (Codec.of_bytes bad_tab ~pos:0) ~field:"tab")
+    (is_bad_field (Codec.of_bytes bad_tab ~pos:0) ~field:"tab");
+  (* The upgrade path itself: a valid pre-step-13 frame must decode — at
+     water bottom, the "no witness" claim — or an upgraded server would drop
+     every floor it had already earned. *)
+  let legacy =
+    frame_of_body ("\001" ^ encode_advance_raw (r, Tab_id.to_string (tab 3), 5))
+  in
+  check "a valid legacy tag 1 triple decodes at water bottom"
+    (decodes_to legacy ~pos:0
+       ~expect:
+         (Sink.Advance
+            { replica = r; tab = tab 3; seq = seq 5; water = Water.bottom })
+       ~next:(String.length legacy))
 
 (* --- 8. The sinks ---------------------------------------------------------- *)
 
@@ -331,9 +364,15 @@ let append_ok (s : Sink.t) (e : Sink.event) : bool =
     ~error:(fun (_ : Sink.err) -> false)
 
 let () =
-  let a = Sink.Advance { replica = replica "sink"; tab = tab 31; seq = seq 1 } in
+  let a =
+    Sink.Advance
+      { replica = replica "sink"; tab = tab 31; seq = seq 1; water = water 10 }
+  in
   let b = Sink.Forget { replica = replica "sink" } in
-  let c = Sink.Advance { replica = replica "sink"; tab = tab 32; seq = seq 2 } in
+  let c =
+    Sink.Advance
+      { replica = replica "sink"; tab = tab 32; seq = seq 2; water = water 20 }
+  in
   check "the null sink accepts every event" (append_ok Sink.null a && append_ok Sink.null b);
   let sink, read = Sink.memory () in
   check "memory records appends oldest-first"

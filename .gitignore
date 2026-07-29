@@ -25,3 +25,6 @@ _irmin/
 # Node (browser smoke-test harness deps; the Chromium binary lives in ~/.cache)
 node_modules/
 package-lock.json
+
+# Python (mutate.py bytecode)
+__pycache__/

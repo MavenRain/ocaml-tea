@@ -25,6 +25,7 @@ module Guard = Tea_server.Replay_guard
 module Sink = Tea_server.Guard_sink
 module Msg_seq = Tea_core.Prim.Msg_seq
 module Tab_id = Tea_core.Prim.Tab_id
+module Water = Tea_core.Prim.Store_water
 
 (** One assertion: TAP-ish line per check, exit nonzero on the first failure. *)
 let check name cond =
@@ -119,12 +120,21 @@ let event_tag (e : Sink.event) : string =
       { replica = (_ : Tea_core.Crdt.Replica.t)
       ; tab = (_ : Tab_id.t)
       ; seq = s
+      ; water = (_ : Water.t)
       } -> Printf.sprintf "advance:%d" (Msg_seq.to_int s)
   | Sink.Forget { replica = (_ : Tea_core.Crdt.Replica.t) } -> "forget"
 
-(** An [Advance] record, spelled once for the algebra tests. *)
+(** An [Advance] record, spelled once for the algebra tests; the seq algebra
+    is stamp-independent, so these carry [bottom]. *)
 let adv (r : Tea_core.Crdt.Replica.t) (t : Tab_id.t) (n : int) : Sink.event =
-  Sink.Advance { replica = r; tab = t; seq = seq n }
+  Sink.Advance { replica = r; tab = t; seq = seq n; water = Water.bottom }
+
+(** A stamped [Advance] and a water mint, for the tie-break pins. *)
+let water (n : int) : Water.t = Water.of_date (Int64.of_int n)
+
+let adv_w (r : Tea_core.Crdt.Replica.t) (t : Tab_id.t) (n : int) (w : Water.t) :
+    Sink.event =
+  Sink.Advance { replica = r; tab = t; seq = seq n; water = w }
 
 (** The sink whose every append fails: the backend-down world, where the only
     acceptable degradation is the duplicate direction. *)
@@ -146,6 +156,39 @@ let () =
   check "a lower Advance never lowers a floor: the max wins"
     (floor_is (Dg.Floors.find ~replica:r ~tab:t f2) ~at:5);
   let f3 = Dg.Floors.apply f2 (adv r t 7) in
+  let stamped_is (fl : Dg.Floors.t) ~(at : int) ~(w : Water.t) : bool =
+    Dg.Floors.find_stamped ~replica:r ~tab:t fl
+    |> Option.fold ~none:false
+         ~some:(fun ((s, got) : Msg_seq.t * Water.t) ->
+           Int.equal (Msg_seq.to_int s) at && Water.equal got w)
+  in
+  (* The stamp fold (step 13, revised in review): the seq only rises AND
+     the witness never drowns. A later record can carry a LOWER water only
+     as a witness-less take (a no-op or fuel-exhausted message mints
+     [bottom]; a real re-persist on a monotone branch mints strictly
+     higher), and adopting it verbatim would de-witness the tab:
+     kept-on-trust at boot where the elder stamp would have read
+     [dropped_behind] — the silent-loss direction. *)
+  check "equal-seq records: the stronger witness wins, whichever is later"
+    (stamped_is
+       (Dg.Floors.of_events [ adv_w r t 3 (water 100); adv_w r t 3 (water 2) ])
+       ~at:3 ~w:(water 100)
+    && stamped_is
+         (Dg.Floors.of_events [ adv_w r t 3 (water 2); adv_w r t 3 (water 100) ])
+         ~at:3 ~w:(water 100));
+  check "a lower seq changes neither floor nor stamp"
+    (stamped_is
+       (Dg.Floors.of_events [ adv_w r t 5 (water 50); adv_w r t 3 (water 999) ])
+       ~at:5 ~w:(water 50));
+  check "a higher seq raises the floor but never drowns the witness"
+    (stamped_is
+       (Dg.Floors.of_events [ adv_w r t 5 (water 50); adv_w r t 7 (water 1) ])
+       ~at:7 ~w:(water 50));
+  check
+    "a witness-less take (no-op, fuel exhaustion) never de-witnesses the tab"
+    (stamped_is
+       (Dg.Floors.of_events [ adv_w r t 9 (water 77); adv r t 10 ])
+       ~at:10 ~w:(water 77));
   check "a higher Advance raises the floor"
     (floor_is (Dg.Floors.find ~replica:r ~tab:t f3) ~at:7)
 
@@ -192,7 +235,7 @@ let () =
   let life1 = guard ~sink:sink1 ~floors:Dg.Floors.empty in
   let consume (n : int) : bool =
     is_fresh (Dg.take life1 ~replica:r ~tab:t ~seq:(seq n)) ~at:n
-    && Result.is_ok (Lwt_main.run (Dg.persist life1 ~replica:r ~tab:t ~seq:(seq n)))
+    && Result.is_ok (Lwt_main.run (Dg.persist life1 ~replica:r ~tab:t ~seq:(seq n) ~water:Water.bottom))
   in
   check "life 1 consumes and persists seqs 1..3" (List.for_all consume [ 1; 2; 3 ]);
   let life2 = guard ~sink:Sink.null ~floors:(Dg.Floors.of_events (reader ())) in
@@ -214,7 +257,7 @@ let () =
   let life1 = guard ~sink:Sink.null ~floors:Dg.Floors.empty in
   let consume (n : int) : bool =
     is_fresh (Dg.take life1 ~replica:r ~tab:t ~seq:(seq n)) ~at:n
-    && Result.is_ok (Lwt_main.run (Dg.persist life1 ~replica:r ~tab:t ~seq:(seq n)))
+    && Result.is_ok (Lwt_main.run (Dg.persist life1 ~replica:r ~tab:t ~seq:(seq n) ~water:Water.bottom))
   in
   check "the null-sink life consumes and persists seqs 1..3 too"
     (List.for_all consume [ 1; 2; 3 ]);
@@ -250,7 +293,7 @@ let () =
   let g = Dg.v ~sessions:(bound 4) ~tabs:(bound 1) ~sink ~floors:Dg.Floors.empty in
   check "tab 1 lands its first seq and persists it"
     (is_fresh (Dg.take g ~replica:r ~tab:(tab 1) ~seq:(seq 1)) ~at:1
-    && Result.is_ok (Lwt_main.run (Dg.persist g ~replica:r ~tab:(tab 1) ~seq:(seq 1))));
+    && Result.is_ok (Lwt_main.run (Dg.persist g ~replica:r ~tab:(tab 1) ~seq:(seq 1) ~water:Water.bottom)));
   check "taking tab 2 under a bound of one genuinely evicts tab 1 from the Cell"
     (is_fresh (Dg.take g ~replica:r ~tab:(tab 2) ~seq:(seq 1)) ~at:1
     && Option.is_none (Guard.high_water (Dg.snapshot g) ~replica:r ~tab:(tab 1)));
@@ -266,7 +309,7 @@ let () =
   let g = guard ~sink ~floors:Dg.Floors.empty in
   check "the setup take and persist land"
     (is_fresh (Dg.take g ~replica:r ~tab:t ~seq:(seq 1)) ~at:1
-    && Result.is_ok (Lwt_main.run (Dg.persist g ~replica:r ~tab:t ~seq:(seq 1))));
+    && Result.is_ok (Lwt_main.run (Dg.persist g ~replica:r ~tab:t ~seq:(seq 1) ~water:Water.bottom)));
   check "a seq beyond high water + 1 is gapped"
     (is_gapped (Dg.take g ~replica:r ~tab:t ~seq:(seq 7)));
   (* The caller never persists a Gapped verdict, so with no persist call after
@@ -289,7 +332,7 @@ let () =
   check "the take is fresh before the backend has any say"
     (is_fresh (Dg.take g ~replica:r ~tab:t ~seq:(seq 1)) ~at:1);
   check "a failing append surfaces as Error Io"
-    (is_io_error (Lwt_main.run (Dg.persist g ~replica:r ~tab:t ~seq:(seq 1))));
+    (is_io_error (Lwt_main.run (Dg.persist g ~replica:r ~tab:t ~seq:(seq 1) ~water:Water.bottom)));
   check "the mirror was raised anyway: degradation falls toward Duplicate, not loss"
     (floor_is (Dg.Floors.find ~replica:r ~tab:t (Dg.floors g)) ~at:1)
 
@@ -305,7 +348,7 @@ let () =
   let g = guard ~sink:failing_sink ~floors:Dg.Floors.empty in
   let (_ : Guard.verdict) = Dg.take g ~replica:r ~tab:t ~seq:(seq 1) in
   let (_ : (unit, Sink.err) result) =
-    Lwt_main.run (Dg.persist g ~replica:r ~tab:t ~seq:(seq 1))
+    Lwt_main.run (Dg.persist g ~replica:r ~tab:t ~seq:(seq 1) ~water:Water.bottom)
   in
   check "the failed-persist mirror floor is in place before the forget"
     (floor_is (Dg.Floors.find ~replica:r ~tab:t (Dg.floors g)) ~at:1);
@@ -322,7 +365,7 @@ let () =
   let g = guard ~sink ~floors:Dg.Floors.empty in
   let (_ : Guard.verdict) = Dg.take g ~replica:r ~tab:t ~seq:(seq 1) in
   check "the memory-sink life persists then forgets, both Ok"
-    (Result.is_ok (Lwt_main.run (Dg.persist g ~replica:r ~tab:t ~seq:(seq 1)))
+    (Result.is_ok (Lwt_main.run (Dg.persist g ~replica:r ~tab:t ~seq:(seq 1) ~water:Water.bottom))
     && Result.is_ok (Lwt_main.run (Dg.forget g ~replica:r)));
   check "the journal records Advance then Forget, and the tombstone is the last word"
     (List.equal String.equal (List.map event_tag (reader ())) [ "advance:1"; "forget" ])

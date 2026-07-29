@@ -142,7 +142,12 @@ let resolved (p : unit Lwt.t) : bool =
 
 let is_advance_for ~(replica : Replica.t) ~(tab : Tab_id.t) ~(seq : int) :
     Sink.event -> bool = function
-  | Sink.Advance { replica = r; tab = t; seq = n } ->
+  | Sink.Advance
+      { replica = r
+      ; tab = t
+      ; seq = n
+      ; water = (_ : Tea_core.Prim.Store_water.t)
+      } ->
     Replica.equal r replica
     && String.equal (Tab_id.to_string t) (Tab_id.to_string tab)
     && Msg_seq.to_int n = seq

@@ -63,8 +63,12 @@ module type CORE = sig
   val main_session : t -> session Lwt.t
   val fork : t -> from:session -> Tea_core.Prim.Session_id.t -> session Lwt.t
   val load : session -> model Lwt.t
-  val commit : session -> label:string -> model -> unit Lwt.t
+  val commit : session -> label:string -> model -> Tea_core.Prim.Store_water.t Lwt.t
   val ctx_of_session : session -> Tea_core.Crdt.Ctx.t
+  val head_water : session -> Tea_core.Prim.Store_water.t Lwt.t
+
+  val branch_waters :
+    t -> (Tea_core.Crdt.Replica.t * Tea_core.Prim.Store_water.t) list Lwt.t
   val apply : session -> msg -> model Lwt.t
   val head_ref : session -> Tea_core.Prim.Commit_ref.t option Lwt.t
   val history : session -> Tea_core.Prim.Commit_ref.t list Lwt.t
@@ -108,7 +112,9 @@ module type CORE = sig
     val seal : t -> unit
   end
 
-  val commit_coalesced : Coalescer.t -> session -> msg:msg -> model -> unit Lwt.t
+  val commit_coalesced :
+    Coalescer.t -> session -> msg:msg -> model -> Tea_core.Prim.Store_water.t Lwt.t
+
   val apply_coalesced : Coalescer.t -> session -> msg -> model Lwt.t
 end
 
@@ -303,24 +309,75 @@ struct
      transaction does. The witness path pays that cost only where it must —
      several paths have to move in one commit — and its durability is pinned by
      [exploded_test]'s close/reopen round trip. *)
-  let commit (s : session) ~(label : string) (model : A.model) : unit Lwt.t =
-    (Option.fold s.exploded
-       ~none:(fun () ->
-         S.set_exn s.branch model_path_raw model ~info:(info_f s.clock label))
-       ~some:(fun (_ : exploder) () ->
-         let* head = S.Head.find s.branch in
-         let base = Option.fold head ~none:(S.Tree.empty ()) ~some:S.Commit.tree in
-         let* tree = scatter s.exploded base model in
-         S.set_tree_exn s.branch [] tree ~info:(info_f s.clock label)))
-      ()
+  let commit (s : session) ~(label : string) (model : A.model) :
+      Tea_core.Prim.Store_water.t Lwt.t =
+    (* The minted date is CAPTURED inside the info thunk rather than read back
+       off the head (roadmap step 13): [set_exn] re-mints per attempt, and
+       freezing one date up front would let a retried commit land with an
+       older date than the racing parent it retried over — breaking the
+       branch-date monotonicity the {!Tea_core.Prim.Store_water} witness rests
+       on. The last mint is the one the successful attempt carried. *)
+    let minted = ref Tea_core.Prim.Store_water.bottom in
+    let info () : S.Info.t =
+      let i = info_v s.clock label in
+      minted := Tea_core.Prim.Store_water.of_date (S.Info.date i);
+      i
+    in
+    let* () =
+      (Option.fold s.exploded
+         ~none:(fun () -> S.set_exn s.branch model_path_raw model ~info)
+         ~some:(fun (_ : exploder) () ->
+           let* head = S.Head.find s.branch in
+           let base = Option.fold head ~none:(S.Tree.empty ()) ~some:S.Commit.tree in
+           let* tree = scatter s.exploded base model in
+           S.set_tree_exn s.branch [] tree ~info))
+        ()
+    in
+    Lwt.return !minted
 
   (* The CRDT context a step on this session applies under (D1): the session's
      own branch name is its stable replica id (a '/'-free framework literal, so
      the trusted mint is right), joined with the handle's single monotonic
      clock so every minted dot is causally-unique and strictly increasing. *)
+  (* The ONE branch-name-to-replica mint (roadmap step 13): [ctx_of_session]
+     keys the persist-time floors with it and [branch_waters] keys the
+     boot-time lookup with it, so the two cannot drift apart. If they ever
+     did, every floor would be dropped (mass duplicates) or none would (mass
+     blindness), with no symptom either way — which is why the mint has
+     exactly one home. *)
+  let replica_of_name (name : string) : Tea_core.Crdt.Replica.t =
+    Tea_core.Crdt.Replica.v (Tea_core.Prim.Session_id.v name)
+
   let ctx_of_session (s : session) : Tea_core.Crdt.Ctx.t =
-    let replica = Tea_core.Crdt.Replica.v (Tea_core.Prim.Session_id.v s.name) in
-    Tea_core.Crdt.Ctx.v ~clock:s.clock ~replica
+    Tea_core.Crdt.Ctx.v ~clock:s.clock ~replica:(replica_of_name s.name)
+
+  (* The one route from a possibly-absent head commit to a water, shared by
+     [head_water] and [branch_waters] so the two cannot diverge. Absence means
+     "no claim" ([bottom]) in both: never written, reaped, or gone with a
+     restored-older root. *)
+  let water_of_commit_opt (head : S.commit option) : Tea_core.Prim.Store_water.t =
+    Option.fold head
+      ~none:Tea_core.Prim.Store_water.bottom
+      ~some:(fun c -> Tea_core.Prim.Store_water.of_date (S.Info.date (S.Commit.info c)))
+
+  let head_water (s : session) : Tea_core.Prim.Store_water.t Lwt.t =
+    let* head =
+      Lwt.catch (fun () -> S.Head.find s.branch) (fun (_ : exn) -> Lwt.return None)
+    in
+    Lwt.return (water_of_commit_opt head)
+
+  let branch_waters (t : t) :
+      (Tea_core.Crdt.Replica.t * Tea_core.Prim.Store_water.t) list Lwt.t =
+    let* names = S.Branch.list t.repo in
+    Lwt_list.map_s
+      (fun (name : S.branch) ->
+        let* head =
+          Lwt.catch
+            (fun () -> S.Branch.find t.repo name)
+            (fun (_ : exn) -> Lwt.return None)
+        in
+        Lwt.return (replica_of_name name, water_of_commit_opt head))
+      names
 
   (** One TEA step, persisted as one commit. (Cmd effects are the server
       runtime's job; here we persist the model transition and label the commit
@@ -328,7 +385,9 @@ struct
   let apply (s : session) (msg : A.msg) : A.model Lwt.t =
     let* model = load s in
     let model', _cmd = A.update (ctx_of_session s) msg model in
-    let* () = commit s ~label:(Codec.msg_to_label msg) model' in
+    let* (_ : Tea_core.Prim.Store_water.t) =
+      commit s ~label:(Codec.msg_to_label msg) model'
+    in
     Lwt.return model'
 
   let ref_of_commit (c : S.commit) : Tea_core.Prim.Commit_ref.t =
@@ -578,9 +637,9 @@ struct
   let append_retry_budget = 3
 
   let append_commit (cz : Coalescer.t) (s : session) ~(msg : A.msg) (model : A.model) :
-      unit Lwt.t =
+      Tea_core.Prim.Store_water.t Lwt.t =
     let label = Codec.msg_to_label msg in
-    let rec attempt (fuel : int) : unit Lwt.t =
+    let rec attempt (fuel : int) : Tea_core.Prim.Store_water.t Lwt.t =
       if fuel <= 0 then (
         Coalescer.seal cz;
         commit s ~label model)
@@ -593,7 +652,7 @@ struct
         let* moved = S.Head.test_and_set s.branch ~test:head ~set:(Some c) in
         if moved then (
           cz.Coalescer.run <- Some (S.Commit.hash c, msg);
-          Lwt.return_unit)
+          Lwt.return (Tea_core.Prim.Store_water.of_date (S.Info.date (S.Commit.info c))))
         else attempt (fuel - 1)
     in
     attempt append_retry_budget
@@ -603,7 +662,7 @@ struct
       append a fresh commit. [Keep_all] takes the historical path bit for
       bit. *)
   let commit_coalesced (cz : Coalescer.t) (s : session) ~(msg : A.msg) (model : A.model) :
-      unit Lwt.t =
+      Tea_core.Prim.Store_water.t Lwt.t =
     match cz.Coalescer.spec with
     | Tea_core.Coalesce_spec.Keep_all -> commit s ~label:(Codec.msg_to_label msg) model
     | Tea_core.Coalesce_spec.Fold_run f ->
@@ -629,7 +688,7 @@ struct
          let* moved = S.Head.test_and_set s.branch ~test:(Some h) ~set:(Some c) in
          if moved then (
            cz.Coalescer.run <- Some (S.Commit.hash c, folded);
-           Lwt.return_unit)
+           Lwt.return (Tea_core.Prim.Store_water.of_date (S.Info.date (S.Commit.info c))))
          else (
            (* A writer landed mid-amend: their commit wins, ours is unreferenced;
               start a fresh run on top of theirs. *)
@@ -639,6 +698,6 @@ struct
   let apply_coalesced (cz : Coalescer.t) (s : session) (msg : A.msg) : A.model Lwt.t =
     let* model = load s in
     let model', _cmd = A.update (ctx_of_session s) msg model in
-    let* () = commit_coalesced cz s ~msg model' in
+    let* (_ : Tea_core.Prim.Store_water.t) = commit_coalesced cz s ~msg model' in
     Lwt.return model'
 end

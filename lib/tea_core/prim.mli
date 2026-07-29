@@ -304,3 +304,65 @@ module Msg_seq : sig
   val compare : t -> t -> int
   val t : t Repr.t
 end
+
+module Store_water : sig
+  (** A session branch's commit high-water: the [Info] date standing at its
+      head, minted by the store's monotonic clock (roadmap step 13, R20).
+
+      Every commit on a branch carries a date strictly greater than its
+      parent's ([Store_core.info_v] mints through [Clock.next], and a reopened
+      handle reseeds from every head), so this value {b advances with commits}
+      and can only fall when the branch's own bytes are older than they were:
+      a restored snapshot, a hot copy whose commits never left irmin-pack's
+      user-space buffer, a reaped or collected branch, an [undo]. That is the
+      whole witness. A delivery floor records the water standing when it was
+      taken, and a floor its branch no longer {!covers} is a floor over an
+      effect the store does not have.
+
+      Deliberately {i derived}, never stored: a witness that must be WRITTEN
+      is a fourth thing that can be restored out of step with the three
+      durability siblings, which is R20 recursed one level. This one is a
+      function of the very bytes whose freshness is in question, so restoring
+      the store restores its water atomically. And deliberately not a
+      {i create-time} identity token: such a token is constant over the
+      store's whole life, so every snapshot of one store carries it and it
+      provably cannot see the rollback R20 names. *)
+  type t
+
+  val bottom : t
+  (** Below every real water, and the only inhabitant meaning "no claim".
+      THREE distinct absences read as [bottom] and all three mean the same
+      thing — nothing was committed that this floor could outlive: a branch
+      with no commits, a floor recorded by a pre-step-13 binary, and a head
+      read the backend refused. [covers ~head:bottom ~floor:bottom] is [true],
+      so no absence ever manufactures a drop on its own. *)
+
+  val of_date : int64 -> t
+  (** An Irmin [Info] date read back off a branch head. Total: any int64 is a
+      legal date, and ordering is all this type promises. *)
+
+  val covers : head:t -> floor:t -> bool
+  (** [covers ~head ~floor] is [true] when the branch head stands at or above
+      the water a floor recorded, i.e. the store still holds a commit at
+      least as new as the one that stood when the floor was taken.
+
+      The {b only} comparison the production path may spell, and it is
+      labelled so it cannot be written backwards: inverted, it drops every
+      sound floor and keeps every stale one — the silent-loss direction.
+      Equality passes, and that is load-bearing rather than incidental: after
+      an orderly restart a floor's water EQUALS its branch head, so a strict
+      comparison here would drop every floor on every clean restart and
+      silently turn durable de-duplication off. *)
+
+  val compare : t -> t -> int
+  (** Total order, for assertions and bookkeeping. {!covers} is the
+      production spelling; this one is not labelled and can be written
+      backwards. *)
+
+  val equal : t -> t -> bool
+  val to_int64 : t -> int64
+
+  val t : t Repr.t
+  (** The journal payload witness ([Repr.int64]); the route back from bytes,
+      so the newtype stays sealed. *)
+end

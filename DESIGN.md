@@ -44,6 +44,8 @@ toolchain removes an entire tier lean-tea had to hand-write.
 | `test/guard_sink_test`, `test/durable_guard_test`, `test/guard_file_test` + extended `exactly_once_test`/`replay_test`/`reaper_test` - codec totality, restart re-seed, torn-tail fold, tombstone-before-removal | **passes** |
 | `Tea_server.Session_secret` + `?sessions` threaded through `handler`/`handler_pack`/`serve_pack` (deliberately NOT the mem tier's `serve`, so identity durability cannot outrun model durability) + `Store_pack.open_root` - durable session identity on the pack tier (`TEA_SECRET`/`TEA_SECRET_FILE`/`<root>.secret` resolver), per-process `memory` everywhere else | **built, green** (roadmap step 12, D17) |
 | `test/session_secret_test`, `test/session_identity_test`, `test/pack_root_test` + browser B4/B5/B6/B7 - secret resolution, sealed composition, cookie adoption across restart, different-secret converse, typed pack-root failures (refused audibly AND non-zero), orphaned guard journal over a wiped root | **passes** (confirmed by mutation) |
+| `Tea_core.Prim.Store_water` + the water-stamped `Advance` frame (tag `'\003'`) + `Guard_file.open_ ~head_water` boot filter with the four-way `verdict` - every durable floor carries the head water of its own session branch, and a restored/rolled-back pack root drops exactly the floors it no longer covers | **built, green** (roadmap step 13, D18) |
+| `test/guard_water_test` (W1-W6 real waters on a pack store incl. a real dir-copy snapshot/restore, G1-G8 hand-built floors) + C1-C3 in `guard_sink_test` + browser B8 three-lives rollback scenario | **passes** (confirmed by mutation) |
 
 Toolchain: OCaml 5.3.0, dune 3.24, a dedicated opam switch (`irmin-tea` locally) with
 `irmin 3.11`, `dream 1.0.0~alpha8`, `repr 0.8`, `vdom 0.3`, `js_of_ocaml 6.4`.
@@ -516,7 +518,9 @@ nothing is lost.
 >   asynchronous write.
 > - **`Tea_server_pack.Guard_file`** is the pack tier's journal: append-only at
 >   `<root>.guard/journal`, fold-until-broken on read, per-record flush, fsync
->   only on close, a cap with drop-oldest, compaction at 4x cap.
+>   only on close, a cap with drop-oldest, compaction at 4x cap and on any
+>   open where the boot filter dropped floors (the drop is durable: a refused
+>   record left behind would silently un-drop once the head rises past it).
 > - The pump persists **after the apply attempt and before the ack**, on both
 >   the success and the fuel-exhausted arms, because the water means "taken",
 >   not "applied" (a no-op msg mints no commit, so the record cannot ride the
@@ -524,24 +528,47 @@ nothing is lost.
 > - `reap ?forget` writes the tombstone **before** the branch removal, so a
 >   crash between the two steps lands on the duplicate side.
 >
-> **The guarantee, restated in three cases** (the step-10 sentence no longer
-> covers it):
+> **The guarantee, restated in three cases** (amended in step 13, D18, whose
+> floors carry a store witness; this block supersedes the step-11 wording):
 >
-> - **Exactly-once effect across an orderly restart** (a SIGINT/SIGTERM
->   teardown, which closes the store and then the journal), within the guard's
->   bounds.
-> - **At-least-once on a torn journal tail, a cap eviction, or a failed
->   append:** each of those loses only a floor, an absent floor accepts
->   anything, and the cost is a visible, convergent double count.
-> - **`kill -9` is out of scope, and it sits on the loss side.** The design
->   rests on one inequality: a floor must not be more durable than the commit
->   whose effect it records. Orderly teardown preserves it by closing the store
->   before the journal. Mid-life, a hard kill violates it: the journal flushes
->   each record to the page cache, so it survives process death, while
->   irmin-pack buffers commits in user space. A floor can then survive a crash
->   its commit did not; the replay reads `Duplicate` against an effect that is
->   gone, and the unacknowledged in-flight tail is silently lost, bounded by
->   the pack's auto-flush lag.
+> - **Exactly-once effect across an orderly restart - now including a restart
+>   onto a pack root that was restored, rolled back, or hot-copied.** A
+>   durable floor is honoured only while its own session branch still carries
+>   a commit at least as new as the one standing when the floor was taken
+>   (`Store_water.covers ~head ~floor`, equality load-bearing: strict would
+>   drop every floor on every clean restart). A branch that went backwards,
+>   or vanished, cannot suppress a replay. Within the guard's bounds, as
+>   before.
+> - **At-least-once - a visible, convergent double count - on every
+>   degradation, and the set is now larger.** A torn journal tail, a cap
+>   eviction, a failed append, and a missing journal, as before; and now
+>   also a floor whose branch head no longer covers it (rollback, hot copy,
+>   reap, a checkpoint GC that made the head unreadable, an `undo` that
+>   moved the head back), a pre-step-13 journal (every legacy record reads
+>   `Store_water.bottom` and is adopted on trust for its own lifetime), and
+>   a step-12 binary reading a step-13 journal (it stops at `Bad_tag 3` on
+>   the first record and discards the whole file). Each of these loses only
+>   floors, and an absent floor accepts anything.
+> - **Still on the loss side, narrowed but not closed.** `kill -9` is now
+>   largely paid off on the pack tier. The design rests on one inequality: a
+>   floor must not be more durable than the commit whose effect it records,
+>   and a hard kill still violates it mid-life (the journal reaches the page
+>   cache per record, irmin-pack buffers commits in user space). But a floor
+>   whose commit died in that buffer no longer has a covering branch head at
+>   the next boot, so it is dropped and its message replays - the exact case
+>   step 11 declared out of scope (R11). The window survives only for tabs
+>   that never minted a witness - every record reads `bottom` (no-op or
+>   fuel-exhausted takes before any real commit, or a legacy journal); a
+>   witness-less take after a real one cannot drown the elder stamp, because
+>   the floor fold never lowers a water - and for divergence that
+>   begins *after* the boot check, which runs once at `Guard_file.open_` and
+>   says nothing about a second writer over the same root (R18) or a swap
+>   under a live process. The identity half is R20a (§10): a journal
+>   restored beside a *different* store whose same-named branch carries a
+>   newer head date is not detected - order, not identity, is what a water
+>   can answer. And `<root>.secret` remains bound to neither sibling: an
+>   absent or rotated secret still silently orphans every branch and every
+>   floor.
 >
 > **Residuals, stated rather than hidden:**
 >
@@ -557,7 +584,11 @@ nothing is lost.
 >   total silent loss onto an empty model. Step 11 closes the ordering half by
 >   construction (tombstone first, removal second); the wiring half stays the
 >   caller's obligation, exactly as `Replay_guard.forget`'s precondition
->   states.
+>   states. Step 13 narrows the unwired case to a window: at the next boot
+>   the filter drops every *witnessed* floor whose branch is gone
+>   (`dropped_no_branch`), so the exposure is the mid-life stretch between
+>   the reap and the following restart - plus `bottom`-water floors, which
+>   no head can drop.
 > - The two-clocks-behind-one-replica-id note (step 9) and the D14
 >   pre-announcement window are unchanged by this step.
 
@@ -622,8 +653,71 @@ nothing is lost.
 > longer bounded by process lifetime (R19); and the three durability siblings
 > (`<root>`, `<root>.guard`, `<root>.secret`) can be restored out of step,
 > where losing the pack store alone turns the surviving floors into silent loss
-> (R20 - the outright-wipe case is refused at boot, a rollback to an older pack
-> snapshot under a newer journal is not).
+> (R20 - the outright-wipe case is refused at boot; the rollback case is
+> closed per-floor by step 13's water filter, D18 below, leaving the
+> different-store residue R20a).
+
+> **D18 - the store water: a monotone, derived, per-floor witness (roadmap
+> step 13).** Step 12's boot refusal covers only the outright wipe; a pack
+> root ROLLED BACK under a surviving guard journal still made every stale
+> floor read `Duplicate` against an effect the store no longer holds - R20's
+> silent-loss residue, reached with no reaper involved. Step 13 binds each
+> floor to the store state it de-duplicates against: `Prim.Store_water` is
+> the session branch's head `Info` date (a step-6 `Clock` stamp, strictly
+> increasing per branch), captured from the very commit the take minted -
+> `commit`/`commit_coalesced`/`append_commit` now *return* the water, so the
+> persist hot path never reads a head - and written into the `Advance`
+> record (tag `'\003'`; legacy tag `'\001'` decodes at `bottom` forever,
+> written never). `Guard_file.open_` compares every floor against one
+> `Store.branch_waters` read and drops what the live head no longer
+> `covers`, counted in a four-way `verdict` and reported in at most three
+> conditional operator lines. Four adjudications carry the design, recorded
+> so they are not re-litigated:
+>
+> - **Derived, never written.** A witness that must be written can itself be
+>   restored out of step with the thing it witnesses - R20 recursed, growing
+>   the pairwise restore surface from C(3,2)=3 to C(4,2)=6. A witness that
+>   *is* a function of the store's own bytes cannot disagree with them:
+>   there is no fourth durability sibling, no reserved ref, no journal
+>   header, and nothing foreign written inside the pack root.
+> - **Per-key, not a global scalar.** Sufficient three times over: a global
+>   mismatch would empty up to every floor for sessions that were never
+>   rolled back (blast radius); a global max is structurally blind to a
+>   SELECTIVE restore of one branch while others advanced (coverage); and
+>   per-key pays off R11 for free - a commit lost in irmin-pack's user-space
+>   buffer leaves exactly its own floor above exactly its own head, so
+>   exactly that message replays as a visible duplicate, which no global
+>   epoch can do without emptying everything.
+> - **A field on the record, not a journal header.** The certificate rides
+>   the `Advance` frame itself, so a floor without one is unrepresentable. A
+>   header would be erased by the first compaction (`compact` rewrites
+>   purely from the kept floors); a sibling witness file is a fourth path to
+>   restore out of step; a free-standing water event re-opens the question
+>   of which floors a stamp covers. One parser, one length field, one CRC.
+> - **Drop and serve, never refuse.** An uncovered floor is dropped and its
+>   replay re-admitted as a visible, convergent duplicate - the accept
+>   direction the whole guard family degrades toward - where refusing to
+>   boot would turn a routine checkpoint GC or reap into an outage. Only
+>   `dropped_behind` (a readable head strictly below the floor) speaks of
+>   rollback; a missing or unreadable head is `dropped_no_branch`, routine
+>   after GC; adopted `bottom` floors are `unwitnessed`, the
+>   trust-on-first-use upgrade window, and the first post-upgrade boot is
+>   classified on the LOSS side of the guarantee and says so on stderr.
+>
+> One refutation recorded because the false argument would outlive the
+> session that heard it: a global water is NOT attacker-poisonable. The
+> claim was that N commits inside one second advance the clock N seconds
+> past wall time, permanently blinding a global check. But `Clock.next`
+> advances strictly off `last`, and reopening reseeds from every head, so
+> every commit after a poison to P mints P+1, P+2, ...: any later stamp
+> sits strictly ABOVE the water of any snapshot containing the poison, and
+> the rollback is still caught. Per-key stands on the three grounds above,
+> not on the poisoning claim. One false positive accepted and named rather
+> than special-cased: `undo` moves a branch head backwards, so a session
+> that used `undo` has its floors dropped at the next restart - only
+> unacknowledged messages replay, so the cost rounds to zero, and the
+> undone effect really is gone, which makes the re-admission defensible as
+> a true positive.
 
 ## 8. Shared RPC contract - built (roadmap step 7; hardened step 8, D11/D12)
 
@@ -850,10 +944,16 @@ Each lean-tea private-constructor primitive → an OCaml `.mli` boundary:
   preserves it (store closed before journal); `kill -9` violates it, because
   the journal reaches the page cache per record while irmin-pack buffers
   commits in user space. A surviving floor over a dead commit makes the replay
-  read `Duplicate` against an effect that is gone. Deliberately **out of
-  scope**, stated on `Tea_server_pack.Guard_file` rather than fixed; the loss
-  is bounded by the pack's auto-flush lag. Every other durable-layer failure
-  (torn tail, cap eviction, failed append) falls on the duplicate side.
+  read `Duplicate` against an effect that is gone. **Narrowed by step 13
+  (D18):** such a floor carries a water its restored branch head no longer
+  covers, so the next boot drops it and the message replays as a visible
+  duplicate. What remains on the loss side is tabs that never minted a
+  witness (every record reads `bottom`: no-op or fuel-exhausted takes
+  before any real commit, legacy records; the fold never lets a later
+  bottom drown an elder stamp) and divergence after the boot check; the
+  loss stays bounded by the
+  pack's auto-flush lag. Every other durable-layer failure (torn tail, cap
+  eviction, failed append) falls on the duplicate side.
 - **R12 (low) - `Durable_guard`'s in-process floor mirror is unbounded.** The
   `Replay_guard.Cell` in front of it is bounded precisely because an attacker
   mints session cookies freely, and `Guard_file`'s cap bounds the journal's
@@ -981,13 +1081,24 @@ Each lean-tea private-constructor primitive → an OCaml `.mli` boundary:
   identity was per-process: a returning tab got a fresh id, a fresh floor key,
   and `Fresh`. Implemented now: `serve_pack` refuses to boot, loudly and with a
   non-zero exit, when the pack root does not exist but `<root>.guard` does,
-  which covers the outright-wipe case. The residue, stated rather than hidden:
-  a rollback to an OLDER pack snapshot with a NEWER journal is NOT covered by
-  that check, because the root exists. Closing it properly needs a
-  store-identity token written into the pack root at create time and stamped
-  into the guard journal header, so that `Guard_file.open_` can start from
-  empty floors audibly when the token does not match. That token is the named
-  future fix, not step-12 work.
+  which covers the outright-wipe case. The rollback direction - an OLDER pack
+  snapshot restored under a NEWER journal, where the root exists and the boot
+  refusal cannot fire - is closed per-floor in step 13 (D18): every `Advance`
+  record carries the head water its own session branch stood at when the
+  floor was taken (`Prim.Store_water`, the branch head's `Info` date,
+  strictly increasing per branch by the step-6 clock), and `Guard_file.open_`
+  drops every floor the live head no longer covers, so the replay is
+  re-admitted as a visible duplicate. A create-time identity token could not
+  have closed this - it is constant over the store's whole life, so an older
+  snapshot of the SAME store carries it and it matches; only a monotone,
+  per-floor witness can see a branch that went backwards. **R20a, the
+  surviving identity residue:** a journal restored beside a DIFFERENT store
+  whose same-named branch happens to carry a newer head date passes the
+  check - order, not identity, is what a water can answer - and catching it
+  is the one job left for a store-identity token, kept as the named future
+  fix rather than shipped. Until then the exposure also includes the first
+  boot after a step-12 upgrade, whose floors decode at `bottom` and are
+  adopted on trust (counted `unwitnessed`, one warning line).
 
 ## 11. Roadmap
 
@@ -1155,3 +1266,36 @@ Each lean-tea private-constructor primitive → an OCaml `.mli` boundary:
     confirmed by mutation). Optional companion landed with it:
     `Store_pack.open_root`, so an unusable `TEA_ROOT` is an audible typed
     failure rather than an uncaught `Pack_error` (`pack_root_test`, browser B6).
+
+13. **The store water** - bind the guard journal to the pack store so an
+    out-of-step restore is never *silent* loss (R20, D18). **Done**
+    (`Prim.Store_water`, the sealed head-`Info`-date newtype with
+    `covers ~head ~floor`; `Store_core.commit`/`commit_coalesced`/
+    `append_commit` return the water they minted so the persist hot path
+    never reads a head, `head_water`/`branch_waters` read it back fenced;
+    the tag-`'\003'` water-stamped `Advance` frame, tag `'\001'` decoding
+    at `bottom` forever; the max-witness floor fold, under which a
+    witness-less take (no-op, fuel exhaustion) raises the seq but never
+    drowns the tab's strongest water; the `Guard_file.open_ ~head_water`
+    boot filter with the four-way `Guard_file.verdict` and three
+    conditional operator lines, compacting the journal in the same open
+    whenever the filter fired, so a drop is durable and cannot un-drop
+    when the branch head later rises past the stale water;
+    browser B8, three lives over a real `cp` snapshot/restore, where a
+    served count of 2 is the guarantee, 1 the R20 silent loss, 3 the
+    rollback not taking and 4 neither; `guard_water_test` W1-W6 real
+    waters / G1-G8 hand-built floors, C1-C3 in `guard_sink_test`, 12 new
+    mutations across both suites).
+
+    Left open, deliberately: R20a - order, not identity, is what a water
+    can answer, so a journal restored beside a DIFFERENT store whose
+    same-named branch carries a newer head date passes, and the identity
+    token stays the named future fix (§10 R20); `<root>.secret` is still
+    bound to neither sibling; the check is boot-time only, silent on a
+    second writer or a swap under a live process (R18); tabs that never
+    minted a witness (every record `bottom`: legacy journals, no-op or
+    fuel-exhausted takes before any real commit) stay trust-on-first-use
+    forever, bounded by the `unwitnessed` counter's visibility, though a
+    bottom record after a real witness no longer de-witnesses the tab;
+    and a session that used `undo` has its floors dropped at
+    the next restart, a named false positive on the duplicate side.

@@ -102,14 +102,23 @@ struct
   type step_outcome =
     { model : A.model
     ; redirect : Prim.Url.t option
+    ; water : Prim.Store_water.t
+          (** what [commit] returned for THIS step's own commit — the only
+              value a floor persisted for this message may claim as its
+              witness (never a head read, which could belong to a later
+              writer). *)
     }
 
   (** One TEA step: load, [Loop.step] (settling the [Cmd] tail), then persist
       through [commit] — the one seam the form-post path (plain event-log
       commit) and the WS pump (coalesced commit) share, so every path mints
-      its commit dates from the store's single clock. A [Navigate] effect is
-      captured and surfaced as the redirect target. *)
-  let step_with ~(commit : St.session -> msg:A.msg -> A.model -> unit Lwt.t)
+      its commit dates from the store's single clock, and the outcome carries
+      the water [commit] returned so a caller persisting a floor stamps it
+      with the state it actually de-duplicated against. A [Navigate] effect
+      is captured and surfaced as the redirect target. *)
+  let step_with
+      ~(commit :
+          St.session -> msg:A.msg -> A.model -> Tea_core.Prim.Store_water.t Lwt.t)
       (s : St.session) (msg : A.msg) : (step_outcome, Loop.err) result Lwt.t =
     let redirect = ref None in
     let fx =
@@ -125,8 +134,8 @@ struct
     let* stepped = Loop.step ~ctx ~fx ~fuel:Prim.Fuel.default msg model in
     Result.fold stepped
       ~ok:(fun model' ->
-        let* () = commit s ~msg model' in
-        Lwt.return (Ok { model = model'; redirect = !redirect }))
+        let* water = commit s ~msg model' in
+        Lwt.return (Ok { model = model'; redirect = !redirect; water }))
       ~error:(fun (e : Loop.err) -> Lwt.return (Error e))
 
   (** One TEA step over HTTP: one commit per Msg, labelled with the Msg so
@@ -241,8 +250,11 @@ struct
                    loss. A failed append degrades the same direction: one
                    audible line, then carry on under step-10 in-memory
                    semantics — never end the session over durability. *)
-                let persist_taken (n : Tea_core.Prim.Msg_seq.t) : unit Lwt.t =
-                  let* persisted = Durable_guard.persist guard ~replica ~tab ~seq:n in
+                let persist_taken ~(water : Prim.Store_water.t)
+                    (n : Tea_core.Prim.Msg_seq.t) : unit Lwt.t =
+                  let* persisted =
+                    Durable_guard.persist guard ~replica ~tab ~seq:n ~water
+                  in
                   Result.fold persisted ~ok:Lwt.return
                     ~error:(fun (e : Guard_sink.err) ->
                       let reason =
@@ -267,15 +279,24 @@ struct
                 | Replay_guard.Fresh n ->
                   let* stepped = step_ws s msg in
                   Result.fold stepped
-                    ~ok:(fun (_ : step_outcome) ->
-                      let* () = persist_taken n in
+                    (* The floor's witness is the water THIS step's commit
+                       returned, never a head read: a head read after the
+                       commit could belong to a later writer, and a floor
+                       claiming a state it did not de-duplicate against is a
+                       forged witness. *)
+                    ~ok:(fun (o : step_outcome) ->
+                      let* () = persist_taken ~water:o.water n in
                       ack n;
                       pump ())
                     (* Fuel exhaustion still ends the session, but the taken
                        record is persisted first: the high water means
                        "attempted", so a fuel-poison msg is attempted once per
-                       guard lifetime — now once ever, not once per restart. *)
-                    ~error:(fun (Loop.Fuel_exhausted : Loop.err) -> persist_taken n)
+                       guard lifetime — now once ever, not once per restart.
+                       Nothing was committed, so there is no store state this
+                       floor de-duplicates against: bottom, "no claim",
+                       explicitly. *)
+                    ~error:(fun (Loop.Fuel_exhausted : Loop.err) ->
+                      persist_taken ~water:Prim.Store_water.bottom n)
                 | Replay_guard.Duplicate n ->
                   (* Acknowledge without applying. An unacknowledged duplicate
                      is a replay loop that never terminates. *)

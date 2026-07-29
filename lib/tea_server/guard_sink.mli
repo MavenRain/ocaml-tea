@@ -22,7 +22,10 @@
       (closed by ordering in [Store_core.reap]'s [?forget]), and a floor
       outliving its {i commit} after a hard kill, since this record reaches
       the page cache per append while the store buffers commits in user space
-      ([Tea_server_pack.Guard_file]).
+      ([Tea_server_pack.Guard_file]). Roadmap step 13 narrows both at the
+      {i next boot}: the [water] field on {!Advance} lets the pack tier drop
+      a floor whose branch head no longer covers it, leaving exposed only
+      [bottom]-water floors and divergence after the boot check.
 
     The sink is a record of one function so the mem tier can stay byte-for-
     byte on step-10 semantics ({!null}), tests can observe exactly what was
@@ -36,10 +39,18 @@ type event =
       { replica : Tea_core.Crdt.Replica.t
       ; tab : Tea_core.Prim.Tab_id.t
       ; seq : Tea_core.Prim.Msg_seq.t
+      ; water : Tea_core.Prim.Store_water.t
       }
       (** [(replica, tab)] consumed [seq]: raise its durable floor. Written
           after the apply attempt completes (either outcome), before the
-          acknowledgement. *)
+          acknowledgement.
+
+          [water] (roadmap step 13) is the {!Tea_core.Prim.Store_water} of the
+          commit this take minted — the floor's own claim about which store
+          state it de-duplicates against, what the boot filter checks a
+          restored pack root against — or [bottom] ("no claim") when the take
+          minted none: a no-op update, fuel exhaustion, or a record decoded
+          from a pre-step-13 journal. *)
   | Forget of { replica : Tea_core.Crdt.Replica.t }
       (** Tombstone: the replica's branch is about to be removed, so every
           floor under it must die with it — a floor outliving its branch is
@@ -57,14 +68,21 @@ val null : t
 
 val memory : unit -> t * (unit -> event list)
 (** A recording sink and its reader (events oldest-first): the test seam for
-    simulated restarts — record a life, [Codec] or {!of_events} it into the
-    next one. *)
+    simulated restarts — record a life, [Codec] or
+    [Durable_guard.Floors.of_events] it into the next one. *)
 
 (** The journal frame codec, pure and total: one {!event} per frame,
     length-prefixed and CRC-32-guarded, so a torn tail or a flipped byte is a
     classified verdict, never an exception. Framing (big-endian):
     [len:4][tag:1][payload:len-1][crc:4], where [len] counts tag plus payload
-    and the CRC covers the same span. *)
+    and the CRC covers the same span.
+
+    Tags: [3] is the water-stamped [Advance] this codec writes (roadmap
+    step 13); [2] is [Forget]; [1] is the pre-step-13 [Advance] — decoded
+    forever at {!Tea_core.Prim.Store_water.bottom} so an upgrade keeps every
+    floor it already earned, written never. A step-12 binary meeting tag [3]
+    reads [Bad_tag] and keeps only the preceding frames: the duplicate side,
+    the sanctioned downgrade. *)
 module Codec : sig
   type decode_err =
     | Torn

@@ -10,11 +10,19 @@ module Key = struct
 end
 
 module Key_map = Map.Make (Key)
+module Rep_map = Map.Make (Tea_core.Crdt.Replica)
 open Lwt.Syntax
 
 type open_err =
   | Io of string
   | Bad_dir of string
+
+type verdict = Durable_guard.Floors.verdict =
+  { kept : int
+  ; dropped_behind : int
+  ; dropped_no_branch : int
+  ; unwitnessed : int
+  }
 
 type t =
   { path : string
@@ -55,13 +63,20 @@ let touch_of_events (events : Guard_sink.event list) : int Key_map.t * int =
   List.fold_left
     (fun ((touch, tick) : int Key_map.t * int) (e : Guard_sink.event) ->
       match e with
-      | Guard_sink.Advance { replica; tab; seq = (_ : Tea_core.Prim.Msg_seq.t) } ->
+      | Guard_sink.Advance
+          { replica
+          ; tab
+          ; seq = (_ : Tea_core.Prim.Msg_seq.t)
+          ; water = (_ : Tea_core.Prim.Store_water.t)
+          } ->
         (Key_map.add (replica, tab) tick touch, tick + 1)
       | Guard_sink.Forget { replica } -> (scrub_replica replica touch, tick + 1))
     (Key_map.empty, 0) events
 
 (* The live floors as Advance records in ascending last-touch order, so a
-   future open's drop-oldest sees the same age order this process did. *)
+   future open's drop-oldest sees the same age order this process did —
+   rewritten at their stored waters, so no rewrite can weaken or forge a
+   floor's witness. *)
 let events_of_kept (floors : Durable_guard.Floors.t) (touch : int Key_map.t) :
     Guard_sink.event list =
   Key_map.bindings touch
@@ -69,9 +84,12 @@ let events_of_kept (floors : Durable_guard.Floors.t) (touch : int Key_map.t) :
        (fun (((_ : Key.t), a) : Key.t * int) (((_ : Key.t), b) : Key.t * int) ->
          Int.compare a b)
   |> List.filter_map (fun (((replica, tab), (_ : int)) : Key.t * int) ->
-         Durable_guard.Floors.find ~replica ~tab floors
-         |> Option.map (fun (seq : Tea_core.Prim.Msg_seq.t) ->
-                Guard_sink.Advance { replica; tab; seq }))
+         Durable_guard.Floors.find_stamped ~replica ~tab floors
+         |> Option.map
+              (fun
+                ((seq, water) :
+                  Tea_core.Prim.Msg_seq.t * Tea_core.Prim.Store_water.t)
+              -> Guard_sink.Advance { replica; tab; seq; water }))
 
 (* Drop-oldest beyond [cap]: victims are the excess oldest keys by last
    append; the survivors' floors are rebuilt through the same
@@ -132,8 +150,12 @@ let append (t : t) (e : Guard_sink.event) : (unit, Guard_sink.err) result Lwt.t 
         t.count <- t.count + 1;
         t.floors <- Durable_guard.Floors.apply t.floors e;
         (match e with
-         | Guard_sink.Advance { replica; tab; seq = (_ : Tea_core.Prim.Msg_seq.t) }
-           ->
+         | Guard_sink.Advance
+             { replica
+             ; tab
+             ; seq = (_ : Tea_core.Prim.Msg_seq.t)
+             ; water = (_ : Tea_core.Prim.Store_water.t)
+             } ->
            t.touch <- Key_map.add (replica, tab) t.tick t.touch
          | Guard_sink.Forget { replica } -> t.touch <- scrub_replica replica t.touch);
         t.tick <- t.tick + 1;
@@ -165,8 +187,26 @@ let read_if_exists (path : string) : string Lwt.t =
       | Unix.Unix_error (Unix.ENOENT, (_ : string), (_ : string)) -> Lwt.return ""
       | exc -> Lwt.fail exc)
 
-let open_ ~(dir : string) ~(cap : int) :
-    (Guard_sink.t * Durable_guard.Floors.t * t, open_err) result Lwt.t =
+(* Build the lookup once, close over it: a boot consults it once per floor
+   key, and a list scan per key would be quadratic in live sessions. *)
+let head_water_of_list
+    (waters : (Tea_core.Crdt.Replica.t * Tea_core.Prim.Store_water.t) list) :
+    Tea_core.Crdt.Replica.t -> Tea_core.Prim.Store_water.t option =
+  let by_replica =
+    List.fold_left
+      (fun (acc : Tea_core.Prim.Store_water.t Rep_map.t)
+           ((replica, water) :
+             Tea_core.Crdt.Replica.t * Tea_core.Prim.Store_water.t) ->
+        Rep_map.add replica water acc)
+      Rep_map.empty waters
+  in
+  fun (replica : Tea_core.Crdt.Replica.t) -> Rep_map.find_opt replica by_replica
+
+let open_ ~(dir : string) ~(cap : int)
+    ~(head_water :
+       Tea_core.Crdt.Replica.t -> Tea_core.Prim.Store_water.t option) :
+    (Guard_sink.t * Durable_guard.Floors.t * verdict * t, open_err) result
+    Lwt.t =
   let* made = ensure_dir dir in
   Result.fold made
     ~error:(fun (e : open_err) -> Lwt.return (Error e))
@@ -177,8 +217,25 @@ let open_ ~(dir : string) ~(cap : int) :
           let* contents = read_if_exists path in
           let events, count = decode_prefix contents in
           let floors0 = Durable_guard.Floors.of_events events in
+          (* The boot filter (R20) runs on the FULL fold, before any cap
+             housekeeping: the verdict reports what the journal claimed
+             against what the store holds, not what happened to fit under
+             [cap]. *)
+          let admitted, verdict =
+            Durable_guard.Floors.filter ~head:head_water floors0
+          in
+          (* Touch entries for refused floors go with them, or the cap would
+             count — and could evict a live key in favour of — keys that no
+             longer exist. *)
           let touch0, tick = touch_of_events events in
-          let floors, touch = enforce_cap ~cap floors0 touch0 in
+          let touch1 =
+            Key_map.filter
+              (fun ((replica, tab) : Key.t) (_ : int) ->
+                Durable_guard.Floors.find_stamped ~replica ~tab admitted
+                |> Option.is_some)
+              touch0
+          in
+          let floors, touch = enforce_cap ~cap admitted touch1 in
           let* fd = Lwt_unix.openfile path append_flags 0o644 in
           let t =
             { path
@@ -192,8 +249,22 @@ let open_ ~(dir : string) ~(cap : int) :
             ; closed = false
             }
           in
-          let* () = if count > 4 * cap then compact t else Lwt.return_unit in
-          Lwt.return (Ok ({ Guard_sink.append = append t }, t.floors, t)))
+          (* A fired filter compacts IMMEDIATELY (step 13, revised in
+             review): a refused record left in the bytes is re-adjudicated
+             from scratch on every open, and the same branch head that
+             stood BEHIND the stale floor today rises past it with one
+             fresh wall-clock commit — un-dropping the floor and re-arming
+             the exact silent loss the filter refused. This open's verdict
+             still reports the drop; the rewrite makes it durable, so the
+             next open finds nothing left to drop. A crash mid-compaction
+             loses floors, which replays as duplicates — the accept
+             direction, same as a torn tail. *)
+          let dropped = verdict.dropped_behind + verdict.dropped_no_branch in
+          let* () =
+            if dropped > 0 || count > 4 * cap then compact t
+            else Lwt.return_unit
+          in
+          Lwt.return (Ok ({ Guard_sink.append = append t }, t.floors, verdict, t)))
         (fun (exc : exn) -> Lwt.return (Error (Io (Printexc.to_string exc)))))
 
 let close (t : t) : unit Lwt.t =

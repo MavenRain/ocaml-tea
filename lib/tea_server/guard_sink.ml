@@ -5,6 +5,7 @@ type event =
       { replica : Tea_core.Crdt.Replica.t
       ; tab : Prim.Tab_id.t
       ; seq : Prim.Msg_seq.t
+      ; water : Prim.Store_water.t
       }
   | Forget of { replica : Tea_core.Crdt.Replica.t }
 
@@ -58,7 +59,14 @@ module Codec = struct
      already use; the two client-chosen fields are re-validated through their
      wire mints on decode, exactly as the pump does, so a corrupt-but-CRC-valid
      journal can never hand the guard an inhabitant the wire could not. *)
-  let advance_body_t : (Tea_core.Crdt.Replica.t * string * int) Repr.t =
+  let advance_body_t :
+      (Tea_core.Crdt.Replica.t * string * int * Prim.Store_water.t) Repr.t =
+    Repr.(quad Tea_core.Crdt.Replica.t string int Prim.Store_water.t)
+
+  (* The pre-step-13 Advance payload: decoded forever, written never, so an
+     upgraded server keeps every floor its journal already holds — at
+     [Store_water.bottom], the honest "no witness" claim. *)
+  let legacy_advance_body_t : (Tea_core.Crdt.Replica.t * string * int) Repr.t =
     Repr.(triple Tea_core.Crdt.Replica.t string int)
 
   let forget_body_t : Tea_core.Crdt.Replica.t Repr.t = Tea_core.Crdt.Replica.t
@@ -66,16 +74,26 @@ module Codec = struct
   (* repr 0.8 stages its binary codecs; unstage each exactly once. *)
   let encode_advance = Repr.unstage (Repr.to_bin_string advance_body_t)
   let decode_advance_bin = Repr.unstage (Repr.of_bin_string advance_body_t)
+
+  let decode_advance_legacy_bin =
+    Repr.unstage (Repr.of_bin_string legacy_advance_body_t)
+
   let encode_forget = Repr.unstage (Repr.to_bin_string forget_body_t)
   let decode_forget_bin = Repr.unstage (Repr.of_bin_string forget_body_t)
-  let tag_advance = '\001'
+  let tag_advance_legacy = '\001'
   let tag_forget = '\002'
+
+  (* A step-12 binary meeting tag 3 reads [Bad_tag] and keeps only the frames
+     before it: floors fall, replays read Fresh — the duplicate side, the one
+     downgrade direction the design permits. *)
+  let tag_advance = '\003'
 
   let body (e : event) : string =
     match e with
-    | Advance { replica; tab; seq } ->
+    | Advance { replica; tab; seq; water } ->
       String.make 1 tag_advance
-      ^ encode_advance (replica, Prim.Tab_id.to_string tab, Prim.Msg_seq.to_int seq)
+      ^ encode_advance
+          (replica, Prim.Tab_id.to_string tab, Prim.Msg_seq.to_int seq, water)
     | Forget { replica } -> String.make 1 tag_forget ^ encode_forget replica
 
   let to_bytes (e : event) : string =
@@ -86,20 +104,40 @@ module Codec = struct
     Bytes.set_int32_be tail 0 (crc32 b);
     Bytes.to_string head ^ b ^ Bytes.to_string tail
 
+  (* One validation spelling for both Advance arms, current and legacy: the
+     two client-chosen fields go back through their wire mints. The water
+     needs no mint — every int64 is a lattice point, and [bottom] claims
+     nothing. *)
+  let advance_validated ~(replica : Tea_core.Crdt.Replica.t) ~(tab : string)
+      ~(seq : int) ~(water : Prim.Store_water.t) ~(next : int) :
+      (event * int, decode_err) result =
+    Result.fold (Prim.Tab_id.of_string tab)
+      ~error:(fun (_ : Prim.Tab_id.err) -> Error (Bad_field "tab"))
+      ~ok:(fun (tab : Prim.Tab_id.t) ->
+        Prim.Msg_seq.of_int seq
+        |> Option.fold
+             ~none:(Error (Bad_field "seq"))
+             ~some:(fun (seq : Prim.Msg_seq.t) ->
+               Ok (Advance { replica; tab; seq; water }, next)))
+
   let decode_advance (payload : string) ~(next : int) :
       (event * int, decode_err) result =
     Result.fold
       (decode_advance_bin payload)
       ~error:(fun (`Msg reason) -> Error (Bad_field reason))
+      ~ok:(fun
+          ((replica, tab, seq, water) :
+            Tea_core.Crdt.Replica.t * string * int * Prim.Store_water.t)
+        -> advance_validated ~replica ~tab ~seq ~water ~next)
+
+  let decode_advance_legacy (payload : string) ~(next : int) :
+      (event * int, decode_err) result =
+    Result.fold
+      (decode_advance_legacy_bin payload)
+      ~error:(fun (`Msg reason) -> Error (Bad_field reason))
       ~ok:(fun ((replica, tab, seq) : Tea_core.Crdt.Replica.t * string * int) ->
-        Result.fold (Prim.Tab_id.of_string tab)
-          ~error:(fun (_ : Prim.Tab_id.err) -> Error (Bad_field "tab"))
-          ~ok:(fun (tab : Prim.Tab_id.t) ->
-            Prim.Msg_seq.of_int seq
-            |> Option.fold
-                 ~none:(Error (Bad_field "seq"))
-                 ~some:(fun (seq : Prim.Msg_seq.t) ->
-                   Ok (Advance { replica; tab; seq }, next))))
+        advance_validated ~replica ~tab ~seq ~water:Prim.Store_water.bottom
+          ~next)
 
   let decode_forget (payload : string) ~(next : int) :
       (event * int, decode_err) result =
@@ -128,6 +166,8 @@ module Codec = struct
           let payload = String.sub b 1 (len - 1) in
           let tag = b.[0] in
           if Char.equal tag tag_advance then decode_advance payload ~next
+          else if Char.equal tag tag_advance_legacy then
+            decode_advance_legacy payload ~next
           else if Char.equal tag tag_forget then decode_forget payload ~next
           else Error (Bad_tag (Char.code tag))
 end

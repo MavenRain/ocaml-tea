@@ -60,12 +60,19 @@
  * silent-LOSS direction specifically: with the floors alive and the store
  * gone, a returning tab's replay is judged Duplicate and dropped onto a model
  * that materialised empty, so serving at all is worse than refusing.
+ *
+ * Step 13 (R20) added B8, the other out-of-step restore: the journal and the
+ * store both survive, but the store is OLDER. Three lives and a real on-disk
+ * snapshot/restore between two of them, because no in-process test can roll a
+ * pack root back under a running system - and because the whole claim is that
+ * the boot filter turns what used to be a silent lost edit into one visible
+ * duplicate plus one line an operator can read.
  */
 
 import { chromium } from 'playwright'
 import { spawn } from 'node:child_process'
 import { existsSync, statSync } from 'node:fs'
-import { mkdir, mkdtemp, rm } from 'node:fs/promises'
+import { cp, mkdir, mkdtemp, readdir, rm, stat } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -80,6 +87,9 @@ const PORT_SECRET = Number(process.env.SMOKE_PORT_SECRET ?? 8141)
    mutation DOES let it serve, it collides with nothing and its red is about
    the missing refusal alone. */
 const PORT_ORPHAN = Number(process.env.SMOKE_PORT_ORPHAN ?? 8142)
+/* B8 runs three lives in sequence on one port; nothing overlaps, because each
+   life is stopped and awaited before the next is spawned. */
+const PORT_ROLLBACK = Number(process.env.SMOKE_PORT_ROLLBACK ?? 8143)
 const HEADED = process.env.SMOKE_HEADED === '1'
 const WAIT_MS = Number(process.env.SMOKE_TIMEOUT_MS ?? 15000)
 
@@ -167,6 +177,11 @@ async function spawnServer({ name, exe, clientDir, port, env = {} }) {
   proc.stderr.on('data', (d) => log.push(String(d)))
   const base = `http://localhost:${port}`
   const tail = () => log.join('').split('\n').slice(-20).join('\n')
+  /* The WHOLE log, for assertions about what a life said WHEN IT BOOTED.
+     `tail` keeps the last 20 lines, which is right for a check made while the
+     server is still starting and wrong for one made after traffic: Dream logs
+     every request, so a boot-time operator line scrolls out of a tail. */
+  const full = () => log.join('')
   const exited = new Promise((r) => proc.on('exit', (code, signal) => r({ code, signal })))
   const deadline = Date.now() + WAIT_MS
   const ready = async () => {
@@ -180,7 +195,7 @@ async function spawnServer({ name, exe, clientDir, port, env = {} }) {
     return ready()
   }
   await ready()
-  return { name, proc, base, tail, exited }
+  return { name, proc, base, tail, full, exited }
 }
 
 /* Deliver `signal` and wait for the exit, escalating to SIGKILL at the
@@ -371,9 +386,16 @@ function wsTap() {
      only sound signal that the durable floor is written. Without it a test can
      only wait on a rendered count, which the store watch can satisfy while the
      journal append is still in flight. */
-  const tap = { applies: 0, acks: 0, droppedAcks: 0, dropUps: 0, dropAcks: false, socket: null }
+  /* [opens] counts sockets the route has seen, which is how a scenario waits
+     for a RECONNECT rather than guessing. A click made while the tab is still
+     re-dialling is queued and flushed by the replay path instead of being sent
+     live, so without this gate a scenario about live delivery can silently
+     become a scenario about replay (and a mutation that kills replay reddens a
+     check that was never about it). */
+  const tap = { applies: 0, acks: 0, droppedAcks: 0, dropUps: 0, opens: 0, dropAcks: false, socket: null }
   tap.handler = (ws) => {
     tap.socket = ws
+    tap.opens += 1
     const server = ws.connectToServer()
     ws.onMessage((message) => {
       if (frameTag(message) === 'apply') {
@@ -1020,6 +1042,303 @@ async function orphanedJournalScenario() {
   }
 }
 
+/* The exact operator sentence serve_pack prints when the boot filter drops
+   floors standing ABOVE their branch heads. Kept as a constant because two
+   checks read it in opposite directions: life 2 must NOT say it (the line is
+   conditional, not decorative) and life 3 must. */
+const ROLLBACK_LINE = 'the pack root is OLDER than the guard journal'
+
+/* Recursive on-disk byte count. The rollback's INDEPENDENT witness: the pack
+   is append-only, so life 2's two extra commits make its root strictly larger
+   than life 1's snapshot, and a restored root that does not shrink back to the
+   snapshot's size did not take. Without this, "the count came back 2" would be
+   the only evidence the restore happened at all, and a copy that silently did
+   nothing would read as the guarantee it is supposed to test. */
+const dirSize = async (dir) => {
+  const entries = await readdir(dir, { recursive: true, withFileTypes: true })
+  const sizes = await Promise.all(
+    entries.filter((e) => e.isFile()).map((e) => stat(join(e.parentPath, e.name)).then((s) => s.size))
+  )
+  return sizes.reduce((a, b) => a + b, 0)
+}
+
+/* B8, THE ROLLBACK (step 13, R20): the store and the guard journal are two
+   separate paths, so a restore can put them out of step - and until step 13
+   that was SILENT LOSS. An operator restores yesterday's pack root beside
+   today's journal; a returning tab replays the message the journal already
+   has a floor for; the guard answers Duplicate and drops it onto a model that
+   no longer contains it. Nothing errors, nothing logs, and the edit is gone.
+ *
+ * The fix binds them by ORDER rather than identity: every floor now carries
+ * the water (the commit date) of the very commit it de-duplicates, and a floor
+ * standing above its branch's head at boot is dropped rather than honoured. A
+ * dropped floor costs one visible duplicate; an honoured stale floor costs a
+ * silent edit, and this system always degrades towards the duplicate.
+ *
+ * Three lives, because two cannot express it: life 1 commits ONE acknowledged
+ * click and is snapshotted on disk; life 2 commits two more, the second with
+ * its Ack dropped so the client still holds it; then life 1's root is restored
+ * BESIDE life 2's journal and life 3 boots over the pair.
+ *
+ * The single served count separates four worlds, which is why life 2 clicks
+ * twice: 2 is the guarantee (life 1's click plus the re-admitted replay); 1 is
+ * the R20 silent loss (the surviving floor swallowed the replay); 3 means the
+ * rollback silently did not take, the likeliest harness bug; 4 means the
+ * rollback did not take AND the floor was lost. With a single life-2 click the
+ * guarantee and the failed rollback would both render 2 and the scenario would
+ * be unfalsifiable - the same trap B4 documents above.
+ *
+ * The audible line and the behaviour are asserted SEPARATELY, per the B6/B7
+ * doctrine: an operator who restored the wrong root must be told, and a server
+ * that says the right thing while doing the wrong one is the most dangerous
+ * slip in this change. Each half has a mutation that kills it alone. */
+async function rollbackScenario(browser) {
+  const parent = await mkdtemp(join(tmpdir(), 'tea-smoke-b8-'))
+  const root = join(parent, 'store')
+  /* The snapshot sits UNDER the parent beside the root, never inside it: the
+     journal and the secret are the root's siblings (<root>.guard,
+     <root>.secret), so a copy named `snapshot` cannot be mistaken for either
+     by the server or by the wipe in `finally`. */
+  const snapshot = join(parent, 'snapshot')
+  const server = () =>
+    spawnServer({
+      name: 'rollback counter server',
+      exe: '_build/default/examples/counter/server/main.exe',
+      clientDir: '_build/default/examples/counter/client',
+      port: PORT_ROLLBACK,
+      env: { TEA_ROOT: root },
+    })
+  let srv = null
+  let ctx = null
+  const errors = []
+  const tap = wsTap()
+  const out = []
+  const step = (r) => {
+    out.push(r)
+    return r.ok
+  }
+  try {
+    /* ---------------------------------- life 1: one acknowledged click ---- */
+    srv = await server()
+    ctx = await browser.newContext()
+    const a = await openCounter(ctx, srv.base, errors, { tap })
+    const o = await openCounter(ctx, srv.base, errors)
+    const preA = await countOn(a)
+    const preO = await countOn(o)
+    if (!step(check('rollback B8: pack-backed tabs mount at 0', preA === '0' && preO === '0', `A=${preA} O=${preO}`))) return out
+
+    const acksLife1 = tap.acks
+    if (!step(await transition(
+      'rollback B8: life 1 commits one click (observer 0 -> 1)',
+      () => countOn(o),
+      (v) => v === '1',
+      { pre: preO, act: () => plusOn(a).click() }
+    ))) return out
+    /* Acknowledged, so it leaves the client's queue: the ONLY message that may
+       ride the rollback is life 2's last one. A second unacked message would
+       land a second re-admitted replay and the served count would no longer
+       separate the four worlds. */
+    if (!step(await transition(
+      "rollback B8: life 1's click is acknowledged, so it leaves the queue and cannot be replayed later",
+      () => tap.acks,
+      (n) => n > acksLife1,
+      { pre: acksLife1 }
+    ))) return out
+
+    /* Life 1's cookie, captured before the stop, exactly as B4 does: the SSR
+       read at the end must present an identity minted BEFORE the rollback, or
+       a green count could mean the tabs got a fresh session rather than that
+       the witness worked. */
+    const cookieBefore = (await ctx.cookies(srv.base)).find((c) => c.name === 'dream.session')?.value ?? ''
+    if (!step(check(
+      'rollback B8: life 1 issued a session cookie to capture',
+      cookieBefore !== '',
+      cookieBefore === '' ? 'no dream.session cookie in the context' : `${cookieBefore.length} cookie bytes held`
+    ))) return out
+
+    const outcome1 = await stop(srv, 'SIGTERM')
+    srv = null
+    if (!step(check(
+      'rollback B8: SIGTERM stops life 1 gracefully, so the snapshot is taken over a quiesced pack root',
+      outcome1.code === 0,
+      `exit=${show(outcome1)}`
+    ))) return out
+
+    /* The snapshot is taken with no process holding the root - the same shape
+       an operator's backup takes, and the shape guard_water_test's W6 already
+       certified in-process (a dir copy of a closed pack root reopens as a
+       valid OLDER store). */
+    await cp(root, snapshot, { recursive: true })
+    const snapSize = await dirSize(snapshot)
+    if (!step(check('rollback B8: the snapshot copied a non-empty pack root', snapSize > 0, `snapshot bytes=${snapSize}`))) return out
+
+    /* ------------------- life 2: one more acknowledged, one unacknowledged - */
+    const opensLife1 = tap.opens
+    srv = await server()
+    const pidLife2 = srv.proc.pid
+    /* Wait for the acting tab to be BACK on the wire before clicking. A click
+       made mid-reconnect would be queued and flushed by the replay path, which
+       would quietly turn the two checks below into a second replay test and
+       leave the live-delivery claim untested. */
+    if (!step(await transition(
+      'rollback B8: the acting tab re-dials life 2 (the next click is delivered live, not replayed)',
+      () => tap.opens,
+      (n) => n > opensLife1,
+      { pre: opensLife1, timeout: WAIT_MS * 2 }
+    ))) return out
+    const acksLife2 = tap.acks
+    if (!step(await transition(
+      'rollback B8: life 2 reopens the same root and commits a second click (observer 1 -> 2)',
+      () => countOn(o),
+      (v) => v === '2',
+      { act: () => plusOn(a).click(), timeout: WAIT_MS * 2 }
+    ))) return out
+    if (!step(await transition(
+      "rollback B8: life 2's first click is acknowledged too (only the LAST click rides the rollback)",
+      () => tap.acks,
+      (n) => n > acksLife2,
+      { pre: acksLife2, timeout: WAIT_MS * 2 }
+    ))) return out
+
+    tap.dropAcks = true
+    const droppedBefore = tap.droppedAcks
+    if (!step(await transition(
+      'rollback B8: life 2 commits a third click while its Ack is dropped (observer 2 -> 3)',
+      () => countOn(o),
+      (v) => v === '3',
+      { act: () => plusOn(a).click() }
+    ))) return out
+    /* The ack the tap swallowed is the signal that the floor is on disk at
+       that commit's water: the pump persists the taken floor BEFORE it acks,
+       while the observer's count only says the commit rendered. Stopping on
+       the count alone is the race B4 measured. */
+    if (!step(await transition(
+      "rollback B8: the server emitted the third click's Ack before the stop, so its floor is persisted at that commit's water",
+      () => tap.droppedAcks,
+      (n) => n > droppedBefore,
+      { pre: droppedBefore }
+    ))) return out
+
+    /* Life 2 booted over a root its journal exactly matches, so the boot
+       filter must be SILENT. Without this, an implementation that printed the
+       rollback line on every boot would satisfy life 3's line check for free -
+       the line would be decoration rather than a diagnosis. */
+    step(check(
+      'rollback B8: life 2 boots over an intact root and says nothing about a rollback (the line is conditional, not decorative)',
+      !srv.full().includes(ROLLBACK_LINE),
+      srv.full().split('\n').filter((l) => l.startsWith('tea_server_pack:')).join(' | ')
+    ))
+
+    const outcome2 = await stop(srv, 'SIGTERM')
+    srv = null
+    /* Un-drop only after the death, per B4's measured race: a live server
+       re-acks every retransmit, and one forwarded re-ack would dequeue the
+       message the rollback is supposed to carry. */
+    tap.dropAcks = false
+    if (!step(check(
+      'rollback B8: SIGTERM stops life 2 gracefully (exit 0 runs the store-then-journal teardown)',
+      outcome2.code === 0,
+      `exit=${show(outcome2)}`
+    ))) return out
+
+    /* ------------------------ the rollback: life 1's root, life 2's journal */
+    const liveSize = await dirSize(root)
+    await rm(root, { recursive: true, force: true })
+    await cp(snapshot, root, { recursive: true })
+    const rolledSize = await dirSize(root)
+    if (!step(check(
+      "rollback B8: the pack root really rolled back - its bytes are life 1's snapshot again, strictly fewer than life 2 left",
+      rolledSize === snapSize && rolledSize < liveSize,
+      `life2=${liveSize} snapshot=${snapSize} restored=${rolledSize}`
+    ))) return out
+    if (!step(check(
+      'rollback B8: the guard journal and the durable secret survived the rollback (only the store went back)',
+      existsSync(`${root}.guard`) && existsSync(`${root}.secret`),
+      `${existsSync(`${root}.guard`) ? '' : 'missing .guard '}${existsSync(`${root}.secret`) ? '' : 'missing .secret'}`
+    ))) return out
+
+    /* ------------------------------------ life 3: over the rolled-back pair */
+    const acksLife3 = tap.acks
+    /* Spawned through an explicit catch rather than plain `await`, so a server
+       that REFUSES to serve reddens the disposition check below by name
+       instead of aborting the scenario as a harness failure. Drop-and-serve is
+       an adjudication (a rollback costs floors, not the site), and an
+       adjudication has to be pinned rather than assumed. */
+    const life3 = await server().then((s) => ({ srv: s, err: null })).catch((e) => ({ srv: null, err: e }))
+    srv = life3.srv
+    if (!step(check(
+      'rollback B8: life 3 SERVES rather than refusing (a rollback drops floors, it does not take the site down)',
+      life3.srv !== null,
+      life3.err ? String(life3.err.message ?? life3.err) : 'the ready loop returned'
+    ))) return out
+    step(check(
+      'rollback B8: life 3 is a NEW process over the rolled-back root',
+      srv.proc.pid !== pidLife2,
+      `pid ${pidLife2} -> ${srv.proc.pid}`
+    ))
+
+    /* Polled rather than read once: the operator line is printed before the
+       server listens, but the pipe's data event is delivered asynchronously,
+       so a bare read can lose a race the server has already won. `pre: false`
+       is the literal before-state - life 3 had emitted no log at all when it
+       was spawned - so the vacuity guard stays meaningful. */
+    step(await transition(
+      'rollback B8: life 3 boots over the rolled-back root and SAYS SO (the line names the root as older than the journal)',
+      () => srv.full().includes(ROLLBACK_LINE),
+      (v) => v === true,
+      { pre: false }
+    ))
+    step(check(
+      'rollback B8: the drop is a diagnosis, not a crash (life 3 raised nothing)',
+      !srv.full().includes('Fatal error: exception'),
+      srv.full().split('\n').slice(-3).join(' | ')
+    ))
+
+    /* The replay must actually happen, or every count below is vacuous. It
+       arrives either way: the guard acknowledges a Duplicate too (an unacked
+       duplicate is a replay loop that never ends), so this check says "the
+       message was re-sent and answered", never "it was applied". */
+    if (!step(await transition(
+      'rollback B8: after the rollback the client replays its unacked message and the server answers (a post-rollback Ack arrives)',
+      () => tap.acks,
+      (n) => n > acksLife3,
+      { pre: acksLife3, timeout: WAIT_MS * 2 }
+    ))) return out
+
+    /* The SSR route with life 1's cookie pinned in the header, never a
+       rendered tab: a tab's model already holds 3 and the reconnect Hello is
+       JOINED into it, so no server state can pull it back down. B4's
+       mut-b4-fresh-root scored ZERO reds against a client-count assertion. */
+    const resp = await ctx.request.get(`${srv.base}/`, {
+      headers: { cookie: `dream.session=${cookieBefore}` },
+    })
+    const reissued = (await resp.headersArray())
+      .filter((h) => h.name.toLowerCase() === 'set-cookie' && h.value.startsWith('dream.session='))
+    /* Not optional. A rotated or absent <root>.secret rotates every replica id
+       and parks the surviving floors under keys no client can present, which
+       would neutralise R20 by accident: the count would come back 2 because
+       the floor was UNREACHABLE, not because the witness dropped it. */
+    step(check(
+      'rollback B8: life 3 ADOPTS the presented session cookie, so the dropped floor was reachable and its being unused is the fix rather than an accident',
+      resp.ok() && reissued.length === 0,
+      `status=${resp.status()} reissued=${reissued.length}`
+    ))
+    const served = (await resp.text()).match(/class="count"[^>]*>([^<]*)</)?.[1] ?? 'UNPARSED'
+    step(check(
+      "rollback B8: the ROLLED-BACK SERVER itself holds 2 (life 1's surviving click plus the re-admitted replay)",
+      served === '2',
+      `server-rendered count=${served} (1 = the surviving floor swallowed the replay, the R20 silent loss; 3 = the rollback did not take; 4 = the rollback did not take AND the floor was lost)`
+    ))
+
+    step(check('rollback B8: no uncaught browser exception', errors.length === 0, errors.join(' | ')))
+    return out
+  } finally {
+    if (ctx) await ctx.close().catch(() => {})
+    if (srv) await stop(srv, 'SIGTERM').catch(() => {})
+    await rm(parent, { recursive: true, force: true })
+  }
+}
+
 /* -------------------------------------------------------------------- main */
 
 const main = async () => {
@@ -1071,7 +1390,10 @@ const main = async () => {
     const secret = await guarded('secret B5', () => secretConverseScenario(browser))
     const preflight = await guarded('preflight B6', () => packRootPreflightScenario())
     const orphan = await guarded('orphan B7', () => orphanedJournalScenario())
-    return [...counter, ...sharedDoc, ...replay, ...durable, ...secret, ...preflight, ...orphan]
+    /* B8 owns three server lives and a filesystem rollback between two of
+       them, so like B4 it is not a withServer body. */
+    const rollback = await guarded('rollback B8', () => rollbackScenario(browser))
+    return [...counter, ...sharedDoc, ...replay, ...durable, ...secret, ...preflight, ...orphan, ...rollback]
   } finally {
     await browser.close()
   }

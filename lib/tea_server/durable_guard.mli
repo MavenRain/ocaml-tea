@@ -29,7 +29,12 @@ module Floors : sig
       a consumed sequence number), [Forget] deletes every floor under the
       replica. {!of_events} is the left fold of this over a record list, and
       the file journal uses [apply] directly so there is exactly one floor-
-      merge in the codebase. *)
+      merge in the codebase.
+
+      The store witness rides along (roadmap step 13): on an equal-or-higher
+      seq the INCOMING record's water is adopted — last-writer-wins, matching
+      journal append order, so the stamp always names the commit the newest
+      record for that key rests on; a lower seq changes nothing. *)
 
   val of_events : Guard_sink.event list -> t
 
@@ -39,8 +44,50 @@ module Floors : sig
     t ->
     Tea_core.Prim.Msg_seq.t option
 
+  val find_stamped :
+    replica:Tea_core.Crdt.Replica.t ->
+    tab:Tea_core.Prim.Tab_id.t ->
+    t ->
+    (Tea_core.Prim.Msg_seq.t * Tea_core.Prim.Store_water.t) option
+  (** {!find} plus the floor's store witness: the water of the commit its
+      newest journal record claims, [bottom] when it claims none (a no-op
+      take, a pre-step-13 record). Compaction rewrites floors through this,
+      so no journal rewrite can weaken — or forge — a witness. *)
+
   val cardinal : t -> int
   (** Total [(replica, tab)] floor count, for assertions. *)
+
+  type verdict =
+    { kept : int  (** floors that survived the boot filter, {!unwitnessed}
+                      included; counted BEFORE any cap enforcement. *)
+    ; dropped_behind : int
+          (** a READABLE branch head stood strictly below the floor's claim —
+              the store's bytes are older than the journal's, which is the
+              R20 rollback. The only counter that may say so. *)
+    ; dropped_no_branch : int
+          (** no branch for the floor's replica, or one whose head reads
+              [bottom] (collected, reaped, or never written). Routine after
+              GC; never evidence of a rollback. *)
+    ; unwitnessed : int
+          (** kept floors whose water is [bottom]: a claim of nothing (a
+              pre-step-13 record, a no-op take) is adopted on trust, and a
+              boot that adopted any is NOT protected against a restored
+              older pack root. Always [unwitnessed <= kept]. *)
+    }
+  (** What the boot filter did, one int per outcome, so a caller asserts the
+      split instead of grepping logs. *)
+
+  val filter :
+    head:(Tea_core.Crdt.Replica.t -> Tea_core.Prim.Store_water.t option) ->
+    t ->
+    t * verdict
+  (** Drop every floor whose branch head no longer {!Tea_core.Prim.Store_water.covers}
+      its claimed water (R20: a floor over an effect the store does not have
+      would judge its replay Duplicate — silent loss; refusing the floor
+      re-admits the message as Fresh — a visible duplicate, the sanctioned
+      direction). [head] answers a replica's branch head water, [None] when
+      the branch does not exist; bottom-water floors are never dropped (a
+      claim of nothing cannot be failed) but are counted, see {!verdict}. *)
 end
 
 type t
@@ -69,6 +116,7 @@ val persist :
   replica:Tea_core.Crdt.Replica.t ->
   tab:Tea_core.Prim.Tab_id.t ->
   seq:Tea_core.Prim.Msg_seq.t ->
+  water:Tea_core.Prim.Store_water.t ->
   (unit, Guard_sink.err) result Lwt.t
 (** Record "this sequence number was taken" durably: raise the mirror first
     (so an eviction between the append and the next frame still re-seeds at
@@ -77,7 +125,12 @@ val persist :
     success and fuel exhaustion, because the high water means "taken", never
     "applied" — and never on [Duplicate] or [Gapped]. An [Error] means the
     record is not durable: the caller degrades toward the duplicate
-    direction, never the loss one. *)
+    direction, never the loss one.
+
+    [water] is what {!Store_core.CORE.commit} returned for this take's
+    commit, or {!Tea_core.Prim.Store_water.bottom} when the take minted none
+    (a no-op update, fuel exhaustion) — the commit's own date, never a value
+    read back off a head. *)
 
 val forget :
   t -> replica:Tea_core.Crdt.Replica.t -> (unit, Guard_sink.err) result Lwt.t

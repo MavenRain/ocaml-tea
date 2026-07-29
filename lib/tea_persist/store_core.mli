@@ -70,13 +70,41 @@ module type CORE = sig
   val main_session : t -> session Lwt.t
   val fork : t -> from:session -> Tea_core.Prim.Session_id.t -> session Lwt.t
   val load : session -> model Lwt.t
-  val commit : session -> label:string -> model -> unit Lwt.t
+  val commit : session -> label:string -> model -> Tea_core.Prim.Store_water.t Lwt.t
+  (** Persist one model as one commit and return the
+      {!Tea_core.Prim.Store_water} of the very commit minted (roadmap step 13):
+      the certificate the WS pump stamps into the durable delivery floor, so
+      the floor can never claim a commit the store does not have. Captured
+      from the commit's own [Info] date, never read back off the head — a
+      concurrent writer between commit and read-back would hand the floor a
+      water it has no right to. *)
 
   val ctx_of_session : session -> Tea_core.Crdt.Ctx.t
   (** The CRDT context (D1) a step on this session applies under: the session's
       branch name as its replica id, plus the handle's monotonic clock. The
       server runtime builds one to drive {!Tea_core.Loop.step}; {!apply} uses it
       internally. *)
+
+  val head_water : session -> Tea_core.Prim.Store_water.t Lwt.t
+  (** The [Info] date standing at this session branch's head, or
+      {!Tea_core.Prim.Store_water.bottom} when there is no head at all —
+      never written, reaped, or gone with a restored-older root. Total: a
+      backend that raises on a collected head is fenced to [bottom], exactly
+      as the branch walk in {!reap} fences it. Boot-time and test surface;
+      the persist path stamps floors with {!commit}'s own return instead. *)
+
+  val branch_waters :
+    t -> (Tea_core.Crdt.Replica.t * Tea_core.Prim.Store_water.t) list Lwt.t
+  (** Every branch in the repo, paired with the {!Tea_core.Crdt.Replica} it
+      would be addressed by and its head's water (roadmap step 13). Reserved
+      refs ([main], the [__checkpoints] spine) are NOT filtered out: a floor
+      can legitimately be keyed on [main], and a replica name with no floor
+      costs nothing.
+
+      The replica is built by the same private mint {!ctx_of_session} uses,
+      so the boot-time lookup and the persist-time key cannot drift apart.
+      One [S.Branch.list] plus one fenced head read per branch, at boot only:
+      the same walk {!v} already makes to seed the clock. *)
 
   val apply : session -> msg -> model Lwt.t
   val head_ref : session -> Tea_core.Prim.Commit_ref.t option Lwt.t
@@ -158,7 +186,15 @@ module type CORE = sig
       into a [Duplicate] against a stale high water — total silent loss onto
       an empty model, the one loss-side path in the guard's degradation
       (stated on [Tea_server.Replay_guard.forget], closed here by ordering:
-      tombstone first, then removal).
+      tombstone first, then removal). The step-13 boot filter bounds the
+      unwired case in time but does not void this precondition: a reaped
+      branch has no head, so at the NEXT boot every {i witnessed} floor
+      under it is dropped ([dropped_no_branch]) and only [bottom]-water
+      floors (no-op takes, pre-step-13 records) survive — the mid-life
+      window between the reap and that restart, and those unwitnessed
+      floors, stay the caller's obligation. The same filter is what makes
+      the other restore-shaped failure — an older pack root under a newer
+      journal — a visible duplicate rather than silent loss (D18).
 
       Since roadmap step 12 made session identity durable, this precondition
       is LIVE rather than theoretical: a client can now return to a branch
@@ -188,7 +224,11 @@ module type CORE = sig
         merge base. *)
   end
 
-  val commit_coalesced : Coalescer.t -> session -> msg:msg -> model -> unit Lwt.t
+  val commit_coalesced :
+    Coalescer.t -> session -> msg:msg -> model -> Tea_core.Prim.Store_water.t Lwt.t
+  (** Like {!commit}, returning the minted commit's water — whichever path
+      minted it (amend, fresh append, or the sealed fallback). *)
+
   val apply_coalesced : Coalescer.t -> session -> msg -> model Lwt.t
 end
 

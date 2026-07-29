@@ -275,3 +275,17 @@ module Msg_seq = struct
   let compare = Int.compare
   let t = Repr.int
 end
+
+module Store_water = struct
+  type t = int64
+
+  (* Below every date [Clock] can mint, so [bottom] is a true lattice bottom
+     rather than a sentinel a real date could collide with. *)
+  let bottom = Int64.min_int
+  let of_date (date : int64) : t = date
+  let covers ~(head : t) ~(floor : t) : bool = Int64.compare head floor >= 0
+  let compare = Int64.compare
+  let equal = Int64.equal
+  let to_int64 (t : t) : int64 = t
+  let t = Repr.int64
+end
