@@ -46,6 +46,8 @@ toolchain removes an entire tier lean-tea had to hand-write.
 | `test/session_secret_test`, `test/session_identity_test`, `test/pack_root_test` + browser B4/B5/B6/B7 - secret resolution, sealed composition, cookie adoption across restart, different-secret converse, typed pack-root failures (refused audibly AND non-zero), orphaned guard journal over a wiped root | **passes** (confirmed by mutation) |
 | `Tea_core.Prim.Store_water` + the water-stamped `Advance` frame (tag `'\003'`) + `Guard_file.open_ ~head_water` boot filter with the four-way `verdict` - every durable floor carries the head water of its own session branch, and a restored/rolled-back pack root drops exactly the floors it no longer covers | **built, green** (roadmap step 13, D18) |
 | `test/guard_water_test` (W1-W6 real waters on a pack store incl. a real dir-copy snapshot/restore, G1-G8 hand-built floors) + C1-C3 in `guard_sink_test` + browser B8 three-lives rollback scenario | **passes** (confirmed by mutation) |
+| `Store_core.based`/`load_based`/`based_model`/`committed`/`commit_based` + `commit_coalesced` and `append_commit` re-pinned to the witness + `step_with ?interpose` taking the token - the TEA step is a compare-and-set whose denial reconciles through the app's own `Merge_spec.t` instead of refusing or re-running, and `shared_doc_serve`'s `Lwt_mutex` is retired | **built, green** (roadmap step 14, D19) |
+| `test/contention_test` C1-C15, S1-S2 over four local apps (`Or_set`, a merging `Three_way`, a refusing `Three_way`, `Last_write_wins`) - the program-order interleave, distinct dots, parentage, the winning round's water, round count, the true ancestor across two rounds, both non-CRDT arms, a reap under the witness, pack close/reopen for both write arms, the coalesced append and the interrupted amend, undo as an R10b characterization, and the server seam through `?interpose` | **passes** (confirmed by mutation, except C11/C12 which are pins: see roadmap 14) |
 
 Toolchain: OCaml 5.3.0, dune 3.24, a dedicated opam switch (`irmin-tea` locally) with
 `irmin 3.11`, `dream 1.0.0~alpha8`, `repr 0.8`, `vdom 0.3`, `js_of_ocaml 6.4`.
@@ -719,6 +721,65 @@ nothing is lost.
 > undone effect really is gone, which makes the re-admission defensible as
 > a true positive.
 
+> **D19 - the witnessed step: compare-and-set with reconciliation, not retry
+> (roadmap step 14).** R10 said the framework's step was a read-modify-write
+> with no compare-and-set. D19 closes it by moving the whole read-modify-write
+> onto a compare-and-set keyed to a **load-time witness**, and by resolving
+> contention with the app's own `Merge_spec.t` rather than by re-running
+> anything.
+>
+> `Store_core` gains an abstract, session-bound token `based`, minted only by
+> `load_based`, carrying the head commit the model was read *through* and the
+> model itself. `commit_based` owns a loop: mint a commit parented on the
+> witnessed head, move the branch by `S.Head.test_and_set`, and on denial
+> re-observe, reconcile the once-stepped model against the head that actually
+> landed, and re-attempt against that new witness.
+>
+> Three consequences carry the design.
+>
+> - **The witness is minted at load and never re-read at commit.** That is
+>   precisely what the old `append_commit` got wrong: it re-read the head and
+>   tested against *that*, so the test almost always passed while the stale
+>   model still landed on top of the racer. R10 named this in so many words -
+>   the retry preserved history, not content. The window R10 describes opens at
+>   the `load`, not at the commit, so a witness taken any later closes nothing;
+>   a `~test` parameter on `commit` would have been self-satisfying. The token
+>   is abstract for the same reason, and session-bound for a second: a witness
+>   minted on branch A presented to branch B would typecheck under a labelled
+>   `~base:`, and under a total commit that mistake is not even an error - the
+>   test fails, the loop reloads B, and a foreign model is joined into it.
+> - **Nothing is re-run.** `Loop.step` executes exactly once per taken message,
+>   so no `fx.sleep` fires twice, no `fx.navigate` is recorded twice, and no
+>   CRDT dot is minted twice. Re-running the pure `A.update` against `theirs`
+>   in the conflict arm was tempting and is rejected: it silently drops any
+>   part of `ours` that came from the settled `Cmd` tail, and the store cannot
+>   tell whether such a part exists, so it trades a declared, labelled,
+>   history-preserving loss for an undetectable one. The commit *date*, by
+>   contrast, IS re-minted per round: freezing it would let a retried commit
+>   land with a date older than the racing parent it retried over, which is the
+>   monotonicity failure D18's water rests on.
+> - **The commit is total**, so the pump's `Fresh` arm is byte-identical to
+>   before and the inversion the D16/D18 family exists to prevent - a durable
+>   floor raised for an apply that was refused - is unrepresentable rather than
+>   handled. See §10 R10 for why a `Contended` refusal with a retry budget is
+>   unsafe upstream of any floor, and R10d for the fate this does not close.
+>
+> One door serves both the whole-blob and the exploded arms on the based path
+> (`S.Commit.v` + `S.Head.test_and_set`, layering onto `S.Commit.tree` of the
+> witnessed commit), because `writes` already reduces the whole-blob case to
+> the single historical `model_path_raw` write and `scatter` consumes either
+> list identically. Plain `commit` is untouched in both arms, which is the
+> strongest available form of "the whole-blob / exploded non-unification is
+> preserved": that comment's subject is the historical `set_exn` transaction
+> and the witness path's `set_tree_exn`, and neither changes a byte. The based
+> path never touches `S.tree`; that is an argument rather than a proof, which
+> is why C11 and C12 round-trip a real pack store before the step counts as
+> green.
+>
+> The water a floor may claim is read off the commit the CAS minted, never off
+> a head after the fact: a head read after a successful commit can belong to a
+> later writer, and a floor stamped with it is a forged witness.
+
 ## 8. Shared RPC contract - built (roadmap step 7; hardened step 8, D11/D12)
 
 lean-tea kept its tiers aligned by convention: route strings and encode/decode
@@ -780,8 +841,12 @@ not a second write path with its own semantics. Two limits, because the obvious
 readings of that sentence are both wrong: it does **not** reach live peers (a
 live session watches its *per-cookie* session branch, and the canonical branch
 is not that branch - cross-branch propagation is the still-deferred R3 auto-merge
-story), and `step` is load-step-commit with **no** compare-and-set, which R10
-below covers.
+story), and it is the first path that puts *different* clients on one branch,
+which is what made R10 a real exposure rather than a theoretical one. Since step
+14 (D19) `Server.step` reads through a witness token and commits by
+compare-and-set, so two concurrent `Append_tag` calls reconcile instead of
+erasing each other, and the app-level `Lwt_mutex` that used to stand in for that
+is gone.
 `/msg` form traffic keeps using Dream's own token. Residual, by construction:
 `Read_only` is a *declaration*, not an enforcement - a `Read_only` handler that
 writes the store re-opens the hole, so classification is a review obligation.
@@ -893,24 +958,69 @@ Each lean-tea private-constructor primitive → an OCaml `.mli` boundary:
   rewriting the `Mutating` arm to call it directly would compile. The gate is
   enforced by the total `kind` match plus `test/csrf_test`, and keeping the two
   arms distinct is a review obligation - see R8.
-- **R10 (med) - `step` is a read-modify-write with no compare-and-set, and D12
-  put different clients on one branch.** `Store.commit` is a plain `set` (last
-  write wins), so `load` -> `Loop.step` -> `commit` can interleave: two writers
-  each read the pre-edit model and the second erases the first. This was
-  harmless while every write path was *per-session* (the only racer was the same
-  user); the `Mutating` RPC endpoint is the first path where different clients
-  read-modify-write the **same** branch, which is what promotes this from
-  theoretical to a real exposure. Note `append_commit`'s test-and-set does not
-  fix it either: the retry re-commits the *same stale model*, so it preserves
-  history, not content. Mitigation shipped: `shared_doc_serve`'s handler holds
-  an `Lwt_mutex` across the whole read-modify-write, correct within one process.
-  **Not test-confirmed, and deliberately labelled as such** - under `Irmin_mem`
-  with an `Add_tag` that emits `Cmd.none` there is no Lwt yield between load and
-  commit, so deleting the lock leaves `test/csrf_test` green (verified by
-  mutation). The real fix belongs in `store_core`: a compare-and-set retry
-  around the whole step, which would also cover the pack backend and any Msg
-  with a Cmd tail. Until then, an app mutating a shared branch from concurrent
-  requests must serialize it itself.
+- **R10 (med) - `step` was a read-modify-write with no compare-and-set, and D12
+  put different clients on one branch. CLOSED in step 14 (D19).** `Store.commit`
+  was a plain `set` (last write wins), so `load` -> `Loop.step` -> `commit`
+  could interleave: two writers each read the pre-edit model and the second
+  erased the first. This was harmless while every write path was *per-session*
+  (the only racer was the same user); the `Mutating` RPC endpoint was the first
+  path where different clients read-modify-write the **same** branch, which is
+  what promoted it from theoretical to a real exposure. `append_commit`'s
+  test-and-set did not fix it either: the retry re-committed the *same stale
+  model*, so it preserved history, not content.
+
+  D19 moves the whole read-modify-write onto a compare-and-set keyed to a
+  **load-time witness** (`Store_core.load_based` / `commit_based`) and resolves
+  contention with the app's own `Merge_spec.t` rather than by re-running
+  anything, so no effect fires twice and no CRDT dot is minted twice. The
+  `Lwt_mutex` mitigation in `shared_doc_serve` is retired; what replaces it is
+  not another check at the example tier but a type: `step_with` takes a token,
+  so nothing routed through the seam can reach the last-write-wins door. The
+  property is pinned at the framework tier by `test/contention_test` C1-C15,
+  S1-S2, and the interleave is deterministic because it is **program order**,
+  not timing - which is exactly why the old mutex was mutation-invisible (under
+  `Irmin_mem` with an `Add_tag` that emits `Cmd.none` there is no Lwt yield
+  between load and commit, so deleting the lock left `test/csrf_test` green,
+  verified by mutation). Residuals below carry what D19 does *not* close.
+- **R10b (low) - unguarded head moves erase acked commits.** `undo`, `redo` and
+  `fork` still move the head with an unconditional `S.Head.set`, so a commit the
+  pump has already floored and acked can be erased by a racing undo. The fix is
+  mechanically small and semantically large (it forces a decision about what a
+  racing undo *means*: refuse, merge, or win positionally) and under `Crdt_join`
+  a later reconcile can rejoin undone content anyway, so it deserves its own
+  record rather than a line in D19. `fork` is the mildest of the three: it
+  writes only inside a branch it has just observed to be absent. Pinned as
+  behaviour by C15, a labelled characterization check, so a future fix turns it
+  red on purpose rather than by surprise.
+- **R10c (low) - the non-CRDT arms keep content only for the writer that was
+  already acked.** For a `Three_way` app whose merge returns `Error`, and for a
+  `Last_write_wins` app, D19 keeps `ours` and demotes `theirs` to history.
+  `ours` has to win: the message being committed is one the pump has already
+  taken and is about to ack, and the D16 contract is that an acked effect exists
+  in the store. R10 is therefore closed *for content* only under `Crdt_join` and
+  a successful `Three_way`. It is still strictly better than before, where the
+  loser was erased *and* unreachable: the loser is now the committed parent, and
+  the conflict reason is durable in the commit message rather than on a stderr
+  line that dies with the process. Pinned by C8 and C9.
+- **R10d (low) - a cancelled pump promise abandons a taken sequence number.**
+  `live_session` ends in `Lwt.pick [...; pump () ]`, so a dying socket cancels
+  the pump and anything it awaits, while the `Cell` has already consumed the
+  sequence number into a guard that outlives the socket: the reconnect's replay
+  reads `Duplicate` and is acked without applying. This is loss, it exists today
+  at every await inside the step (`fx.sleep`, every store IO), and D19 changes
+  the width of that window without changing its kind. Its fix is cancellation
+  atomicity around the take-to-floor span, which interacts with `Lwt.finalize`'s
+  unwatch and with the fuel arm's once-ever contract, and needs a cancellation
+  seam that does not exist. Named here rather than claimed away: D19 closes the
+  interleaving-writer loss, it does not make loss unrepresentable.
+- **R10e (low) - per-socket liveness under sustained fan-in.** A denied round
+  certifies that the *system* progressed, not that this socket will. The
+  reconcile loop is unbounded on purpose (every loss-free exhaustion arm is
+  either the loop continued or a plain set, and a plain set is R10), so the
+  instruments are `committed.rounds`, asserted by C5, and one diagnostic line at
+  eight rounds. A lost round also leaves an unreferenced commit and tree, and
+  this repo has no GC wired; `commit_coalesced` already orphans commits, and D19
+  makes the rate proportional to contention.
 - **R8 (low) - a `Read_only` RPC endpoint whose handler writes the store.** The
   `Tea_rpc.endpoint_kind` witness is what the server gates on, and it is a
   *declaration*: the type system forces every endpoint to carry one (no
@@ -1299,3 +1409,79 @@ Each lean-tea private-constructor primitive → an OCaml `.mli` boundary:
     bottom record after a real witness no longer de-witnesses the tab;
     and a session that used `undo` has its floors dropped at
     the next restart, a named false positive on the duplicate side.
+
+14. **The witnessed step** - make the TEA step a compare-and-set transaction so
+    two writers on one branch cannot erase each other (R10, D19). **Done**
+    (`Store_core.based`, the abstract session-bound token minted only by
+    `load_based`, which reads the head once and gathers the model *through*
+    that commit rather than off the branch, both reads fenced; `based_model`,
+    so the model is read off the token and the safe wiring is the SHORT one;
+    `committed = { water; model; rounds }`, a record because the committed
+    model differs from the caller's input under contention and a tuple would
+    let a caller pick up its own stale value by position; `commit_based`, one
+    tail-recursive `attempt` carrying its own witness AND the ancestor that
+    witness stands for, minting per round through `S.Commit.v` +
+    `S.Head.test_and_set` - `append_commit`'s production recipe, one door for
+    both the whole-blob and exploded arms, with plain `commit` untouched in
+    both; the pure `resolution` type, exhaustive over `Merge_spec.t`'s three
+    constructors, whose conflict arm carries its reason OUT so the single
+    commit site writes it into the label instead of onto a stderr line that
+    dies with the process; the absent-head arm, because a denied test-and-set
+    does not imply a competitor committed - the reaper removes whole branches,
+    and `gather` reports absence as the app's INITIAL model, which a three-way
+    policy would read as "theirs deleted everything"; `commit_coalesced` with
+    the amend decision AND its test-and-set both pinned to the witness rather
+    than to a head re-read taken after the caller's load; `append_commit`
+    reworked onto the token, its three-attempt retry and its plain-`commit`
+    fallback deleted, the first because retrying without recomputing is what
+    R10 indicts and the second because an unconditional last write wins is R10
+    itself; `step_with` re-signed to take the token, plus `?interpose`, a hook
+    fired between the witnessed read and the commit so a test can land a
+    competing writer in the one window that matters without a sleep or a
+    scheduler assumption - deliberately NOT an injectable commit function,
+    which would let a closure ignore the witness and reach the plain door in a
+    directory that has no `.mli` to forbid it; `shared_doc_serve`'s
+    `mutate_lock` retired; `test/contention_test` C1-C15 and S1-S2, 17 checks
+    over four local apps - an `Or_set` app because a counter CANNOT express two
+    survivors here (the replica is minted from the branch name and R10's
+    premise is one branch, so both writers apply under one replica and
+    `Pn_counter.join` is a per-replica max), a `Three_way` app that merges, one
+    that always refuses, and a `Last_write_wins` app; 13 new mutations, 11
+    killing and 2 declared equivalents; the mutation driver's native runner
+    gains `NATIVE_TIMEOUT_S` and a `TimeoutExpired` non-catch verdict, because
+    an unbounded reconcile loop's regression is a HANG, and a sweep that hangs
+    reports nothing at all, which is strictly worse than a MISS).
+
+    Nothing is re-run: a denied round re-runs neither `Loop.step` nor
+    `A.update`, it reconciles the model already computed against the model at
+    the head that landed. Re-running would double a real `Lwt_unix.sleep` and
+    mint a second CRDT dot for one user operation, which a join then keeps -
+    one click, two set elements. And the commit is **total**, which is a
+    composition requirement rather than a convenience: a refusal would have to
+    travel to the pump, whose `Cell` has already consumed the sequence number
+    before the apply and whose guard outlives the socket, so a refused message
+    replays as `Duplicate` and is acked without ever being applied. Un-taking
+    would mean lowering a floor whose stated law is that it never lowers. The
+    D16/D18 family's standing direction - degrade toward a visible duplicate,
+    never toward silent loss - therefore forbids the obvious `Contended` retry
+    budget outright.
+
+    Left open, deliberately: R10b, R10c, R10d and R10e (§10) - unguarded
+    `undo`/`redo`/`fork` head moves, the non-CRDT arms keeping content only for
+    the already-acked writer, the pre-existing cancellation loss, and
+    per-socket liveness plus the unreferenced commits a lost round leaves in a
+    repo with no GC wired; the example tier is NOT driven by a two-writer
+    check, because the `Mutating` RPC handler exposes no interpose seam and,
+    under `Irmin_mem` with `Cmd.none`, two RPC calls simply serialize, so what
+    replaced the retired mutex is a type-level guarantee at the seam and not a
+    check at the example; and C11/C12, the pack close/reopen round trips that
+    were this step's U1 decision point, are **pins rather than
+    mutation-confirmed** - both went green, so the `S.Commit.v` door is sound
+    on pack and Irmin's contents-level `S.test_and_set` fallback stays
+    unopened, but no mutation in the table kills them. Two mutations are
+    declared equivalents and say why: the round's base tree is unobservable end
+    to end (`scatter` rewrites every model path, and nothing in the suite
+    writes a path the model does not own), and an amend decision taken from a
+    live head read instead of the witness falls into an append that reconciles
+    to an identical landed state, so catching it would need a check on the
+    orphaned amend commit or on the clock tick it burns.

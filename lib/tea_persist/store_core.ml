@@ -64,6 +64,19 @@ module type CORE = sig
   val fork : t -> from:session -> Tea_core.Prim.Session_id.t -> session Lwt.t
   val load : session -> model Lwt.t
   val commit : session -> label:string -> model -> Tea_core.Prim.Store_water.t Lwt.t
+
+  type based
+
+  val load_based : session -> based Lwt.t
+  val based_model : based -> model
+
+  type committed =
+    { water : Tea_core.Prim.Store_water.t
+    ; model : model
+    ; rounds : int
+    }
+
+  val commit_based : based -> label:string -> model -> committed Lwt.t
   val ctx_of_session : session -> Tea_core.Crdt.Ctx.t
   val head_water : session -> Tea_core.Prim.Store_water.t Lwt.t
 
@@ -112,9 +125,7 @@ module type CORE = sig
     val seal : t -> unit
   end
 
-  val commit_coalesced :
-    Coalescer.t -> session -> msg:msg -> model -> Tea_core.Prim.Store_water.t Lwt.t
-
+  val commit_coalesced : Coalescer.t -> based -> msg:msg -> model -> committed Lwt.t
   val apply_coalesced : Coalescer.t -> session -> msg -> model Lwt.t
 end
 
@@ -301,6 +312,206 @@ struct
 
   let load (s : session) : A.model Lwt.t = gather s.exploded (S.find s.branch)
 
+  (** The model as of one specific commit rather than the branch head: watch
+      notifications read the tree they were notified about, so a burst of
+      commits yields one frame per commit instead of n reads of whatever the
+      final head happens to be. Since D19 it is also the witnessed read: the
+      whole point of a witness is that the model came from the commit the
+      test-and-set will name, and only a read {i through} that commit can say
+      so. *)
+  let model_at_with (x : exploder option) (c : S.commit) : A.model Lwt.t =
+    let* at = S.of_commit c in
+    gather x (S.find at)
+
+  let model_at (t : t) (c : S.commit) : A.model Lwt.t = model_at_with t.exploded c
+
+  (* Every read the witnessed path makes is fenced the way [head_water] and
+     the watch delivery already fence theirs (D19): a surface with no error
+     channel must not leak the backend's exceptions instead, or the raise
+     lands in the WS pump after the sequence number was taken and before the
+     floor was written, which is the silent loss the whole guard family
+     exists to prevent. A fenced miss degrades to the ABSENT witness, from
+     which a commit is a create-if-still-absent that any live branch simply
+     denies — so the cost of a fenced miss is one extra reconcile round, not
+     a wrong write. *)
+  let fenced_head (s : session) : S.commit option Lwt.t =
+    Lwt.catch (fun () -> S.Head.find s.branch) (fun (_ : exn) -> Lwt.return None)
+
+  let fenced_model_at (x : exploder option) (c : S.commit) : A.model Lwt.t =
+    Lwt.catch (fun () -> model_at_with x c) (fun (_ : exn) -> Lwt.return (fst A.init))
+
+  (** One writer's witnessed read (roadmap step 14, D19). See store_core.mli:
+      the head observed at read time, the model read through {i that} commit,
+      and the session both came from, so neither can be forged nor crossed. *)
+  type based =
+    { session : session
+    ; head : S.commit option
+    ; model : A.model
+    }
+
+  let load_based (s : session) : based Lwt.t =
+    let* head = fenced_head s in
+    (* Absence yields [fst A.init] rather than a [gather] over an empty find,
+       which is the same value by construction ([gather]'s legacy arm defaults
+       a missing blob to it, and its exploded arm falls into that legacy arm
+       when no leaf is present) and one fewer backend round trip. *)
+    let* model =
+      Option.fold head
+        ~none:(fun () -> Lwt.return (fst A.init))
+        ~some:(fun (c : S.commit) () -> fenced_model_at s.exploded c)
+        ()
+    in
+    Lwt.return { session = s; head; model }
+
+  let based_model (b : based) : A.model = b.model
+
+  (* The outcome of one reconcile round, as a value rather than as a side
+     effect (D19). The conflict arm carries its reason OUT rather than
+     printing it: an app-declared loss recorded only by [Printf.eprintf] dies
+     with the process, while the branch is this system's audit surface, so the
+     single commit site appends the reason to the label instead. *)
+  type resolution =
+    | Joined of A.model
+    | Declared of A.model
+    | Conflicted of
+        { model : A.model
+        ; reason : string
+        }
+
+  (* Exhaustive over {!Tea_core.Merge_spec.t}'s three constructors with no
+     wildcard, so a fourth policy has to come here and say what losing a race
+     means for it.
+
+     [ours] wins every non-joining arm, and that is forced rather than chosen:
+     the message being committed is one the WS pump has already TAKEN and is
+     about to ACK, and the D16 contract is that an acked effect exists in the
+     store. [theirs] is not erased either — it is the parent of the commit
+     this round mints, so its content stays reachable from history. That is
+     the honest limit of the closure (R10c) and still a strict improvement on
+     the pre-D19 [set_exn], where the loser was erased AND unreachable.
+
+     Pure: no IO, no printing. The reason travels as data. *)
+  let resolve ~(ancestor : A.model option) ~(ours : A.model) ~(theirs : A.model) : resolution =
+    match A.merge with
+    | Tea_core.Merge_spec.Crdt_join join -> Joined (join ours theirs)
+    | Tea_core.Merge_spec.Last_write_wins -> Declared ours
+    | Tea_core.Merge_spec.Three_way f ->
+      Result.fold
+        (f ~ancestor ~ours ~theirs)
+        ~ok:(fun (m : A.model) -> Joined m)
+        ~error:(fun (reason : string) -> Conflicted { model = ours; reason })
+
+  let resolved_model (r : resolution) : A.model =
+    match r with
+    | Joined m -> m
+    | Declared m -> m
+    | Conflicted { model; reason = (_ : string) } -> model
+
+  (* An app-declared loss is written into the commit message, so "the loser is
+     recoverable from history" is something a reader of the log can act on
+     rather than something this file claims. [Declared] is labelled too: a
+     [Last_write_wins] app that quietly drops a concurrent write leaves the
+     same trace as one whose merge function refused. *)
+  let resolved_label (label : string) (r : resolution) : string =
+    match r with
+    | Joined (_ : A.model) -> label
+    | Declared (_ : A.model) -> label ^ " [last-write-wins over a concurrent commit]"
+    | Conflicted { model = (_ : A.model); reason } -> label ^ " [conflict: " ^ reason ^ "]"
+
+  (** What a witnessed commit actually landed (D19). See store_core.mli: a
+      record rather than a tuple because two of its three fields are easy to
+      confuse with the caller's own inputs. *)
+  type committed =
+    { water : Tea_core.Prim.Store_water.t
+    ; model : A.model
+    ; rounds : int
+    }
+
+  (* Loud once, at a round count no honest workload reaches: the loop is
+     unbounded on purpose (every loss-free exhaustion arm is either this loop
+     continued or a plain set, and a plain set is R10), so its only pathology
+     is a socket that keeps being outrun, and an unobservable pathology is a
+     hang rather than a test result. *)
+  let reconcile_noisy_round = 8
+
+  (* The loop itself, handing back the commit it minted as well as what that
+     commit landed. Only the coalescer needs the commit (its run bookkeeping
+     is keyed on the hash of a commit it minted ITSELF), and it must not get
+     it by reading the head back afterwards: a head read after a successful
+     commit can belong to a later writer, and a run that then amends that
+     writer's commit is the ownership guard defeated. *)
+  let commit_witnessed (b : based) ~(label : string) (model : A.model) :
+      (S.commit * committed) Lwt.t =
+    let s = b.session in
+    let parents_of (h : S.commit option) : S.commit_key list =
+      Option.fold h ~none:[] ~some:(fun (c : S.commit) -> [ S.Commit.key c ])
+    in
+    let base_tree (h : S.commit option) : S.tree =
+      Option.fold h ~none:(S.Tree.empty ()) ~some:S.Commit.tree
+    in
+    (* One tail-recursive function carrying its own witness AND the ancestor
+       that witness stands for, so the ancestor is a function of the round and
+       freezing it at round zero is unwritable rather than merely untested.
+       With a frozen ancestor, round two of a three-way merge would compare an
+       [ours] that already contains round one's [theirs] against a base that
+       predates it, and read a re-add as a delete. *)
+    let rec attempt
+        (witness : S.commit option)
+        (ancestor : A.model)
+        (ours : A.model)
+        (label : string)
+        (rounds : int) : (S.commit * committed) Lwt.t =
+      if Int.equal rounds reconcile_noisy_round then
+        Printf.eprintf
+          "tea-store: %d reconcile rounds on branch %s (%s): a writer may be outrun\n%!"
+          rounds s.name label;
+      let* tree = scatter s.exploded (base_tree witness) ours in
+      (* The date is re-minted per round, never frozen at round zero: a
+         retried commit carrying an older date than the racing parent it
+         retried over would break the branch-date monotonicity
+         {!Tea_core.Prim.Store_water} rests on (the step-13 lesson at the
+         comment above [commit]). Gaps in the clock are harmless; order is
+         not. *)
+      let* c =
+        S.Commit.v s.repo ~info:(info_v s.clock label) ~parents:(parents_of witness) tree
+      in
+      let* moved = S.Head.test_and_set s.branch ~test:witness ~set:(Some c) in
+      if moved then
+        Lwt.return
+          ( c
+          , ({ water = Tea_core.Prim.Store_water.of_date (S.Info.date (S.Commit.info c))
+             ; model = ours
+             ; rounds
+             }
+              : committed) )
+      else
+        let* landed = fenced_head s in
+        Option.fold landed
+          ~none:(fun () ->
+            (* A denied test-and-set does not imply a competitor committed:
+               the reaper removes whole branches. An absent head must never
+               reach the resolver, because [gather] reports absence as the
+               app's INITIAL model and a three-way policy would read that as
+               "theirs deleted everything". Our content becomes a fresh root
+               instead; the reaper's own precondition already scrubbed the
+               delivery floor, so the client's next replay reads Fresh. *)
+            attempt None ancestor ours label (rounds + 1))
+          ~some:(fun (landed_c : S.commit) () ->
+            let* theirs = fenced_model_at s.exploded landed_c in
+            let r = resolve ~ancestor:(Some ancestor) ~ours ~theirs in
+            attempt (Some landed_c) theirs (resolved_model r) (resolved_label label r)
+              (rounds + 1))
+          ()
+    in
+    attempt b.head b.model model label 0
+
+  (** Persist one model as one commit against the witness, resolving
+      contention rather than refusing it (roadmap step 14, D19). See
+      store_core.mli for why it is total and why nothing is re-run. *)
+  let commit_based (b : based) ~(label : string) (model : A.model) : committed Lwt.t =
+    let* ((_ : S.commit), landed) = commit_witnessed b ~label model in
+    Lwt.return landed
+
   (* Whole-blob and exploded stores take genuinely different write paths, and
      the no-witness one is the historical [set_exn] {i verbatim}. Unifying both
      onto a root [set_tree_exn] is what a first cut does, and it is wrong: a
@@ -381,14 +592,21 @@ struct
 
   (** One TEA step, persisted as one commit. (Cmd effects are the server
       runtime's job; here we persist the model transition and label the commit
-      with the Msg so the history reads as an event log.) *)
+      with the Msg so the history reads as an event log.)
+
+      Witnessed since D19: the read mints a token, the step runs off that
+      token's model, and the commit tests against the head the model was read
+      through, so a writer landing mid-step is reconciled instead of erased.
+      The returned model is therefore the {i committed} one, not the caller's
+      own transition — under contention the two differ, and the callers that
+      immediately assert store state want the former. *)
   let apply (s : session) (msg : A.msg) : A.model Lwt.t =
-    let* model = load s in
-    let model', _cmd = A.update (ctx_of_session s) msg model in
-    let* (_ : Tea_core.Prim.Store_water.t) =
-      commit s ~label:(Codec.msg_to_label msg) model'
+    let* b = load_based s in
+    let model', (_ : A.msg Tea_core.Cmd.t) =
+      A.update (ctx_of_session s) msg (based_model b)
     in
-    Lwt.return model'
+    let* (landed : committed) = commit_based b ~label:(Codec.msg_to_label msg) model' in
+    Lwt.return landed.model
 
   let ref_of_commit (c : S.commit) : Tea_core.Prim.Commit_ref.t =
     Tea_core.Prim.Commit_ref.of_hash (Irmin.Type.to_string S.Hash.t (S.Commit.hash c))
@@ -457,16 +675,6 @@ struct
         let* () = S.Branch.remove s.repo (redo_ref_name s) in
         let* model = load s in
         Lwt.return (Some model))
-
-  (** The model as of one specific commit rather than the branch head: watch
-      notifications read the tree they were notified about, so a burst of
-      commits yields one frame per commit instead of n reads of whatever the
-      final head happens to be. *)
-  let model_at_with (x : exploder option) (c : S.commit) : A.model Lwt.t =
-    let* at = S.of_commit c in
-    gather x (S.find at)
-
-  let model_at (t : t) (c : S.commit) : A.model Lwt.t = model_at_with t.exploded c
 
   type watch = S.watch
 
@@ -629,75 +837,81 @@ struct
 
   let hash_equal : S.hash -> S.hash -> bool = Irmin.Type.(unstage (equal S.Hash.t))
 
-  (* A fresh commit on top of the observed head, moved by test-and-set so a
-     racing writer is never overwritten; after repeated interference, fall
-     back to the plain event-log commit and break the run. Three attempts:
-     interference on a single session is transient (one racing form post or
-     merge), so more retries would only defer the safe fallback. *)
-  let append_retry_budget = 3
+  (* A fresh commit on top of the WITNESSED head, moved by test-and-set and
+     reconciled on denial: {!commit_witnessed} plus the one piece of
+     bookkeeping the run needs, the hash of the commit this coalescer minted.
 
-  let append_commit (cz : Coalescer.t) (s : session) ~(msg : A.msg) (model : A.model) :
-      Tea_core.Prim.Store_water.t Lwt.t =
-    let label = Codec.msg_to_label msg in
-    let rec attempt (fuel : int) : Tea_core.Prim.Store_water.t Lwt.t =
-      if fuel <= 0 then (
-        Coalescer.seal cz;
-        commit s ~label model)
-      else
-        let* head = S.Head.find s.branch in
-        let parents = Option.fold head ~none:[] ~some:(fun h -> [ S.Commit.key h ]) in
-        let base_tree = Option.fold head ~none:(S.Tree.empty ()) ~some:S.Commit.tree in
-        let* tree = scatter s.exploded base_tree model in
-        let* c = S.Commit.v s.repo ~info:(info_v s.clock label) ~parents tree in
-        let* moved = S.Head.test_and_set s.branch ~test:head ~set:(Some c) in
-        if moved then (
-          cz.Coalescer.run <- Some (S.Commit.hash c, msg);
-          Lwt.return (Tea_core.Prim.Store_water.of_date (S.Info.date (S.Commit.info c))))
-        else attempt (fuel - 1)
-    in
-    attempt append_retry_budget
+     Two things are gone since D19, and both were losses hiding inside the
+     mitigation. The three-attempt retry re-committed the same stale model
+     against a freshly read head, which is exactly what R10 indicts ("preserves
+     history, not content"); and its exhaustion arm sealed the run and fell
+     back to a plain [commit], an unconditional last-write-wins [set_exn]
+     after three losses, which is R10's own loss mechanism. There is nothing
+     left to fall back TO because the loop no longer has a failing case. *)
+  let append_commit (cz : Coalescer.t) (b : based) ~(msg : A.msg) (model : A.model) :
+      committed Lwt.t =
+    let* (c, landed) = commit_witnessed b ~label:(Codec.msg_to_label msg) model in
+    cz.Coalescer.run <- Some (S.Commit.hash c, msg);
+    Lwt.return landed
 
   (** Commit one Msg through the coalescer: amend the head while the policy
       keeps folding {i and} the head is one this coalescer minted; otherwise
       append a fresh commit. [Keep_all] takes the historical path bit for
       bit. *)
-  let commit_coalesced (cz : Coalescer.t) (s : session) ~(msg : A.msg) (model : A.model) :
-      Tea_core.Prim.Store_water.t Lwt.t =
+  let commit_coalesced (cz : Coalescer.t) (b : based) ~(msg : A.msg) (model : A.model) :
+      committed Lwt.t =
+    let s = b.session in
     match cz.Coalescer.spec with
-    | Tea_core.Coalesce_spec.Keep_all -> commit s ~label:(Codec.msg_to_label msg) model
+    | Tea_core.Coalesce_spec.Keep_all -> commit_based b ~label:(Codec.msg_to_label msg) model
     | Tea_core.Coalesce_spec.Fold_run f ->
-      let* head = S.Head.find s.branch in
       let amend =
         (* Pure decision: amendable iff the head is the commit we minted and
-           the policy folds the run's Msg with the incoming one. *)
-        Option.bind head (fun h ->
-            Option.bind cz.Coalescer.run (fun (minted, last) ->
+           the policy folds the run's Msg with the incoming one.
+
+           Taken against the WITNESS since D19, not against a fresh head read.
+           The old read happened after the caller's load, so a writer landing
+           in that gap flipped the run to the append path while the model in
+           hand was already stale: the amend test was right and its timing was
+           wrong. Asking the witness makes the decision and the test-and-set
+           agree about which commit this writer actually saw. *)
+        Option.bind b.head (fun (h : S.commit) ->
+            Option.bind cz.Coalescer.run (fun ((minted : S.hash), (last : A.msg)) ->
                 if hash_equal (S.Commit.hash h) minted then
-                  Option.map (fun folded -> (h, folded)) (f ~last ~next:msg)
+                  Option.map (fun (folded : A.msg) -> (h, folded)) (f ~last ~next:msg)
                 else None))
       in
-      (match amend with
-       | None -> append_commit cz s ~msg model
-       | Some (h, folded) ->
-         let* tree = scatter s.exploded (S.Commit.tree h) model in
-         let* c =
-           S.Commit.v s.repo
-             ~info:(info_v s.clock (Codec.msg_to_label folded))
-             ~parents:(S.Commit.parents h) tree
-         in
-         let* moved = S.Head.test_and_set s.branch ~test:(Some h) ~set:(Some c) in
-         if moved then (
-           cz.Coalescer.run <- Some (S.Commit.hash c, folded);
-           Lwt.return (Tea_core.Prim.Store_water.of_date (S.Info.date (S.Commit.info c))))
-         else (
-           (* A writer landed mid-amend: their commit wins, ours is unreferenced;
-              start a fresh run on top of theirs. *)
-           Coalescer.seal cz;
-           append_commit cz s ~msg model))
+      Option.fold amend
+        ~none:(fun () -> append_commit cz b ~msg model)
+        ~some:(fun ((h : S.commit), (folded : A.msg)) () ->
+          let* tree = scatter s.exploded (S.Commit.tree h) model in
+          let* c =
+            S.Commit.v s.repo
+              ~info:(info_v s.clock (Codec.msg_to_label folded))
+              ~parents:(S.Commit.parents h) tree
+          in
+          let* moved = S.Head.test_and_set s.branch ~test:(Some h) ~set:(Some c) in
+          if moved then (
+            cz.Coalescer.run <- Some (S.Commit.hash c, folded);
+            Lwt.return
+              ({ water = Tea_core.Prim.Store_water.of_date (S.Info.date (S.Commit.info c))
+               ; model
+               ; rounds = 0
+               }
+                : committed))
+          else (
+            (* A writer landed mid-amend: their commit wins, ours is
+               unreferenced; start a fresh run on top of theirs. The append we
+               fall into now RECONCILES against the witness we still hold, so
+               that writer keeps their content and not merely their history. *)
+            Coalescer.seal cz;
+            append_commit cz b ~msg model))
+        ()
 
   let apply_coalesced (cz : Coalescer.t) (s : session) (msg : A.msg) : A.model Lwt.t =
-    let* model = load s in
-    let model', _cmd = A.update (ctx_of_session s) msg model in
-    let* (_ : Tea_core.Prim.Store_water.t) = commit_coalesced cz s ~msg model' in
-    Lwt.return model'
+    let* b = load_based s in
+    let model', (_ : A.msg Tea_core.Cmd.t) =
+      A.update (ctx_of_session s) msg (based_model b)
+    in
+    let* (landed : committed) = commit_coalesced cz b ~msg model' in
+    Lwt.return landed.model
 end

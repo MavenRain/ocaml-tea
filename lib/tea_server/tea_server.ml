@@ -115,10 +115,25 @@ struct
       its commit dates from the store's single clock, and the outcome carries
       the water [commit] returned so a caller persisting a floor stamps it
       with the state it actually de-duplicated against. A [Navigate] effect
-      is captured and surfaced as the redirect target. *)
-  let step_with
-      ~(commit :
-          St.session -> msg:A.msg -> A.model -> Tea_core.Prim.Store_water.t Lwt.t)
+      is captured and surfaced as the redirect target.
+
+      Witnessed since D19 (roadmap step 14): the read mints a
+      {!St.based} token and the commit closure can only be handed that token,
+      so nothing routed through this seam can reach the last-write-wins door.
+      Under contention the outcome carries the {i committed} model and the
+      water of the commit that actually landed, so a floor stamped from it
+      still names a commit the store has.
+
+      [?interpose] is fired between this step's witnessed read and its commit,
+      so a test can land a competing writer in the one window that matters and
+      get a deterministic reconcile without a sleep or a scheduler assumption.
+      Defaults to a resolved unit, the same seam discipline as [?guard]. It is
+      deliberately NOT an injectable commit function: a commit seam would let
+      an injected closure ignore the witness and call the plain
+      last-write-wins commit, which is a compile-clean way to disable D19 in
+      production, and this module has no [.mli] in which to forbid it. *)
+  let step_with ?(interpose : unit -> unit Lwt.t = fun () -> Lwt.return_unit)
+      ~(commit : St.based -> msg:A.msg -> A.model -> St.committed Lwt.t)
       (s : St.session) (msg : A.msg) : (step_outcome, Loop.err) result Lwt.t =
     let redirect = ref None in
     let fx =
@@ -129,20 +144,23 @@ struct
             Lwt.return_unit)
       }
     in
-    let* model = St.load s in
+    let* based = St.load_based s in
     let ctx = St.ctx_of_session s in
-    let* stepped = Loop.step ~ctx ~fx ~fuel:Prim.Fuel.default msg model in
+    let* stepped = Loop.step ~ctx ~fx ~fuel:Prim.Fuel.default msg (St.based_model based) in
     Result.fold stepped
       ~ok:(fun model' ->
-        let* water = commit s ~msg model' in
-        Lwt.return (Ok { model = model'; redirect = !redirect; water }))
+        let* () = interpose () in
+        let* (landed : St.committed) = commit based ~msg model' in
+        Lwt.return
+          (Ok { model = landed.St.model; redirect = !redirect; water = landed.St.water }))
       ~error:(fun (e : Loop.err) -> Lwt.return (Error e))
 
   (** One TEA step over HTTP: one commit per Msg, labelled with the Msg so
       the branch log stays the event log. *)
-  let step : St.session -> A.msg -> (step_outcome, Loop.err) result Lwt.t =
-    step_with ~commit:(fun s ~msg model ->
-        St.commit s ~label:(Codec.msg_to_label msg) model)
+  let step ?(interpose : unit -> unit Lwt.t = fun () -> Lwt.return_unit) :
+      St.session -> A.msg -> (step_outcome, Loop.err) result Lwt.t =
+    step_with ~interpose ~commit:(fun based ~msg model ->
+        St.commit_based based ~label:(Codec.msg_to_label msg) model)
 
   (* --- Live view over WebSocket (roadmap step 3, DESIGN §7) -------------- *)
 
@@ -187,12 +205,13 @@ struct
       ~floors:Durable_guard.Floors.empty
 
   let live_session ?(coalesce = Tea_core.Coalesce_spec.Keep_all) ?(guard = guard)
-      (s : St.session) (t : live_transport) : unit Lwt.t =
+      ?(interpose : unit -> unit Lwt.t = fun () -> Lwt.return_unit) (s : St.session)
+      (t : live_transport) : unit Lwt.t =
     (* One coalescer per socket (R1): a chatty client folds its own run of
        Msgs into one amended commit, and can never amend a commit some other
        writer minted — a form post, a merge, or an undo ends the run. *)
     let cz = St.Coalescer.v coalesce in
-    let step_ws = step_with ~commit:(St.commit_coalesced cz) in
+    let step_ws = step_with ~interpose ~commit:(St.commit_coalesced cz) in
     let frames, push = Lwt_stream.create () in
     let* w =
       St.watch s (fun m ->

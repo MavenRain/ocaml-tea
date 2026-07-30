@@ -70,6 +70,12 @@ module type CORE = sig
   val main_session : t -> session Lwt.t
   val fork : t -> from:session -> Tea_core.Prim.Session_id.t -> session Lwt.t
   val load : session -> model Lwt.t
+  (** The model standing at this session branch's head, read off the branch.
+      A read-only surface since D19: the model it returns carries no witness,
+      so an edit derived from it and handed to {!commit} is a last-write-wins
+      write that can erase a concurrent writer (R10). Read, edit and commit
+      through {!load_based} instead. *)
+
   val commit : session -> label:string -> model -> Tea_core.Prim.Store_water.t Lwt.t
   (** Persist one model as one commit and return the
       {!Tea_core.Prim.Store_water} of the very commit minted (roadmap step 13):
@@ -77,7 +83,115 @@ module type CORE = sig
       the floor can never claim a commit the store does not have. Captured
       from the commit's own [Info] date, never read back off the head — a
       concurrent writer between commit and read-back would hand the floor a
-      water it has no right to. *)
+      water it has no right to.
+
+      {b Precondition since D19}: the model must not derive from a prior read
+      of this branch. This is the load-free writer's door — a boot seed, a
+      test that commits values directly — and a read-modify-write routed
+      through it is exactly R10, which is why the step seam can no longer
+      reach it. *)
+
+  type based
+  (** One writer's witnessed read: the branch head observed at read time, the
+      model read {i through} that very commit, and the session both came from.
+      Abstract, and {!load_based} is the only mint, for two reasons a labelled
+      [~base] argument cannot supply.
+
+      First, a witness that could be built from a fresh head read is
+      self-satisfying, and self-satisfying is the whole bug: the pre-D19
+      [append_commit] re-read the head and tested against that read, so the
+      test passed while the stale model still landed on the racer — R10's
+      "preserves history, not content".
+
+      Second, the token carries its session, so a witness minted on one branch
+      cannot be presented to another. Under a total commit that mistake would
+      not even be an error: the test would fail, the loop would reload the
+      other branch and join a foreign model into it. Prose has been tried on
+      the neighbouring hazard ({!Coalescer.t}'s "not for sharing across
+      concurrent writers"); a token is cheaper than prose.
+
+      Both reads are fenced, so the token is total in fact and not merely in
+      type: a backend that raises on a collected head or tree yields the
+      absent witness, from which a commit is a create-if-still-absent that a
+      moved branch simply denies. That is the fence {!head_water} and the
+      watch delivery already carry. *)
+
+  val load_based : session -> based Lwt.t
+  (** Read the head once, then gather the model through {i that} commit rather
+      than off the branch. Two reads off the branch would be two Lwt steps, so
+      a writer landing between them would hand back a model older than the
+      witness and the commit would then pass its test while erasing that
+      writer: R10 rebuilt inside its own fix. An empty branch yields the
+      absent witness paired with the app's initial model, exactly the value
+      {!load} reports for one. *)
+
+  val based_model : based -> model
+  (** The model this writer saw, and the only model a witnessed commit should
+      be computed from. Reading it off the token rather than off a second
+      {!load} is deliberate: it makes the safe wiring the {i shorter} one, the
+      lesson this module already wrote down about [?forget]'s no-op default. *)
+
+  (** What a witnessed commit actually landed. A record rather than a tuple
+      because two of its three fields are easy to confuse with the caller's
+      own inputs: the model here is the {i committed} one, which under
+      contention differs from the one passed in, and the water is the winning
+      round's mint rather than the first attempt's. A tuple would let a caller
+      silently pick up its own stale value by position. *)
+  type committed =
+    { water : Tea_core.Prim.Store_water.t
+          (** The date of the commit that actually landed, minted by the
+              winning round. The only value a delivery floor for this message
+              may claim, and read off the commit itself, never back off a
+              head: a head read after the commit can belong to a later
+              writer. *)
+    ; model : model
+          (** What the branch now holds for this write: the model as
+              committed, which under contention is the reconciled model
+              rather than the one the caller passed in. A caller reporting
+              state to a user must report this and not its own input. *)
+    ; rounds : int
+          (** How many times contention forced a reconcile before this commit
+              landed; [0] on an uncontended write. Exposed because a loop
+              whose progress cannot be observed can only fail as a hang, and
+              a hang is not a test result. *)
+    }
+
+  val commit_based : based -> label:string -> model -> committed Lwt.t
+  (** Persist one model as one commit against the witness, resolving
+      contention rather than refusing it.
+
+      Each round mints a commit parented on the witnessed head, carrying the
+      model scattered onto that commit's tree, and moves the branch by
+      test-and-set. On denial the head that actually landed is re-observed and
+      becomes the new witness, the app's {!Tea_core.Merge_spec.t} reconciles
+      the caller's model against the model at that head with the {i new}
+      witness as ancestor, and the round repeats. Nothing is re-run: the
+      caller's step, its effects and its CRDT dots all happened exactly once,
+      and only their result is carried forward. Re-running would double a real
+      [Lwt_unix.sleep] and mint a second dot for one user operation, which a
+      join then keeps — one click, two set elements.
+
+      Total on purpose, not for convenience. A refusal would have to travel to
+      the WS pump, whose [Cell] has already consumed the message's sequence
+      number before the apply and whose guard outlives the socket, so a
+      refused message replays as [Duplicate] and is acknowledged without ever
+      being applied. That is the silent loss the whole D16 family exists to
+      prevent, and the only way to un-take is to lower a floor whose law is
+      that it never lowers.
+
+      Unbounded, and bounded in fact: a round is entered only after the head
+      moved, and a head only moves when another writer's write landed, so
+      rounds are paid for by competing writes rather than by a constant. A
+      budget was rejected because every loss-free exhaustion arm is either
+      this loop continued or a plain set, and a plain set is R10. What a
+      budget would have bought — visible progress — is bought instead by
+      [rounds] and by one diagnostic line at eight.
+
+      An absent head is not a merge input. When the re-observed head is [None]
+      the branch was removed underneath us (the reaper), and the caller's
+      model is committed as a fresh root rather than reconciled against the
+      app's initial model, which a three-way policy would read as "theirs
+      deleted everything". *)
 
   val ctx_of_session : session -> Tea_core.Crdt.Ctx.t
   (** The CRDT context (D1) a step on this session applies under: the session's
@@ -224,10 +338,20 @@ module type CORE = sig
         merge base. *)
   end
 
-  val commit_coalesced :
-    Coalescer.t -> session -> msg:msg -> model -> Tea_core.Prim.Store_water.t Lwt.t
-  (** Like {!commit}, returning the minted commit's water — whichever path
-      minted it (amend, fresh append, or the sealed fallback). *)
+  val commit_coalesced : Coalescer.t -> based -> msg:msg -> model -> committed Lwt.t
+  (** {!commit_based} through the coalescer: amend the head while the policy
+      keeps folding {i and} the head is the commit this coalescer minted,
+      otherwise append. Returns what landed, whichever path minted it.
+
+      The ownership guard is unchanged; what changed in D19 is when it is
+      asked. The amend decision and its test-and-set both consult the witness
+      rather than a head re-read taken after the caller's load, because a
+      writer landing in that gap used to demote the run to an append that then
+      carried an already stale model. The append path is one witnessed
+      test-and-set with {!commit_based}'s reconcile loop; the historical
+      three-attempt retry and its plain-{!commit} fallback are gone, the first
+      because retrying without recomputing is what R10 indicts and the second
+      because an unconditional last write wins is R10 itself. *)
 
   val apply_coalesced : Coalescer.t -> session -> msg -> model Lwt.t
 end

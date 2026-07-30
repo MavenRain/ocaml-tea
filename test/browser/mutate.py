@@ -594,6 +594,256 @@ MUTATIONS = [
         "expect_red": {"native": [], "browser": []},
         "run": ["native"],
     },
+    # --- Roadmap step 14, D19: the witnessed write path under contention -----
+    # Native-only, all of them. The browser tier drives one writer per
+    # scenario and this whole family lives in the window between one writer's
+    # read and its commit, so smoke.mjs has nothing to say about any of it.
+    # Each entry is an inline argument swap or an addition, never a deletion
+    # that orphans a binding: warnings 26/27/32 are errors in this build, and
+    # a mutation that dies at compile time proves typing rather than
+    # observation. contention_test is fail-fast like every other file here, so
+    # each label below is the check that ACTUALLY went red when the mutation
+    # was hand-driven, not the deepest check it would reach.
+    {
+        "id": "mut-cas-tests-a-fresh-head",
+        "why": "the test-and-set must name the head this writer READ: tested against a freshly read one instead, every witnessed commit is last-write-wins again and the racer's content is gone",
+        "file": "lib/tea_persist/store_core.ml",
+        # The pre-D19 disease one layer down. The witness still supplies the
+        # parents and the base tree, so the commit is well formed and only the
+        # CAS is wrong: no hang, no extra round, the loser's content simply
+        # vanishes while its commit stays in history. R10 exactly.
+        "old": "      let* moved = S.Head.test_and_set s.branch ~test:witness ~set:(Some c) in",
+        "new": """      let* head_live = S.Head.find s.branch in
+      let* moved = S.Head.test_and_set s.branch ~test:head_live ~set:(Some c) in""",
+        "expect_red": {
+            "native": ["both writers' content survives an interleaved commit"],
+            "browser": [],
+        },
+    },
+    {
+        "id": "mut-resolve-theirs-is-ours",
+        "why": "`theirs` is the model read through the commit that WON the race: handed ours instead, the loop merges a writer with itself and the round it just lost leaves nothing in content",
+        "file": "lib/tea_persist/store_core.ml",
+        # The join still runs and still returns, so the shape of the fix is
+        # untouched and only its inputs are wrong - the failure mode a merge
+        # helper refactor actually produces.
+        "old": "            let r = resolve ~ancestor:(Some ancestor) ~ours ~theirs in",
+        "new": "            let r = resolve ~ancestor:(Some ancestor) ~ours ~theirs:ours in",
+        "expect_red": {
+            "native": ["both writers' content survives an interleaved commit"],
+            "browser": [],
+        },
+    },
+    {
+        "id": "mut-resolve-ours-is-theirs",
+        "why": "`ours` is the model the pump has already acked: handed theirs instead, the reconcile keeps the racer and drops the write the client was told existed, which is the D16 silent loss",
+        "file": "lib/tea_persist/store_core.ml",
+        # The mirror of mut-resolve-theirs-is-ours, and the one that matters
+        # more: this direction loses an ACKED effect rather than an unacked
+        # one. `ours` stays used by the tree, the None arm and the outcome, so
+        # nothing is orphaned.
+        "old": "            let r = resolve ~ancestor:(Some ancestor) ~ours ~theirs in",
+        "new": "            let r = resolve ~ancestor:(Some ancestor) ~ours:theirs ~theirs in",
+        "expect_red": {
+            "native": ["both writers' content survives an interleaved commit"],
+            "browser": [],
+        },
+    },
+    {
+        "id": "mut-ancestor-frozen",
+        "why": "the ancestor is a function of the ROUND: frozen at the writer's own read, round two compares an ours that already absorbed round one against a base predating it and reads a re-add as a delete",
+        "file": "lib/tea_persist/store_core.ml",
+        # Only a three-way app can see this, and only from the second round on,
+        # which is why C7 lands its third writer from inside the merge itself.
+        # A CRDT join ignores the ancestor entirely, so C1 stays green and the
+        # earliest red is C7.
+        "old": "            let r = resolve ~ancestor:(Some ancestor) ~ours ~theirs in",
+        "new": "            let r = resolve ~ancestor:(Some b.model) ~ours ~theirs in",
+        "expect_red": {"native": ["two contention rounds use the true ancestor"], "browser": []},
+    },
+    {
+        "id": "mut-step-rereads-after-interpose",
+        "why": "the server seam must commit against the token its own read minted: re-minted after the step, the witness names a head this step never read and a mid-step writer is erased by the Cmd tail",
+        "file": "lib/tea_server/tea_server.ml",
+        # The seam-level twin of mut-cas-tests-a-fresh-head: the store keeps
+        # its whole reconcile loop and is simply lied to about what was read.
+        # `based` stays used by `St.based_model`, so nothing is orphaned.
+        "old": """        let* () = interpose () in
+        let* (landed : St.committed) = commit based ~msg model' in""",
+        "new": """        let* () = interpose () in
+        let* reread = St.load_based s in
+        let* (landed : St.committed) = commit reread ~msg model' in""",
+        "expect_red": {
+            "native": ["a mid-step writer is not erased by a Cmd-tail step"],
+            "browser": [],
+        },
+    },
+    {
+        "id": "mut-water-of-the-witness",
+        "why": "the water an outcome carries is the WINNING round's mint: reporting the witness's water instead stamps the delivery floor with a commit this writer did not land, which is the forged witness D18 exists to prevent",
+        "file": "lib/tea_persist/store_core.ml",
+        # Not literally the denied round's own water - reaching that needs a
+        # ref threaded around the loop, which is two edits and the driver
+        # applies one anchor - but the same class: any water other than the
+        # mint of the round that moved the head. The uncontended case has no
+        # witness and is left alone, so C6 stays green and C4, where the
+        # ordering between two writers' waters is asserted, is the earliest
+        # red.
+        "old": """      if moved then
+        Lwt.return
+          ( c
+          , ({ water = Tea_core.Prim.Store_water.of_date (S.Info.date (S.Commit.info c))""",
+        "new": """      if moved then
+        Lwt.return
+          ( c
+          , ({ water =
+                 Tea_core.Prim.Store_water.of_date
+                   (S.Info.date (S.Commit.info (Option.value witness ~default:c)))""",
+        "expect_red": {"native": ["the winning round's water is the newest mint"], "browser": []},
+    },
+    {
+        "id": "mut-coalesced-append-rereads",
+        "why": "the coalesced append must reconcile against the witness it was HANDED: re-reading the head first restores the three-attempt retry's disease, and a writer landing between the caller's read and the append is clobbered",
+        "file": "lib/tea_persist/store_core.ml",
+        # Scoped to the coalescer, so the plain based path is untouched and
+        # C1-C12 stay green: this is the entry that says the append inherited
+        # the witness rather than merely inheriting the loop.
+        "old": "    let* (c, landed) = commit_witnessed b ~label:(Codec.msg_to_label msg) model in",
+        "new": """    let* reread = load_based b.session in
+    let* (c, landed) = commit_witnessed reread ~label:(Codec.msg_to_label msg) model in""",
+        "expect_red": {
+            "native": ["a coalesced append reconciles instead of clobbering"],
+            "browser": [],
+        },
+    },
+    {
+        "id": "EQUIVALENT-amend-consults-live-head",
+        "why": "the amend decision is taken against the witness rather than a live head read, and nothing here can currently tell: a denied amend falls into an append that reconciles to the same landed state",
+        "file": "lib/tea_persist/store_core.ml",
+        # Hand-driven: the whole suite stays green (795 ok, 0 red).
+        #
+        # What IS observable is the same either way. With the witness, the
+        # amend is attempted, its test-and-set is denied by the foreign head,
+        # the run is sealed and `append_commit` reconciles; with a live head
+        # read the amend is never attempted and the same `append_commit` runs
+        # with the same witness. Both land three commits, both keep the
+        # foreign writer as the parent, both fold the run's likes to 2, and
+        # both leave the run pointing at the commit that actually landed.
+        #
+        # What is NOT observable is the difference between them: the witness
+        # path mints an amend commit that loses its CAS and is left
+        # unreferenced, and it burns one clock tick doing so. Catching this
+        # needs a check that looks at one of those two - the orphaned commit
+        # (count the objects the repo holds, or assert the amend was tried at
+        # all) or the tick (assert the landed water is the branch's second
+        # mint and not its third). The regression it stands for is real and
+        # sits outside what a single-threaded test can schedule: a head that
+        # moves BACK onto this coalescer's own minted commit between the
+        # caller's read and the decision would be amended against a commit
+        # this writer never saw.
+        "old": """      let amend =
+        (* Pure decision: amendable iff the head is the commit we minted and
+           the policy folds the run's Msg with the incoming one.
+
+           Taken against the WITNESS since D19, not against a fresh head read.
+           The old read happened after the caller's load, so a writer landing
+           in that gap flipped the run to the append path while the model in
+           hand was already stale: the amend test was right and its timing was
+           wrong. Asking the witness makes the decision and the test-and-set
+           agree about which commit this writer actually saw. *)
+        Option.bind b.head (fun (h : S.commit) ->""",
+        "new": """      let* live = S.Head.find s.branch in
+      let amend =
+        Option.bind live (fun (h : S.commit) ->""",
+        "expect_red": {"native": [], "browser": []},
+        "run": ["native"],
+    },
+    {
+        "id": "mut-absent-head-merges-init",
+        "why": "an absent head is a reap, not a competitor: resolved against the app's INITIAL model, a three-way policy reads the empty branch as 'theirs deleted everything' and wipes the writer's own field on the way back in",
+        "file": "lib/tea_persist/store_core.ml",
+        # The arm exists precisely so [gather]'s "absent reads as init" never
+        # reaches the resolver. Re-attempting as a fresh root is the only
+        # loss-free answer, and this mutation takes the other one.
+        "old": "            attempt None ancestor ours label (rounds + 1))",
+        "new": """            let r = resolve ~ancestor:(Some ancestor) ~ours ~theirs:(fst A.init) in
+            attempt None ancestor (resolved_model r) (resolved_label label r) (rounds + 1))""",
+        "expect_red": {
+            "native": ["a reap between the read and the commit neither wipes nor resurrects blindly"],
+            "browser": [],
+        },
+    },
+    {
+        "id": "EQUIVALENT-round-base-tree-from-branch",
+        "why": "the round's base tree comes from the witness, and no check can currently tell: [scatter] rewrites every model path, so the base carries only what the model does not write, and nothing in the suite puts anything there",
+        "file": "lib/tea_persist/store_core.ml",
+        # Hand-driven twice. The edit below (the live branch tree instead of
+        # the witness's) leaves the suite green, and so does the strictly
+        # stronger `S.Tree.empty ()`, which discards the base entirely - so
+        # this is not a near miss, it is the base tree being unobservable end
+        # to end.
+        #
+        # The pack pair was the hoped-for red: store_core.ml:517-524 records
+        # that a root tree rebuilt from [S.tree] and re-saved does NOT survive
+        # a pack close and reopen, and C11/C12 exist to decide whether the
+        # based path may use that door. It may not, and it does not: this
+        # mutation still lands through [S.Commit.v], which survives the round
+        # trip whatever the base tree was read from. Catching it needs a check
+        # that writes a path the model does not own - a foreign key, or a D6
+        # field the app has since dropped - and asserts it is still there
+        # after a reconciled round.
+        #
+        # The discarded call keeps `base_tree` used on purpose: warning 32 is
+        # an error in this build and an orphaned binding would be reported as
+        # "not observable" rather than as the equivalent it is.
+        "old": "      let* tree = scatter s.exploded (base_tree witness) ours in",
+        "new": """      let (_ : S.tree) = base_tree witness in
+      let* live_base = S.tree s.branch in
+      let* tree = scatter s.exploded live_base ours in""",
+        "expect_red": {"native": [], "browser": []},
+        "run": ["native"],
+    },
+    {
+        "id": "mut-conflict-keeps-theirs",
+        "why": "a refused merge must keep OURS: the Msg being committed is one the pump has already taken and is about to ack, so keeping theirs acknowledges an effect the store does not hold",
+        "file": "lib/tea_persist/store_core.ml",
+        # The Three_way error arm only. `ours` stays used by the join and by
+        # the last-write-wins arm, so nothing is orphaned, and the label still
+        # carries the reason - which is what tells this apart from
+        # mut-conflict-reason-dropped even though both redden C8.
+        "old": "        ~error:(fun (reason : string) -> Conflicted { model = ours; reason })",
+        "new": "        ~error:(fun (reason : string) -> Conflicted { model = theirs; reason })",
+        "expect_red": {
+            "native": ["a declared conflict keeps ours, keeps theirs as parent, and says why"],
+            "browser": [],
+        },
+    },
+    {
+        "id": "mut-lww-declares-theirs",
+        "why": "the last-write-wins arm is the R10c pin: declaring theirs makes 'last write' name the write that lost, and the acked model is gone from content while D19 still claims the arm is honest",
+        "file": "lib/tea_persist/store_core.ml",
+        "old": "    | Tea_core.Merge_spec.Last_write_wins -> Declared ours",
+        "new": "    | Tea_core.Merge_spec.Last_write_wins -> Declared theirs",
+        "expect_red": {
+            "native": ["last-write-wins keeps ours with theirs as parent"],
+            "browser": [],
+        },
+    },
+    {
+        "id": "mut-conflict-reason-dropped",
+        "why": "the app's REASON is the audit trail: dropped from the label, a declared loss leaves the branch saying only that something was committed, and the log stops being the place the loss can be found",
+        "file": "lib/tea_persist/store_core.ml",
+        # A typed wildcard rather than a dropped field, so the reason stops
+        # travelling without warning 27 turning the mutation into a build
+        # failure. The model still lands, which is the half C8 keeps green
+        # here and mut-conflict-keeps-theirs reddens.
+        "old": '    | Conflicted { model = (_ : A.model); reason } -> label ^ " [conflict: " ^ reason ^ "]"',
+        "new": "    | Conflicted { model = (_ : A.model); reason = (_ : string) } -> label",
+        "expect_red": {
+            "native": ["a declared conflict keeps ours, keeps theirs as parent, and says why"],
+            "browser": [],
+        },
+    },
 ]
 
 
@@ -618,6 +868,12 @@ def browser():
 # is byte-for-byte what `dune runtest` does.
 NATIVE_DIR = REPO / "_build" / "default" / "test"
 
+# Per-executable wall clock. Generous against the slowest honest file (the pack
+# tiers do real IO) and still far under a human's patience, because what it is
+# really guarding is a mutant that hangs rather than fails: see the
+# TimeoutExpired arm in `native`.
+NATIVE_TIMEOUT_S = 180
+
 
 def native():
     """Run the OCaml suite; return (summary, red_labels).
@@ -640,7 +896,21 @@ def native():
         return "(no test executables built)", ["FAIL - the native suite was never built"]
     red, ok = [], 0
     for exe in exes:
-        r = subprocess.run([str(exe)], cwd=NATIVE_DIR, capture_output=True, text=True)
+        try:
+            r = subprocess.run(
+                [str(exe)], cwd=NATIVE_DIR, capture_output=True, text=True,
+                timeout=NATIVE_TIMEOUT_S,
+            )
+        except subprocess.TimeoutExpired:
+            # Roadmap step 14 (D19) put an UNBOUNDED reconcile loop in the
+            # commit path: a mutation that stops a round from re-basing does
+            # not fail, it spins, and a sweep that hangs reports nothing at
+            # all - strictly worse than a MISS. A timeout is therefore its own
+            # verdict rather than a catch: it lands in `red` under a label no
+            # expectation names, so it scores as a STRAY and fails the sweep
+            # loudly instead of being read as coverage.
+            red.append(f"FAIL - {exe.stem} did not finish within {NATIVE_TIMEOUT_S}s (hung)")
+            continue
         lines = r.stdout.splitlines()
         ok += sum(1 for ln in lines if ln.startswith("ok"))
         failures = [ln for ln in lines if ln.startswith("FAIL")]
