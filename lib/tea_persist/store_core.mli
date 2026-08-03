@@ -68,6 +68,18 @@ module type CORE = sig
   val model_path_raw : string list
   val session : t -> Tea_core.Prim.Session_id.t -> session Lwt.t
   val main_session : t -> session Lwt.t
+
+  val main_replica : Tea_core.Crdt.Replica.t
+  (** The {!Tea_core.Crdt.Replica} the canonical branch is addressed by, from
+      the same private mint {!branch_waters} and the persist path already use
+      (roadmap step 15). Named here rather than rebuilt at each call site
+      because a second spelling of "the main replica" would key delivery floors
+      no boot filter ever looks up — mass duplicates or mass blindness, with no
+      symptom either way. It is what an app declares as the [floor_replica] of
+      a [Tea_server.Rpc.once] when its keyed endpoints commit on the canonical
+      branch, and what makes that floor's water checkable against the head
+      water [branch_waters] reports for [main]. *)
+
   val fork : t -> from:session -> Tea_core.Prim.Session_id.t -> session Lwt.t
   val load : session -> model Lwt.t
   (** The model standing at this session branch's head, read off the branch.

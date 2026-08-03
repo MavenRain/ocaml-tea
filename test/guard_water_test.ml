@@ -646,7 +646,7 @@ let () =
       let sink, fl, (_ : Guard_file.verdict), h = opened "G7" r0 in
       let guard =
         Dguard.v ~sessions:Guard.default_sessions ~tabs:Guard.default_tabs
-          ~sink ~floors:fl
+          ~sink ~floors:fl ()
       in
       check
         "G7 the drop is behavioural: the dropped key re-admits (Fresh) while \

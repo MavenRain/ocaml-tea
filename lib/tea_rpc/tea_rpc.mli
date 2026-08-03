@@ -29,13 +29,87 @@ val prefix : string
 (** ["/rpc/"]. Disjoint by construction from every reserved flat path
     ([/], [/msg], [/undo], [Wire.ws_path], [/app]). *)
 
+val key_header : string
+(** ["x-tea-key"]. One definition for both tiers (T3); a one-byte drift is
+    pinned red by a literal check. A custom header keeps a keyed cross-site
+    POST non-simple independently of the content-type gate, hardening the CSRF
+    preflight argument.
+
+    The header carries only the CLIENT half of the delivery key — which
+    stream, which position in it. The server derives the de-duplication
+    namespace from the session cookie, and that half never rides the wire, so
+    the header alone can never name someone else's floor (roadmap step 15,
+    D20.1). *)
+
+(** The delivery key's wire half: which client stream, and which position in
+    that stream's dense per-tab call sequence. The RPC analog of the
+    [(tab, seq)] header [Wire.up] carries. The guard never consumes the tab
+    raw; see the floor-tab derivation in [Tea_server.Rpc]. *)
+module Key : sig
+  type t
+
+  val v : tab:Tea_core.Prim.Tab_id.t -> seq:Tea_core.Prim.Msg_seq.t -> t
+  (** Pair a client stream tab with a position in its dense sequence. *)
+
+  val tab : t -> Tea_core.Prim.Tab_id.t
+  (** The client-minted stream tab: an INPUT to the server's floor-tab
+      derivation, never a floor key itself. *)
+
+  val seq : t -> Tea_core.Prim.Msg_seq.t
+  (** Position in the tab's dense stream. *)
+
+  type err =
+    | Bad_shape  (** not [<tab> ":" <seq>] *)
+    | Bad_tab of Tea_core.Prim.Tab_id.err
+        (** the tab half fails [Tab_id.of_string] *)
+    | Bad_seq  (** the seq half is not a positive decimal integer *)
+
+  val to_string : t -> string
+  (** [<32 lowercase hex> ":" <decimal>]. *)
+
+  val of_string : string -> (t, err) result
+  (** Total strict parse for the untrusted header; reuses [Tab_id.of_string]
+      and [Msg_seq.of_int] so this grammar cannot drift from the socket
+      tier's. *)
+end
+
+(** The response contract of a [Mutating] endpoint (roadmap step 15): the
+    reply, or the typed admission that the effect was already applied and the
+    original reply bytes are unrecoverable. *)
+type 'resp keyed_resp =
+  | Reply of 'resp
+      (** the handler's answer: fresh, or replayed verbatim from the reply
+          cache, byte-identical to what the one taken delivery computed and
+          never recomputed at replay time *)
+  | Replayed
+      (** the effect was applied exactly once by an earlier delivery of this
+          key, and the reply bytes are gone (process restart, cache eviction,
+          an endpoint mismatch, or a duplicate below the newest seq) *)
+
+val keyed_resp_t : 'resp Repr.t -> 'resp keyed_resp Repr.t
+(** A Repr variant, never a string-in-string envelope (the house wire law).
+
+    [Mutating] endpoints answer 200 with this shape ALWAYS, keyed request or
+    not, because [expect] is fixed when [Make.call] builds the command and
+    sees neither headers nor the runtime's keying decision: a response whose
+    shape varied with a header the closure cannot read would be undecodable
+    by construction. [Read_only] endpoints are untouched and still answer a
+    bare ['resp]. *)
+
 (** Failure of one typed call as seen by the app's reply handler. App-level
     failure never appears here: a fallible endpoint declares
     ['resp = ('ok, 'app_err) result] in its GADT constructor and rides the
     200 channel through [resp_t]. *)
 type error =
   | Transport of Tea_core.Cmd.http_failure
+      (** the exchange failed; the effect's fate is UNKNOWN *)
   | Decode of string  (** a 2xx body that does not parse as ['resp] *)
+  | Applied_reply_lost
+      (** the server answered [Replayed]: the call's effect happened exactly
+          once, but its reply cannot be recovered — re-read state if the value
+          matters. Deliberately distinct from [Transport]: that one means
+          "effect unknown", this one means "effect certain, value lost". It is
+          the sentence an app reads before writing recovery code. *)
 
 (** Whether an endpoint changes server state, and therefore whether the server
     demands a same-origin proof before dispatching it (roadmap step 8, D12).
@@ -107,8 +181,16 @@ module Make (A : API) : sig
     'req ->
     reply:(('resp, error) result -> 'msg) ->
     'msg Tea_core.Cmd.t
-  (** The typed client builder: encodes with [encode_req] and returns
-      [Tea_core.Cmd.http] whose [expect] closure decodes with [decode_resp]
-      and maps failures into {!error}. Do not retry synchronously in [update]
-      on [Transport No_transport] — fuel bounds the server [Loop]. *)
+  (** The typed client builder: encodes with [encode_req] and returns an
+      [Http] command whose [expect] closure decodes the reply and maps
+      failures into {!error}. Do not retry synchronously in [update] on
+      [Transport No_transport] — fuel bounds the server [Loop].
+
+      The endpoint's own [kind] witness picks the delivery contract, so there
+      is no [call_keyed], no app-minted key, and no second entry point:
+      [Read_only] builds [Cmd.http] and decodes a bare ['resp] exactly as
+      before; [Mutating] builds [Cmd.http_keyed] and decodes
+      [keyed_resp_t (resp_t e)], mapping [Reply r] to [Ok r] and [Replayed]
+      to [Error Applied_reply_lost]. Classifying an endpoint [Mutating] is
+      therefore the whole of what an app does to get exactly-once delivery. *)
 end

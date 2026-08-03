@@ -82,6 +82,17 @@ module App = struct
             the reply is genuinely per-client, and the shared model has no field
             for it, so this is identity here; the client-local companion that
             actually displays it lands in a later phase *)
+    | Publish_tag of string
+        (** ask the [Append_tag] endpoint to add a tag SERVER-side. Distinct
+            from {!Add_tag}, which edits this tab's replica and reaches peers
+            over the live socket: this one commits through the RPC handler, and
+            being [Tea_rpc.Mutating] it is the app's only exactly-once channel
+            (step 15). The pair exists so one example drives both write paths. *)
+    | Got_tag_count of (int, Tea_rpc.error) result
+        (** the tag count the endpoint answers, or the marker that says the
+            append certainly happened and only its reply is gone. Same D10
+            shared-half reading as {!Got_stats}: identity here, displayed by the
+            companion. *)
 
   (* [Got_stats] is still serialised (it is a total msg), so [msg_t] must encode
      it; [Tea_rpc.error] wraps the abstract Status and has no faithful wire form,
@@ -95,11 +106,22 @@ module App = struct
          ~some:(fun s -> Ok s))
       (Result.fold ~ok:Option.some ~error:(fun (_ : Tea_rpc.error) -> None))
 
+  (* The same deliberate lossiness for the keyed reply, and it costs nothing
+     here for the same reason: both halves of this pair are CLAIMED by the
+     companion below, so neither is ever handed to [msg_t] for real. The codec
+     exists because the type is total, not because a value travels. *)
+  let tag_reply_t : (int, Tea_rpc.error) result Repr.t =
+    Repr.map (Repr.option Repr.int)
+      (Option.fold
+         ~none:(Error (Tea_rpc.Decode "rpc reply has no wire form"))
+         ~some:(fun n -> Ok n))
+      (Result.fold ~ok:Option.some ~error:(fun (_ : Tea_rpc.error) -> None))
+
   let msg_t =
     Repr.(
       variant "msg"
         (fun set_title set_body like unlike add_tag remove_tag sync request_stats
-             got_stats ->
+             got_stats publish_tag got_tag_count ->
         function
         | Set_title s -> set_title s
         | Set_body s -> set_body s
@@ -109,7 +131,9 @@ module App = struct
         | Remove_tag t -> remove_tag t
         | Sync_doc d -> sync d
         | Request_stats -> request_stats
-        | Got_stats r -> got_stats r)
+        | Got_stats r -> got_stats r
+        | Publish_tag t -> publish_tag t
+        | Got_tag_count r -> got_tag_count r)
       |~ case1 "Set_title" string (fun s -> Set_title s)
       |~ case1 "Set_body" string (fun s -> Set_body s)
       |~ case0 "Like" Like
@@ -119,6 +143,8 @@ module App = struct
       |~ case1 "Sync_doc" model_t (fun d -> Sync_doc d)
       |~ case0 "Request_stats" Request_stats
       |~ case1 "Got_stats" stats_reply_t (fun r -> Got_stats r)
+      |~ case1 "Publish_tag" string (fun t -> Publish_tag t)
+      |~ case1 "Got_tag_count" tag_reply_t (fun r -> Got_tag_count r)
       |> sealv)
 
   let init : model * msg Cmd.t =
@@ -147,13 +173,22 @@ module App = struct
           { Shared_doc_rpc.title = title_of model; body = body_of model }
           ~reply:(fun reply -> Got_stats reply) )
     | Got_stats (_ : (Shared_doc_rpc.stats_resp, Tea_rpc.error) result) -> (model, Cmd.none)
+    (* Issued here as well as in the companion, the same shape [Request_stats]
+       has: a tab mounted without a companion still drives the endpoint, it
+       simply has nowhere to show the answer. The tag never enters THIS model -
+       the append happens on the canonical branch, and comes back to every tab
+       through the store watch, which is what makes it a server-side write
+       rather than a replicated edit. *)
+    | Publish_tag t ->
+      (model, R.call Shared_doc_rpc.Append_tag t ~reply:(fun reply -> Got_tag_count reply))
+    | Got_tag_count (_ : (int, Tea_rpc.error) result) -> (model, Cmd.none)
 
   (* The one seam the D10 companion needs: everything about the page is shared
      except the stats readout, which is per-client. Parameterising the view
      here (rather than letting the companion rebuild the page) keeps ONE view
      definition  -  a second copy would drift, and the point of D10 is that local
      state costs an extra argument, not an extra UI. *)
-  let view_with ~(stats_line : msg Html.t) model =
+  let view_with ~(stats_line : msg Html.t) ~(publish_line : msg Html.t) model =
     let open Html in
     let tag_li t = li [ text t; button ~attrs:[ on_click (Remove_tag t) ] [ text " ×" ] ] in
     let add_tag_button t = button ~attrs:[ on_click (Add_tag t) ] [ text ("+ " ^ t) ] in
@@ -183,12 +218,20 @@ module App = struct
           [ button ~attrs:[ on_click Request_stats ] [ text "Stats" ]
           ; span ~attrs:[ class_ "stats-line" ] [ stats_line ]
           ]
+      ; div
+          ~attrs:[ class_ "publish" ]
+          [ button ~attrs:[ on_click (Publish_tag "published") ] [ text "Publish tag" ]
+          ; span ~attrs:[ class_ "publish-line" ] [ publish_line ]
+          ]
       ]
 
   (* The [APP] view: no companion, so no stats to show. A tab mounted with
      {!Local} below overrides exactly this one node. *)
   let view model =
-    view_with ~stats_line:(Html.text "stats are a per-client readout") model
+    view_with
+      ~stats_line:(Html.text "stats are a per-client readout")
+      ~publish_line:(Html.text "the tag count is a per-client readout")
+      model
 
   let subscriptions _model = Sub.store_watch (fun m -> Sync_doc m)
 
@@ -263,9 +306,12 @@ module Local = struct
       string rather than a [stats_resp option]: there is no state machine here
       to get wrong, and "asked but not answered" is a third display value that
       an [option] would have to encode as [None] alongside "never asked". *)
-  type local = { stats_line : string }
+  type local =
+    { stats_line : string
+    ; publish_line : string
+    }
 
-  let init = { stats_line = "no stats yet" }
+  let init = { stats_line = "no stats yet"; publish_line = "no tag published yet" }
 
   let rendered (reply : (Shared_doc_rpc.stats_resp, Tea_rpc.error) result) : string =
     Result.fold reply
@@ -275,20 +321,54 @@ module Local = struct
       ~error:(fun (e : Tea_rpc.error) ->
         match e with
         | Tea_rpc.Transport (_ : Cmd.http_failure) -> "stats unavailable (transport)"
-        | Tea_rpc.Decode (_ : string) -> "stats unavailable (undecodable reply)")
+        | Tea_rpc.Decode (_ : string) -> "stats unavailable (undecodable reply)"
+        (* Unreachable for [Doc_stats], which is [Read_only] and therefore
+           never enveloped; spelled anyway because the arm is what a Mutating
+           endpoint's companion would have to write, and the reading is not
+           "it failed": the effect happened, only its answer is gone. *)
+        | Tea_rpc.Applied_reply_lost -> "stats applied, reply lost")
+
+  (* The [Mutating] companion of {!rendered}, and the arm the comment above
+     calls unreachable for [Doc_stats] is the load-bearing one here:
+     [Applied_reply_lost] is not a failure, it is the append saying it
+     certainly happened while its reply bytes are gone, so the wording never
+     invites a retry. [Transport] survives as an arm but is close to
+     unreachable now that the runtime owns the retries (step 15): a network
+     failure on a keyed call is re-sent under the same key rather than
+     surfaced, so what reaches here is the refusal class the queue gives up
+     on. *)
+  let rendered_tag (reply : (int, Tea_rpc.error) result) : string =
+    Result.fold reply
+      ~ok:(fun (n : int) -> Printf.sprintf "%d tags on the document" n)
+      ~error:(fun (e : Tea_rpc.error) ->
+        match e with
+        | Tea_rpc.Transport (_ : Cmd.http_failure) -> "tag refused (transport)"
+        | Tea_rpc.Decode (_ : string) -> "tag unconfirmed (undecodable reply)"
+        | Tea_rpc.Applied_reply_lost -> "tag applied, reply lost")
 
   (* The prior [local] is never read: every claimed msg replaces the readout
      outright, so this companion is a function of the message alone. A
      companion that accumulated (a request counter, a history) would use it. *)
-  let update (m : msg) (shared : shared) (_ : local) : (local * msg Cmd.t) option =
+  let update (m : msg) (shared : shared) (local : local) : (local * msg Cmd.t) option =
     match m with
     | App.Request_stats ->
       Some
-        ( { stats_line = "asking..." }
+        ( { local with stats_line = "asking..." }
         , App.R.call Shared_doc_rpc.Doc_stats
             { Shared_doc_rpc.title = App.title_of shared; body = App.body_of shared }
             ~reply:(fun reply -> App.Got_stats reply) )
-    | App.Got_stats reply -> Some ({ stats_line = rendered reply }, Cmd.none)
+    | App.Got_stats reply -> Some ({ local with stats_line = rendered reply }, Cmd.none)
+    (* "publishing..." rather than a spinner with a timeout: the runtime queue
+       owns the retry ladder, so the honest thing to display between the click
+       and the reply is that the call is outstanding, however many times it has
+       actually crossed the wire. The tab cannot tell, and does not need to. *)
+    | App.Publish_tag t ->
+      Some
+        ( { local with publish_line = "publishing..." }
+        , App.R.call Shared_doc_rpc.Append_tag t
+            ~reply:(fun reply -> App.Got_tag_count reply) )
+    | App.Got_tag_count reply ->
+      Some ({ local with publish_line = rendered_tag reply }, Cmd.none)
     (* Every shared edit declines: it belongs to the document, and declining is
        what forwards it to peers. Listed constructor by constructor so a new
        Msg is a compile error here, not a silently unmirrored edit. *)
@@ -301,7 +381,10 @@ module Local = struct
     | App.Sync_doc (_ : App.model) -> None
 
   let view (shared : shared) (local : local) : msg Html.t =
-    App.view_with ~stats_line:(Html.text local.stats_line) shared
+    App.view_with
+      ~stats_line:(Html.text local.stats_line)
+      ~publish_line:(Html.text local.publish_line)
+      shared
 end
 
 module _ : Tea_core.Local.LOCAL with type shared = App.model and type msg = App.msg =

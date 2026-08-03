@@ -19,6 +19,7 @@
 module Reconnect = Reconnect
 module Rebase = Rebase
 module Delivery = Delivery
+module Rpc_delivery = Rpc_delivery
 module Local_channel = Local_channel
 
 (** {2 This tab's CRDT identity}
@@ -75,11 +76,16 @@ type 'msg Vdom.Cmd.t +=
   | Http of
       { path : string  (** lowered at the vdom boundary, as [Navigate] lowers [Url] *)
       ; body : string
+      ; delivery : Tea_core.Cmd.Http_delivery.t
+            (** which delivery contract the interpreter owes this call
+                (roadmap step 15, D20); carried across the boundary unchanged,
+                because the two channels differ in effect, not in structure *)
       ; expect : (string, Tea_core.Cmd.http_failure) result -> 'msg
       }
       (** POST [body] to same-origin [path] (application/json); feed the raw
           transport outcome to [expect]. Interpreted by [Tea_client_run]'s
-          XHR arm. *)
+          XHR arm: [Bare] fires one request and forgets it, [Keyed] records
+          into {!Rpc_delivery} and lets the runtime own the retries. *)
 
 (** {2 Total translations}
 

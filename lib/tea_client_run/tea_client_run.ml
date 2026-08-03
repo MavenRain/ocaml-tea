@@ -2,11 +2,192 @@ module Prim = Tea_core.Prim
 module Subs = Tea_client.Subs
 module W = Js_browser.Window
 module WS = Js_browser.WebSocket
+module X = Js_browser.XHR
+module Rpc_delivery = Tea_client.Rpc_delivery
+module Backoff = Tea_client.Reconnect.Backoff
 
 let window = Js_browser.window
 
 let log (line : string) =
   Js_browser.Console.log Js_browser.console (Ojs.string_to_js line)
+
+(* The page's delivery identities, minted here rather than inside {!Start_local}
+   because the keyed RPC channel below is a peer of the mount, not a part of it
+   (roadmap step 15, I5). A session cookie names a session, not a sender: two
+   tabs share one cookie, one branch and one replica id, so without this both
+   would number their messages from 1 and the server would read the second
+   tab's first edit as the first tab's replay (D15).
+
+   [Random.self_init] is the entropy source rather than a [crypto] binding:
+   these values are de-duplication keys inside an already-authenticated
+   session, not credentials, so what they need is collision-freedom between a
+   handful of tabs on one machine, not unpredictability against an attacker.
+   Under js_of_ocaml [self_init] seeds from the JS RNG. A collision would
+   degrade exactly to the two-tabs bug this closes, which is why the mint is
+   one expression with no fallback path to drift from.
+
+   Seeded ONCE at module load and drawn from twice, rather than re-seeded per
+   mint: this page now mints two ids back to back (the websocket tab and the
+   RPC channel's), and two seedings that close together would rest their
+   independence on the resolution of the seed source, where two draws from one
+   seeded generator are independent by construction. *)
+let () = Random.self_init ()
+let mint_tab () : Prim.Tab_id.t = Prim.Tab_id.of_draws (fun () -> Random.int 256)
+
+(* [Status.of_int 0 = None] is the network-failure classifier: offline, DNS
+   failure, a refused connection and an aborted request all surface as XHR
+   status 0. *)
+let outcome_of (xhr : X.t) : (string, Tea_core.Cmd.http_failure) result =
+  Prim.Status.of_int (X.status xhr)
+  |> Option.fold
+       ~none:(Error Tea_core.Cmd.Network_error)
+       ~some:(fun (st : Prim.Status.t) ->
+         if Prim.Status.is_success st then Ok (X.response_text xhr)
+         else Error (Tea_core.Cmd.Http_status st))
+
+(* One same-origin JSON POST. Both delivery channels go through this, so the
+   content type and the readiness classification cannot drift between them -
+   the difference between a bare call and a keyed one is [headers] and who owns
+   the outcome, nothing about the request itself. *)
+let post ~(path : string) ~(headers : (string * string) list) ~(body : string)
+    ~(settle : (string, Tea_core.Cmd.http_failure) result -> unit) : unit =
+  let xhr = X.create () in
+  X.open_ xhr "POST" path;
+  X.set_request_header xhr "Content-Type" "application/json";
+  List.iter
+    (fun ((name : string), (value : string)) -> X.set_request_header xhr name value)
+    headers;
+  X.set_onreadystatechange xhr (fun () ->
+      match X.ready_state xhr with
+      | X.Done -> settle (outcome_of xhr)
+      | X.Unsent | X.Opened | X.Headers_received | X.Loading -> ()
+      | X.Other (_ : int) -> ());
+  X.send xhr (Ojs.string_to_js body)
+
+(* --- The keyed RPC channel (roadmap step 15, D20, I5) ---------------------
+
+   Page-global, exactly like the mount it serves: one page is one RPC channel,
+   one tab id, one dense sequence. It lives outside {!Start_local} because the
+   command interpreter does, and the interpreter is where a keyed command
+   arrives.
+
+   The queue is instantiated at [unit] rather than at an app's msg type because
+   [env]'s handler is polymorphic in msg: the only way to keep ONE queue for
+   the page is to store each continuation already applied to its context.
+   [Vdom_blit.Cmd.send_msg ctx] is that application, and firing it from an
+   async callback is the established [After]/[set_timeout] precedent. *)
+module Keyed = struct
+  let queue : unit Rpc_delivery.t ref = ref (Rpc_delivery.v ~tab:(mint_tab ()))
+
+  (* [inflight] is a request that has been sent and not yet settled;
+     [waiting] is a settled failure whose retry is on the backoff ladder. The
+     two together are the G4 shell invariant, AT MOST ONE LIVE REQUEST PER HEAD
+     SEQ, and they hold it in the strongest form available: rather than abort a
+     request when a retry comes due, {!pump} never schedules the retry until
+     the request it retries has settled, so the two never overlap at all. The
+     spec's abort is then unreachable, which is why none is issued (js_browser
+     binds no [abort], and reaching past it through [Ojs] would buy nothing).
+
+     What that costs is named honestly: a request that never settles stalls the
+     queue behind it until the browser's own connection timeout settles it as
+     status 0. It cannot lose or duplicate a call, only delay one. *)
+  let inflight : bool ref = ref false
+  let waiting : W.timeout_id option ref = ref None
+  let backoff : Backoff.t ref = ref Backoff.initial
+
+  (* The only place a keyed request starts, and the only place a retry is
+     scheduled. A retry is [head] re-sent under the key it was recorded with:
+     key stability needs no discipline here because no operation in
+     {!Rpc_delivery} renumbers a recorded entry. *)
+  let rec pump () : unit =
+    if (not !inflight) && Option.is_none !waiting then
+      Option.iter send (Rpc_delivery.head !queue)
+
+  and send ((seq, entry) : Prim.Msg_seq.t * unit Rpc_delivery.entry) : unit =
+    inflight := true;
+    post ~path:entry.path ~body:entry.body
+      ~headers:
+        [ ( Tea_rpc.key_header
+          , Tea_rpc.Key.to_string
+              (Tea_rpc.Key.v ~tab:(Rpc_delivery.tab !queue) ~seq) )
+        ]
+      ~settle:(settle seq entry)
+
+  and settle (seq : Prim.Msg_seq.t) (entry : unit Rpc_delivery.entry)
+      (outcome : (string, Tea_core.Cmd.http_failure) result) : unit =
+    inflight := false;
+    Result.fold outcome
+      ~ok:(fun (body : string) ->
+        (* Acknowledge BEFORE dispatching. [expect] runs the app's [update]
+           synchronously and that update may record the next keyed call, which
+           would otherwise queue behind an entry the server has already
+           answered - and a duplicate response could not fire [expect] twice
+           for one entry even in principle. *)
+        queue := Rpc_delivery.ack seq !queue;
+        backoff := Backoff.initial;
+        entry.expect (Ok body);
+        pump ())
+      ~error:(fun (failure : Tea_core.Cmd.http_failure) ->
+        match failure with
+        (* The retryable half: the effect's fate is unknown, which is precisely
+           the case the server-side guard was built to absorb. The framework's
+           503 for a delivery still in flight (D20.2) arrives here as a 5xx and
+           is retried like any other. *)
+        | Tea_core.Cmd.Network_error -> retry ()
+        (* Unreachable from {!outcome_of}, which mints only the two wire
+           outcomes, and terminal rather than retryable on purpose: an
+           interpreter that answers "no transport" is not one a backoff ladder
+           will talk round. Kept as its own arm so that a future runtime which
+           CAN produce it inherits the honest behaviour instead of a spin. *)
+        | Tea_core.Cmd.No_transport ->
+          queue := Rpc_delivery.ack seq !queue;
+          backoff := Backoff.initial;
+          entry.expect (Error failure);
+          pump ()
+        | Tea_core.Cmd.Http_status st ->
+          if Prim.Status.to_int st >= 500 then retry ()
+          else (
+            (* 4xx is poison: a rejected key, a rejected body or a lost session
+               will be rejected identically forever, so retrying is a spin. The
+               entry leaves, the app hears the failure, and the tab rotates -
+               under a fresh tab there is no floor, and an absent floor accepts
+               any first sequence number, so the numbers this tab already
+               burned stop mattering. *)
+            queue := Rpc_delivery.ack seq !queue;
+            queue := Rpc_delivery.rotate ~tab:(mint_tab ()) !queue;
+            backoff := Backoff.initial;
+            entry.expect (Error failure);
+            pump ()))
+
+  and retry () : unit =
+    let delay = Backoff.to_ms !backoff in
+    backoff := Backoff.bump !backoff;
+    waiting :=
+      Some
+        (W.set_timeout window
+           (fun () ->
+             waiting := None;
+             pump ())
+           delay)
+
+  let record ~(path : string) ~(body : string)
+      ~(expect : (string, Tea_core.Cmd.http_failure) result -> unit) : unit =
+    (Rpc_delivery.record { Rpc_delivery.path; body; expect } !queue
+    |> Option.fold
+         ~none:(fun () ->
+           (* The [Delivery.record] defined arm, unreachable in a page life.
+              Reported rather than dropped in silence: this call's continuation
+              will now never fire, which an app reads as a hang, not a no-op. *)
+           log "tea: keyed RPC sequence space exhausted; call not sent")
+         ~some:(fun
+             ((q, (_ : Prim.Msg_seq.t * unit Rpc_delivery.entry)) :
+               unit Rpc_delivery.t * (Prim.Msg_seq.t * unit Rpc_delivery.entry))
+             ()
+           ->
+           queue := q;
+           pump ()))
+      ()
+end
 
 (* The command handler contract: react to the commands you recognize and
    return [true]; [false] passes the command along. [Vdom.Cmd.t] is an open
@@ -31,33 +212,33 @@ let env =
           | Tea_client.Navigate url ->
             Js_browser.History.push_state (W.history window) Ojs.null "" url;
             true
-          | Tea_client.Http { path; body; expect } ->
+          | Tea_client.Http { path; body; delivery; expect } -> (
             (* The wire half of [Tea_rpc.Make.call]: POST the encoded request,
                classify the transport outcome, feed it to the [expect]
                continuation the typed layer built. [send_msg] from an async
                callback is the established [After]/[set_timeout] precedent.
-               [Status.of_int 0 = None] is the network-failure classifier:
-               offline/DNS/abort surface as XHR status 0. *)
-            let module X = Js_browser.XHR in
-            let xhr = X.create () in
-            X.open_ xhr "POST" path;
-            X.set_request_header xhr "Content-Type" "application/json";
-            X.set_onreadystatechange xhr (fun () ->
-                match X.ready_state xhr with
-                | X.Done ->
-                  let outcome =
-                    Prim.Status.of_int (X.status xhr)
-                    |> Option.fold
-                         ~none:(Error Tea_core.Cmd.Network_error)
-                         ~some:(fun st ->
-                           if Prim.Status.is_success st then Ok (X.response_text xhr)
-                           else Error (Tea_core.Cmd.Http_status st))
-                  in
-                  Vdom_blit.Cmd.send_msg ctx (expect outcome)
-                | X.Unsent | X.Opened | X.Headers_received | X.Loading -> ()
-                | X.Other (_ : int) -> ());
-            X.send xhr (Ojs.string_to_js body);
-            true
+
+               The two arms differ in who owns the outcome, not in what is
+               sent (roadmap step 15, D20). Spelled as an exhaustive match, so
+               a third delivery contract is a compile error here - which is the
+               whole reason [Http_delivery] is a sum rather than a flag. *)
+            match delivery with
+            | Tea_core.Cmd.Http_delivery.Bare ->
+              (* Today's semantics, unchanged: one request, no key, no retry,
+                 and the app hears whatever came back. *)
+              post ~path ~headers:[] ~body ~settle:(fun outcome ->
+                  Vdom_blit.Cmd.send_msg ctx (expect outcome));
+              true
+            | Tea_core.Cmd.Http_delivery.Keyed ->
+              (* Retry ownership moves into the runtime: the call is recorded
+                 first and sent from the queue, so a failure re-sends it under
+                 the key it already has instead of surfacing as a transport
+                 error the app would have to retry itself - which it could only
+                 do by calling again, i.e. under a NEW key, i.e. as a second
+                 delivery of the same effect. *)
+              Keyed.record ~path ~body ~expect:(fun outcome ->
+                  Vdom_blit.Cmd.send_msg ctx (expect outcome));
+              true)
           | unrecognized ->
             ignore unrecognized;
             false)
@@ -86,22 +267,11 @@ struct
      edits made while [conn] could not send. Both are driven by pure state
      machines in [Tea_client]; everything below is the effect half. *)
 
-  (* The tab's delivery identity, minted once per page load (D15). A session
-     cookie names a session, not a sender: two tabs share one cookie, one branch
-     and one replica id, so without this both would number their messages from
-     1 and the server would read the second tab's first edit as the first tab's
-     replay.
-
-     [Random.self_init] is the entropy source rather than a [crypto] binding:
-     this value is a de-duplication key inside an already-authenticated session,
-     not a credential, so what it needs is collision-freedom between a handful
-     of tabs on one machine, not unpredictability against an attacker. Under
-     js_of_ocaml [self_init] seeds from the JS RNG. A collision would degrade
-     exactly to the two-tabs bug this closes, which is why the mint is one
-     expression with no fallback path to drift from. *)
-  let mint_tab () : Tea_core.Prim.Tab_id.t =
-    Random.self_init ();
-    Tea_core.Prim.Tab_id.of_draws (fun () -> Random.int 256)
+  (* The websocket tab's delivery identity, minted once per page load (D15) by
+     the module-level {!mint_tab}. The keyed RPC channel draws its own from the
+     same mint and must never share this one: the two channels number their
+     streams independently, so one id across both would make each channel's
+     first frame look like a replay of the other's. *)
 
   type live =
     { mutable app : (Client.state, A.msg) Vdom_blit.app option

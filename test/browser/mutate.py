@@ -844,6 +844,531 @@ MUTATIONS = [
             "browser": [],
         },
     },
+    # ---- roadmap step 15 (D20, rpc exactly-once): the spec 5.4 table as s15-*.
+    # The ids are namespaced because this file's own M1-M4 predate the step-15
+    # numbering. Every recipe below was applied and watched by hand during I2-I6
+    # (2026-07-30/31, logs in ~/Documents/ocaml-tea-step15-harness/) EXCEPT
+    # s15-M5, whose first confirmation is this driver. The hand runs mostly
+    # exercised only each mutant's killer suite; where a collateral red in a
+    # sibling suite is certain by construction it is named too, and the first
+    # full driver sweep is the arbiter for the remainder.
+    # ---- step-15 adversarial-review fixes (F1-F4): the recipes that confirm
+    # the review-pass tests, numbered on from s15-M17. First confirmed by the
+    # 2026-08-02 fix pass (rerun-fix.log in the step-15 harness dir).
+    {
+        "id": "s15-M18",
+        "why": "the Pending grace drains under the tab's own polling, never silently holds",
+        "file": "lib/tea_server/reply_cache.ml",
+        "old": "&& Int64.compare polls ticked.pending_grace < 0",
+        "new": "&& 0 = 0",
+        "expect_red": {"native": [
+            "the window drains under its own polling: past the budget it reads Gone",
+        ], "browser": []},
+    },
+    {
+        "id": "s15-M19",
+        "why": "a fresh window answers Busy from its first poll: the budget starts full",
+        "file": "lib/tea_server/reply_cache.ml",
+        "old": "Pending { seq; polls = 0L }",
+        "new": "Pending { seq; polls = 1000000L }",
+        "expect_red": {"native": [
+            "a Pending entry at the same seq reads Busy inside the grace",
+            "a duplicate inside the Pending window is refused 503, not answered 200",
+            "the 503 carries no keyed reply body at all",
+        ], "browser": []},
+    },
+    {
+        "id": "s15-M20",
+        "why": "settle compares seqs: a stale settle must not destroy a newer window",
+        "file": "lib/tea_server/reply_cache.ml",
+        # "> 0" to "> 99" rather than deleting the guard, so [entry_seq] stays
+        # referenced and the kill is behavioral, not a warning-32 build death.
+        "old": "if Msg_seq.compare (entry_seq s.entry) seq > 0 then t else install ()",
+        "new": "if Msg_seq.compare (entry_seq s.entry) seq > 99 then t else install ()",
+        "expect_red": {"native": [
+            "a stale settle is discarded: the newer Pending still reads Busy",
+        ], "browser": []},
+    },
+    {
+        "id": "s15-M21",
+        "why": "the barrier's failure arm releases the take, or the retry is refused forever",
+        "file": "lib/tea_server/tea_server.ml",
+        "old": "              Durable_guard.release o.guard ~replica:o.floor_replica ~tab:floor ~seq;",
+        "new": "              ();",
+        "expect_red": {"native": [
+            "the retry of a released delivery reads Fresh and answers its own reply",
+            "the released seq's effect landed exactly once, on the retry",
+        ], "browser": []},
+    },
+    {
+        "id": "s15-M22",
+        "why": "the seq parse accepts exactly the canonical print, no aliased spellings",
+        "file": "lib/tea_rpc/tea_rpc.ml",
+        "old": r'''        if String.equal (Int.to_string n) s then Tea_core.Prim.Msg_seq.of_int n
+        else None''',
+        "new": "        Tea_core.Prim.Msg_seq.of_int n",
+        "expect_red": {"native": [
+            "Key.of_string rejects 0, a sign, padding, hex, an underscore, and leading zeros as Bad_seq",
+        ], "browser": []},
+    },
+    {
+        "id": "s15-M23",
+        "why": "release un-takes exactly the failed seq, conditionally on the high water",
+        "file": "lib/tea_server/replay_guard.ml",
+        # Inverted rather than deleted, so [restore] stays referenced and the
+        # kill is behavioral, not a warning-26 build death.
+        "old": "if Int.equal (Msg_seq.compare high seq) 0 then restore () else t",
+        "new": "if Int.equal (Msg_seq.compare high seq) 0 then t else restore ()",
+        "expect_red": {"native": [
+            "a released first-seq take reads Fresh again, not Duplicate",
+            "the retry of a released delivery reads Fresh and answers its own reply",
+            "the released seq's effect landed exactly once, on the retry",
+        ], "browser": []},
+    },
+    {
+        "id": "s15-M1",
+        "why": "the guard's verdict precedes the effect: a duplicate inside the window must not commit twice",
+        "file": "lib/tea_server/tea_server.ml",
+        # The confirmed shape: hoist the handler call ABOVE the take and delete
+        # the Fresh arm's own call. The hoisted binding stays used (the Fresh
+        # arm reads resp/water), so nothing is orphaned into a warning-27 build
+        # kill. A duplicate and a gap now apply before being refused.
+        "old": r'''        match Durable_guard.take o.guard ~replica:o.floor_replica ~tab:floor ~seq with
+        | Replay_guard.Gapped ->
+          (* Nothing consumed, nothing applied, no state touched. The seq space
+             is dense per tab (the client queue is one-in-flight over dense
+             numbering), so an honest client never gaps. The WS tier's
+             silent-ignore arm is unavailable because HTTP must answer
+             something, and answering on the 200 channel would type a protocol
+             violation into every endpoint's contract. *)
+          Dream.respond ~status:`Bad_Request ~headers:text_plain "rpc delivery gap"
+        | Replay_guard.Duplicate (_ : Tea_core.Prim.Msg_seq.t) ->
+          (* Never invoke the handler, never persist: the effect already
+             happened, and this arm exists only to answer for it. *)
+          (match Reply_cache.Cell.find o.replies ~tab:floor ~seq ~endpoint with
+          | Reply_cache.Busy ->
+            (* The taken delivery is still inside its window. 503 means "the
+               effect's fate is unknown at this instant, ask again", a
+               transport-channel meaning the client runtime's 5xx retry arm
+               consumes; it never reaches the app's [expect]. *)
+            Dream.respond ~status:`Service_Unavailable ~headers:text_plain
+              "rpc delivery in flight"
+          | Reply_cache.Original bytes ->
+            (* Byte-identical to what the one taken delivery computed: replayed
+               verbatim, never recomputed at replay time. *)
+            ok_json bytes
+          | Reply_cache.Gone ->
+            (* Effect certain, value lost. The typed arm the whole envelope
+               exists for; the client surfaces it as [Applied_reply_lost]. *)
+            ok_json replayed_body)
+        | Replay_guard.Fresh (_ : Tea_core.Prim.Msg_seq.t) ->
+          (* [mark_pending] in the SAME continuation as the verdict, with no
+             Lwt bind between them: a yield here would let a concurrent
+             duplicate read "no entry" and be told [Replayed] for an effect
+             still running, which is the one answer that would be a lie. *)
+          Reply_cache.Cell.mark_pending o.replies ~tab:floor ~seq;
+          Lwt.try_bind
+            (fun () ->
+              let* () = on_taken () in
+              h.handle_keyed ep req)''',
+        "new": r'''        let* resp, water = h.handle_keyed ep req in
+        match Durable_guard.take o.guard ~replica:o.floor_replica ~tab:floor ~seq with
+        | Replay_guard.Gapped ->
+          (* Nothing consumed, nothing applied, no state touched. The seq space
+             is dense per tab (the client queue is one-in-flight over dense
+             numbering), so an honest client never gaps. The WS tier's
+             silent-ignore arm is unavailable because HTTP must answer
+             something, and answering on the 200 channel would type a protocol
+             violation into every endpoint's contract. *)
+          Dream.respond ~status:`Bad_Request ~headers:text_plain "rpc delivery gap"
+        | Replay_guard.Duplicate (_ : Tea_core.Prim.Msg_seq.t) ->
+          (* Never invoke the handler, never persist: the effect already
+             happened, and this arm exists only to answer for it. *)
+          (match Reply_cache.Cell.find o.replies ~tab:floor ~seq ~endpoint with
+          | Reply_cache.Busy ->
+            (* The taken delivery is still inside its window. 503 means "the
+               effect's fate is unknown at this instant, ask again", a
+               transport-channel meaning the client runtime's 5xx retry arm
+               consumes; it never reaches the app's [expect]. *)
+            Dream.respond ~status:`Service_Unavailable ~headers:text_plain
+              "rpc delivery in flight"
+          | Reply_cache.Original bytes ->
+            (* Byte-identical to what the one taken delivery computed: replayed
+               verbatim, never recomputed at replay time. *)
+            ok_json bytes
+          | Reply_cache.Gone ->
+            (* Effect certain, value lost. The typed arm the whole envelope
+               exists for; the client surfaces it as [Applied_reply_lost]. *)
+            ok_json replayed_body)
+        | Replay_guard.Fresh (_ : Tea_core.Prim.Msg_seq.t) ->
+          (* [mark_pending] in the SAME continuation as the verdict, with no
+             Lwt bind between them: a yield here would let a concurrent
+             duplicate read "no entry" and be told [Replayed] for an effect
+             still running, which is the one answer that would be a lie. *)
+          Reply_cache.Cell.mark_pending o.replies ~tab:floor ~seq;
+          Lwt.try_bind
+            (fun () ->
+              let* () = on_taken () in
+              Lwt.return (resp, water))''',
+        "expect_red": {"native": [
+            "a duplicate delivered INSIDE the window lands NO second commit",
+            "the whole window landed exactly one commit",
+            "the taken delivery's reply counts the branch it actually committed",
+            "a gapped delivery applies nothing",
+            "a gapped delivery consumes nothing else",
+            "and it commits (so the replay above was de-duplication, not a dead channel)",
+            "and it applied nothing: the commit count is unmoved",
+            "and that refusal applied nothing",
+            "a second delivery of the re-applied key does not apply AGAIN",
+            "the rejected delivery committed nothing",
+            "the released seq's effect landed exactly once, on the retry",
+        ], "browser": []},
+    },
+    {
+        "id": "s15-M2",
+        "why": "a taken delivery's floor reaches the journal, not just the in-process mirror",
+        "file": "lib/tea_server/tea_server.ml",
+        # The water binding is consumed by a typed wildcard so the deletion is
+        # not a warning-27 build kill. The kill lands UPSTREAM of the spec's
+        # designated T3 arm: rpc_pack_once_test's restart section reds first
+        # and its T5 die exits the file before T3's arm runs. The two
+        # ordering-arm labels are the same absence seen from rpc_once_test's
+        # gated sink: nothing ever appends, so the 200 resolves with the gate
+        # still closed and the append count stays zero.
+        "old": r'''              let* persisted =
+                Durable_guard.persist o.guard ~replica:o.floor_replica ~tab:floor ~seq
+                  ~water
+              in''',
+        "new": r'''              let* persisted =
+                let (_ : Tea_core.Prim.Store_water.t) = water in
+                Lwt.return (Ok ())
+              in''',
+        "expect_red": {"native": [
+            "the restart adopts the keyed floor from the journal",
+            "life 1's keyed delivery wrote a floor record",
+            "the keyed 200 is still unresolved while the floor's append is held open",
+            "and the acknowledgement followed exactly one append",
+        ], "browser": []},
+    },
+    {
+        "id": "s15-M3",
+        "why": "the persisted floor carries the commit's own water, not a bottom claim",
+        "file": "lib/tea_server/tea_server.ml",
+        # The handler's water is renamed _water in the same span, or the
+        # mutation dies as warning 27 at compile time (measured; a build-error
+        # kill is not a kill). Bottom floors are always adopted unwitnessed,
+        # so adoption itself stays green and only the witness checks red.
+        "old": r'''            (fun (resp, water) ->
+              let body = enveloped resp in
+              let* persisted =
+                Durable_guard.persist o.guard ~replica:o.floor_replica ~tab:floor ~seq
+                  ~water
+              in''',
+        "new": r'''            (fun (resp, _water) ->
+              let body = enveloped resp in
+              let* persisted =
+                Durable_guard.persist o.guard ~replica:o.floor_replica ~tab:floor ~seq
+                  ~water:Tea_core.Prim.Store_water.bottom
+              in''',
+        "expect_red": {"native": [
+            "with its store witness matched against this boot's branch head",
+            "the floor's witness is not the bottom claim of nothing",
+            "and the witness IS the canonical commit's own water, not a second clock",
+            "and drops ONLY that one: the witnessed floor is still adopted",
+        ], "browser": []},
+    },
+    {
+        "id": "s15-M4",
+        "why": "the reply cache answers a seq only its own bytes, never the newest body",
+        "file": "lib/tea_server/reply_cache.ml",
+        # || true rather than a deletion: dropping the conjunct orphans the
+        # pattern binding into a warning-27 build kill.
+        "old": r'''             Int.equal (Msg_seq.compare seq stored_seq) 0
+             && String.equal endpoint stored_endpoint''',
+        "new": r'''             (true || Int.equal (Msg_seq.compare seq stored_seq) 0)
+             && String.equal endpoint stored_endpoint''',
+        "expect_red": {"native": [
+            "a duplicate of an older seq reads Gone, never the newest bytes",
+            "the victim's consumed seq answers Replayed, never a newer seq's bytes",
+        ], "browser": []},
+    },
+    {
+        "id": "s15-M5",
+        "why": "the key grammar is exact: a 31-hex tab is refused, not padded into a namespace",
+        "file": "lib/tea_rpc/tea_rpc.ml",
+        # Padding rather than skipping the validation: acceptance has to
+        # produce a well-typed Key, and a 31-hex tab that round-trips into
+        # SOMEONE'S floor is exactly the forgery the grammar row pins.
+        "old": r'''    | [ tab; seq ] ->
+      Result.bind
+        (Tea_core.Prim.Tab_id.of_string tab''',
+        "new": r'''    | [ tab; seq ] ->
+      let tab = if String.length tab = 31 then tab ^ "0" else tab in
+      Result.bind
+        (Tea_core.Prim.Tab_id.of_string tab''',
+        "expect_red": {"native": [
+            "Key.of_string rejects a 31-hex tab as Bad_tab Wrong_length",
+        ], "browser": []},
+    },
+    {
+        "id": "s15-M6",
+        "why": "a gap is refused on the 400 channel, never answered as a keyed reply",
+        "file": "lib/tea_server/tea_server.ml",
+        "old": r'''          Dream.respond ~status:`Bad_Request ~headers:text_plain "rpc delivery gap"''',
+        "new": r'''          ok_json replayed_body''',
+        "expect_red": {"native": [
+            "a gapped delivery is refused 400",
+        ], "browser": []},
+    },
+    {
+        "id": "s15-M7",
+        "why": "a retry re-sends the RECORDED seq: the queue head never renumbers",
+        "file": "lib/tea_client/rpc_delivery.ml",
+        # Spec 5.4 designated a browser kill (B9: a fresh-seq retry as a second
+        # take), but the full driver sweep measured B9 green under this mutant;
+        # the native head-numbering pin is the one real kill.
+        "old": r'''  match t.queue with
+  | [] -> None
+  | frame :: (_ : (Msg_seq.t * 'msg entry) list) -> Some frame''',
+        "new": r'''  match t.queue with
+  | [] -> None
+  | ((_ : Msg_seq.t), e) :: (_ : (Msg_seq.t * 'msg entry) list) -> Some (t.next, e)''',
+        "expect_red": {"native": [
+            "the first recorded call is numbered one and is the head",
+        ], "browser": []},
+    },
+    {
+        "id": "s15-M8",
+        "why": "the rpc journal lives under .guard/rpc: the two channels never share a ledger",
+        "file": "lib/tea_server_pack/tea_server_pack.ml",
+        # Both positive controls ("the reopened ... channel adopts the floor it
+        # wrote") stayed green under the hand run: the reds below are absences
+        # stated beside presences, so none can be explained by an empty ledger.
+        "old": r'''      ~dir:(Filename.concat guard_dir "rpc")''',
+        "new": r'''      ~dir:guard_dir''',
+        "expect_red": {"native": [
+            "the rpc journal is a file UNDER .guard/rpc, so one restore keeps both",
+            "the rpc channel did not inherit the websocket channel's floor",
+            "the websocket channel did not inherit the rpc channel's floor",
+            "each ledger holds exactly the one floor its own channel wrote",
+        ], "browser": []},
+    },
+    {
+        "id": "s15-M9",
+        "why": "mirror eviction takes the least-recently-TOUCHED floor, not the freshest",
+        "file": "lib/tea_server/durable_guard.ml",
+        "old": r'''                if Int64.compare e.tick best < 0 then''',
+        "new": r'''                if Int64.compare e.tick best > 0 then''',
+        "expect_red": {"native": [
+            "THE POINT: the victim is the least-recently-TOUCHED floor",
+        ], "browser": []},
+    },
+    {
+        "id": "s15-M10",
+        "why": "a Read_only endpoint rides the Bare channel: classification is kind-driven",
+        "file": "lib/tea_rpc/tea_rpc.ml",
+        "old": r'''    | Read_only ->
+      Tea_core.Cmd.http ~path ~body ~expect:(fun wire -> reply (decode_bare e wire))''',
+        "new": r'''    | Read_only ->
+      Tea_core.Cmd.http_keyed ~path ~body ~expect:(fun wire -> reply (decode_bare e wire))''',
+        "expect_red": {"native": [
+            "call puts a Read_only endpoint on the Bare channel",
+            "a Read_only call lowers as the bare delivery contract",
+        ], "browser": []},
+    },
+    {
+        "id": "s15-M11",
+        "why": "the keyed 200 is written strictly after the persist attempt completes",
+        "file": "lib/tea_server/tea_server.ml",
+        # The mutant that survived the WHOLE pre-existing suite: an un-awaited
+        # journal append still completes on the next scheduler pump, so every
+        # after-the-fact read agrees with the pristine pipeline. Only the
+        # ordering arm's gated sink can see it, by holding the response as a
+        # raw promise and asserting it is still asleep.
+        "old": r'''              let* persisted =
+                Durable_guard.persist o.guard ~replica:o.floor_replica ~tab:floor ~seq
+                  ~water
+              in
+              let () =
+                Result.fold persisted
+                  ~ok:(fun () -> ())
+                  ~error:(fun (e : Guard_sink.err) ->
+                    (* One stderr line and in-process semantics, never a failed
+                       response: the effect landed, and refusing to answer for it
+                       would lose the reply on top of the floor. The pump
+                       precedent. *)
+                    let reason =
+                      match e with
+                      | Guard_sink.Sink_closed -> "sink closed"
+                      | Guard_sink.Io reason -> reason
+                    in
+                    Printf.eprintf
+                      "tea_server: rpc delivery floor NOT recorded (%s); this delivery keeps in-process semantics and may re-apply as a visible duplicate after a restart\n%!"
+                      reason)
+              in
+              Reply_cache.Cell.settle o.replies ~tab:floor ~seq ~endpoint ~body;
+              (* The 200 IS this channel's acknowledgement, and it is written
+                 strictly after the persist attempt completes, on BOTH persist
+                 outcomes. Answering first would acknowledge a delivery whose floor
+                 might never reach the journal. *)
+              ok_json body''',
+        "new": r'''              let (_ : (unit, Guard_sink.err) result Lwt.t) =
+                Durable_guard.persist o.guard ~replica:o.floor_replica ~tab:floor ~seq
+                  ~water
+              in
+              Reply_cache.Cell.settle o.replies ~tab:floor ~seq ~endpoint ~body;
+              ok_json body''',
+        "expect_red": {"native": [
+            "the keyed 200 is still unresolved while the floor's append is held open",
+        ], "browser": []},
+    },
+    {
+        "id": "s15-M12",
+        "why": "the origin gate guards the keyed path too, not only the legacy routes",
+        "file": "lib/tea_server/tea_server.ml",
+        # Anchored on dispatch_read_only: the legacy [routes] carries a
+        # byte-identical gate block whose Read_only arm reads
+        # `dispatch request` instead. Forging the origin from Host (rather
+        # than inverting the gate) keeps every same-origin arm green, so the
+        # one red is the gate's absence and nothing else.
+        "old": r'''          | Read_only -> dispatch_read_only request
+          | Mutating ->
+            Tea_safe.Origin_gate.check
+              ~origin:(Dream.header request "Origin")''',
+        "new": r'''          | Read_only -> dispatch_read_only request
+          | Mutating ->
+            Tea_safe.Origin_gate.check
+              ~origin:
+                (Dream.header request "Host"
+                |> Option.map (fun (h : string) -> "http://" ^ h))''',
+        "expect_red": {"native": [
+            "a cross-origin mutating POST is refused 403",
+        ], "browser": []},
+    },
+    {
+        "id": "s15-M13",
+        "why": "the floor namespace is session-scoped: a forged tab cannot reach the victim's floor",
+        "file": "lib/tea_server/tea_server.ml",
+        # An if-true swap so session_id_hex stays used; deleting it outright is
+        # a warning kill on the parameter's one consumer.
+        "old": r'''    "tea-rpc-floor\000" ^ session_id_hex ^ "\000"''',
+        "new": r'''    "tea-rpc-floor\000" ^ (if true then "" else session_id_hex) ^ "\000"''',
+        "expect_red": {"native": [
+            "a forged client tab under another cookie is Fresh in its OWN namespace",
+            "a forged client tab under another cookie applies under its own floor",
+        ], "browser": []},
+    },
+    {
+        "id": "s15-M14",
+        "why": "a Pending hit answers 503, never Replayed: the effect's fate is not yet known",
+        "file": "lib/tea_server/tea_server.ml",
+        "old": r'''            Dream.respond ~status:`Service_Unavailable ~headers:text_plain
+              "rpc delivery in flight"''',
+        "new": r'''            ok_json replayed_body''',
+        "expect_red": {"native": [
+            "a duplicate inside the Pending window is refused 503, not answered 200",
+            "the 503 carries no keyed reply body at all",
+        ], "browser": []},
+    },
+    {
+        "id": "s15-M15",
+        "why": "the reply cache never forges across endpoints sharing a floor tab",
+        "file": "lib/tea_server/reply_cache.ml",
+        "old": r'''             Int.equal (Msg_seq.compare seq stored_seq) 0
+             && String.equal endpoint stored_endpoint''',
+        "new": r'''             Int.equal (Msg_seq.compare seq stored_seq) 0
+             && (true || String.equal endpoint stored_endpoint)''',
+        "expect_red": {"native": [
+            "the reply cache never forges: an endpoint mismatch reads Gone",
+        ], "browser": []},
+    },
+    {
+        "id": "s15-M16",
+        "why": "the key header literal is pinned: client and server cannot drift apart silently",
+        "file": "lib/tea_rpc/tea_rpc.ml",
+        # Both tiers read Tea_rpc.key_header, so a consistent drift breaks no
+        # traffic anywhere: the single literal pin is the ONLY thing that can
+        # red, which is exactly the T20/G9 argument for keeping it.
+        "old": r'''let key_header = "x-tea-key"''',
+        "new": r'''let key_header = "x-tea-kev"''',
+        "expect_red": {"native": [
+            "the key header literal is x-tea-key",
+        ], "browser": []},
+    },
+    {
+        "id": "s15-M17",
+        "why": "the mirror default is derived (4x Cell, max journal cap), not a constant",
+        "file": "lib/tea_server/durable_guard.ml",
+        # The product is still computed and discarded so sessions/tabs/
+        # journal_cap all stay consumed. Instance-vs-derivation compares move
+        # together and stay green (the I4c note); what reds is every check
+        # that pins the derivation against an independently stated cap.
+        "old": r'''  Int.max
+    (4 * Replay_guard.Bound.to_int sessions * Replay_guard.Bound.to_int tabs)
+    journal_cap
+  |> Replay_guard.Bound.of_int
+  |> Option.value ~default:sessions''',
+        "new": r'''  let (_ : int) =
+    (4 * Replay_guard.Bound.to_int sessions * Replay_guard.Bound.to_int tabs)
+    + journal_cap
+  in
+  Replay_guard.Bound.of_int 8 |> Option.value ~default:sessions''',
+        "expect_red": {"native": [
+            "the rpc mirror out-remembers its Cell by the factor of four",
+            "the rpc mirror holds every floor its journal can replay at boot",
+            "the websocket mirror holds every floor its journal can replay at boot",
+            "the default is four times the Cell it seeds",
+            "the rpc channel's mirror clears its own journal cap",
+            "the websocket channel's mirror clears its own, much larger population",
+            "so the two channels were not handed one shared bound",
+        ], "browser": []},
+    },
+    {
+        "id": "s15-M-B9",
+        "why": "a cached reply is replayed byte-identical, not degraded to the reply-lost marker",
+        "file": "lib/tea_server/tea_server.ml",
+        # _bytes because a plain unused binding is a warning-27 build kill.
+        # The B9 retry and same-key checks stayed green under the hand run,
+        # which is the evidence the seven browser checks are independent.
+        "old": r'''          | Reply_cache.Original bytes ->
+            (* Byte-identical to what the one taken delivery computed: replayed
+               verbatim, never recomputed at replay time. *)
+            ok_json bytes''',
+        "new": r'''          | Reply_cache.Original _bytes ->
+            (* Byte-identical to what the one taken delivery computed: replayed
+               verbatim, never recomputed at replay time. *)
+            ok_json replayed_body''',
+        "expect_red": {"native": [
+            "a retry answers the ORIGINAL bytes, not a recompute",
+            "the retry after the window answers the ORIGINAL bytes",
+            "the retry replays the taken delivery's OWN bytes, not a recompute",
+        ], "browser": [
+            "B9: the reply is dropped, the client retries, and the app renders the cached count",
+            "B9: the server counts exactly one tag on the canonical document",
+            "B9: the retry was answered with the byte-identical cached reply",
+            "B9: the app saw a real reply, not the reply-lost marker (the cache held)",
+        ]},
+    },
+    {
+        "id": "s15-M-B10",
+        "why": "a Cell miss consults the durable mirror: the journal floor survives a restart",
+        "file": "lib/tea_server/durable_guard.ml",
+        # Browser-only on purpose, matching the hand confirmation: B9 stays
+        # GREEN under this mutant (its retry hits a warm in-process Cell and
+        # never consults the mirror), which is the measured proof the two
+        # scenarios are not redundant. The _floor rename is load-bearing:
+        # warning 27 is an error here, and keeping the touch keeps
+        # t/replica/tab used. The durable B4 line is the websocket channel
+        # seen through the same consult path.
+        "old": r'''      (fun (floor : Msg_seq.t) ->
+        Replay_guard.Cell.seed t.cell ~replica ~tab ~high:floor;''',
+        "new": r'''      (fun (_floor : Msg_seq.t) ->''',
+        "expect_red": {"native": [], "browser": [
+            "durable B4: the RESTARTED SERVER itself holds 2",
+            "B10: the retry crosses the restart and the app surfaces the reply-lost marker",
+            "B10: life 2 refused the duplicate from the journal alone",
+        ]},
+    },
 ]
 
 

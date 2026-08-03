@@ -43,7 +43,12 @@ module Loop (Io : IO) (A : App.APP) = struct
     | Cmd.Navigate url ->
       let* () = fx.navigate url in
       Io.return (Ok model)
-    | Cmd.Http { path = (_ : Prim.Rpc_path.t); body = (_ : string); expect } ->
+    | Cmd.Http
+        { path = (_ : Prim.Rpc_path.t)
+        ; body = (_ : string)
+        ; delivery = (_ : Cmd.Http_delivery.t)
+        ; expect
+        } ->
       (* This tier has no HTTP client: fail closed INTO the app, not past it.
          The continuation is fed back through [update] like [Emit], so the
          reply msg is fuel-bounded and the app decides what a transportless

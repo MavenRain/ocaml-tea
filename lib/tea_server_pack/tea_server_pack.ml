@@ -16,6 +16,116 @@ module Guard_sink = Tea_server.Guard_sink
 module Durable_guard = Tea_server.Durable_guard
 module Replay_guard = Tea_server.Replay_guard
 module Session_secret = Tea_server.Session_secret
+module Rpc_once = Tea_server.Rpc_once
+
+type guards =
+  { ws : Durable_guard.t
+  ; ws_journal : Guard_file.t option
+  ; rpc : Durable_guard.t
+  ; rpc_journal : Guard_file.t option
+  }
+(** Both delivery channels' guards, opened as one unit (roadmap step 15,
+    D20.3). A journal that failed to open is [None] beside a null-sink guard,
+    never an absent channel: the caller serves at-least-once on that channel
+    rather than not at all. *)
+
+(** Open both channels' guard journals under [guard_dir].
+
+    Since roadmap step 15 there are TWO journals, one per delivery channel:
+    the websocket channel keeps [<root>.guard] byte for byte, and the keyed RPC
+    channel gets [<root>.guard/rpc]. They are separate files rather than one
+    file split at boot because the channels have different bounds, different
+    caps and different compaction pressure, and because a step-14 root must
+    open here with the RPC journal simply ABSENT (created on first keyed take)
+    while a step-14 binary reading a step-15 root never looks inside the
+    subdirectory at all. Nesting the RPC journal under the websocket one keeps
+    the sibling discipline intact: [.guard] is still the single durability
+    artifact a restore has to keep beside the pack root.
+
+    The two opens live in ONE function, and not at two call sites, because
+    what relates them is load-bearing twice over. The ORDER is: [Guard_file.
+    open_] creates its own [dir] but never the parent, so the websocket open
+    is what brings [<root>.guard] into existence, and an rpc-first boot would
+    die ENOENT on a fresh root. The HEAD SNAPSHOT is: both boot filters are
+    checked against the same [head_water], taken once by the caller between
+    the store open and this call, so the two channels cannot straddle a write
+    and judge their floors against different heads.
+
+    Separate from {!Make_pack} because neither channel's composition depends on
+    the app: it is the same pair for every [A], and a test can drive the real
+    composition against a temp root without binding a port. That matters here
+    more than it reads — the directory each channel is opened at is exactly the
+    thing that must not drift, and inside a blocking [serve_pack] no test could
+    observe it. *)
+let open_guards ~(guard_dir : string)
+    ~(head_water :
+       Tea_core.Crdt.Replica.t -> Tea_core.Prim.Store_water.t option) : guards =
+  let open_journal ~(channel : string) ~(dir : string) ~(cap : int)
+      ~(sessions : Replay_guard.Bound.t) ~(tabs : Replay_guard.Bound.t) :
+      Durable_guard.t * Guard_file.t option =
+    Lwt_main.run (Guard_file.open_ ~dir ~cap ~head_water)
+    |> Result.fold
+         ~ok:(fun
+             ((sink, floors, verdict, jf) :
+               Guard_sink.t
+               * Durable_guard.Floors.t
+               * Guard_file.verdict
+               * Guard_file.t)
+           ->
+           let { Guard_file.kept = (_ : int)
+               ; dropped_behind
+               ; dropped_no_branch
+               ; unwitnessed
+               } =
+             verdict
+           in
+           (if dropped_behind > 0 then
+              Printf.eprintf
+                "tea_server_pack: %s channel: dropped %d delivery floor(s) standing ABOVE their branch heads: the pack root is OLDER than the guard journal (a restored snapshot, a rolled-back store); the affected replays will re-apply as visible duplicates rather than be silently lost\n%!"
+                channel dropped_behind);
+           (if dropped_no_branch > 0 then
+              Printf.eprintf
+                "tea_server_pack: %s channel: dropped %d delivery floor(s) with an unreadable or absent branch head — a collected, reaped, or never-written branch (routine after checkpoint GC), or a pack root restored from BEFORE the branch existed; either way the affected replays re-apply as visible duplicates rather than be silently lost\n%!"
+                channel dropped_no_branch);
+           (if unwitnessed > 0 then
+              Printf.eprintf
+                "tea_server_pack: %s channel: adopted %d delivery floor(s) with no store witness (pre-step-13 journal); this boot is NOT protected against a restored-older pack root\n%!"
+                channel unwitnessed);
+           (* The mirror bound is DERIVED at this composition site, never a
+              constant (D20.4), and this is the only place that knows [cap]:
+              the guard reaches its journal through an append-only sink and
+              cannot ask. Passing it is what keeps the boot fold from
+              overflowing the very table it is refilling. *)
+           ( Durable_guard.v ~sessions ~tabs
+               ~mirror:(Durable_guard.default_mirror ~sessions ~tabs ~journal_cap:cap ())
+               ~sink ~floors ()
+           , Some jf ))
+         ~error:(fun (e : Guard_file.open_err) ->
+           let reason =
+             match e with
+             | Guard_file.Io reason -> reason
+             | Guard_file.Bad_dir reason -> reason
+           in
+           Printf.eprintf
+             "tea_server_pack: %s channel: guard journal unavailable (%s); serving at-least-once\n%!"
+             channel reason;
+           (* No journal, hence no cap to clear: the sinkless derivation, the
+              mem tier's composition exactly. *)
+           ( Durable_guard.v ~sessions ~tabs ~sink:Guard_sink.null
+               ~floors:Durable_guard.Floors.empty ()
+           , None ))
+  in
+  let ws, ws_journal =
+    open_journal ~channel:"websocket" ~dir:guard_dir ~cap:32768
+      ~sessions:Replay_guard.default_sessions ~tabs:Replay_guard.default_tabs
+  in
+  let rpc, rpc_journal =
+    open_journal ~channel:"rpc"
+      ~dir:(Filename.concat guard_dir "rpc")
+      ~cap:16384 ~sessions:Replay_guard.default_rpc_replicas
+      ~tabs:Replay_guard.default_rpc_tabs
+  in
+  { ws; ws_journal; rpc; rpc_journal }
 
 module Make_pack (A : Tea_core.App.APP) = struct
   module Store = Tea_persist_pack.Store_pack.Make (A)
@@ -104,8 +214,8 @@ module Make_pack (A : Tea_core.App.APP) = struct
       scenario would be measuring a lost store rather than a lost delivery
       record. The wake is guarded by [is_sleeping], so a second signal (or both
       signals) resolves the promise once. *)
-  let serve_pack ?(interface = "localhost") ?(port = 8080) ?client_dir ?rpc ?coalesce ?retention
-      ?lower_root ?sessions ~(root : Root.t) () : unit =
+  let serve_pack ?(interface = "localhost") ?(port = 8080) ?client_dir ?rpc ?rpc_once
+      ?coalesce ?retention ?lower_root ?sessions ~(root : Root.t) () : unit =
     (* The three durability siblings are three separate paths with no
        cross-binding, so a restore or a manual wipe can keep some and drop
        others (DESIGN R20). One direction is silent LOSS rather than the
@@ -175,58 +285,42 @@ module Make_pack (A : Tea_core.App.APP) = struct
        across GC and migration is not a bet worth making. A failed open is one
        audible line and a null-sink guard — a server without durability beats
        no server, and the degradation direction is duplicate, never loss. *)
-    let guard, journal =
+    (* ONE branch_waters read, taken between the store open and the guard opens,
+       feeds BOTH boot filters: each journal's floors are checked against the
+       heads THIS boot will actually serve from, and reading twice could
+       straddle a write and judge the two channels against different heads. *)
+    let head_water =
       Lwt_main.run
-        (let open Lwt.Syntax in
-         (* One branch_waters read, taken between the store open and the
-            guard open, feeds the boot filter: the journal's floors are
-            checked against the heads THIS boot will actually serve from. *)
-         let* waters = Store.branch_waters repo in
-         Guard_file.open_ ~dir:guard_dir ~cap:32768
-           ~head_water:(Guard_file.head_water_of_list waters))
-      |> Result.fold
-           ~ok:(fun
-               ((sink, floors, verdict, jf) :
-                 Guard_sink.t
-                 * Durable_guard.Floors.t
-                 * Guard_file.verdict
-                 * Guard_file.t)
-             ->
-             let { Guard_file.kept = (_ : int)
-                 ; dropped_behind
-                 ; dropped_no_branch
-                 ; unwitnessed
-                 } =
-               verdict
-             in
-             (if dropped_behind > 0 then
-                Printf.eprintf
-                  "tea_server_pack: dropped %d delivery floor(s) standing ABOVE their branch heads: the pack root is OLDER than the guard journal (a restored snapshot, a rolled-back store); the affected replays will re-apply as visible duplicates rather than be silently lost\n%!"
-                  dropped_behind);
-             (if dropped_no_branch > 0 then
-                Printf.eprintf
-                  "tea_server_pack: dropped %d delivery floor(s) with an unreadable or absent branch head — a collected, reaped, or never-written branch (routine after checkpoint GC), or a pack root restored from BEFORE the branch existed; either way the affected replays re-apply as visible duplicates rather than be silently lost\n%!"
-                  dropped_no_branch);
-             (if unwitnessed > 0 then
-                Printf.eprintf
-                  "tea_server_pack: adopted %d delivery floor(s) with no store witness (pre-step-13 journal); this boot is NOT protected against a restored-older pack root\n%!"
-                  unwitnessed);
-             ( Durable_guard.v ~sessions:Replay_guard.default_sessions
-                 ~tabs:Replay_guard.default_tabs ~sink ~floors
-             , Some jf ))
-           ~error:(fun (e : Guard_file.open_err) ->
-             let reason =
-               match e with
-               | Guard_file.Io reason -> reason
-               | Guard_file.Bad_dir reason -> reason
-             in
-             Printf.eprintf
-               "tea_server_pack: guard journal unavailable (%s); serving at-least-once\n%!"
-               reason;
-             ( Durable_guard.v ~sessions:Replay_guard.default_sessions
-                 ~tabs:Replay_guard.default_tabs ~sink:Guard_sink.null
-                 ~floors:Durable_guard.Floors.empty
-             , None ))
+        (Lwt.map Guard_file.head_water_of_list (Store.branch_waters repo))
+    in
+    (* Both channels' journals, opened together and against this one head
+       snapshot (D20.3). The directory each channel lands in, and the order the
+       two are opened in, live in {!open_guards} rather than here so a native
+       test can drive the real composition without binding a port. *)
+    let { ws = guard; ws_journal = journal; rpc = rpc_guard; rpc_journal } =
+      open_guards ~guard_dir ~head_water
+    in
+    (* [?rpc_once] takes a route BUILDER for the reason {!Tea_server.Make.serve}
+       gives, and here the reason is at its strongest: the guard it wraps is
+       backed by a journal THIS function opened three lines ago and will close
+       at teardown, so no caller could have composed the value in advance. The
+       repo is handed over for the same reason and is just as load-bearing: the
+       app's keyed handler commits through {!step}, this function is what opened
+       the store it commits to, and an app cannot reopen a pack root a live
+       server already holds.
+
+       [floor_replica] is [main] because that is the branch the boot filter
+       above just checked these floors against; the single-branch contract
+       (D20, R26) is what makes the two agree. *)
+    let rpc =
+      Option.fold rpc_once ~none:(fun () -> rpc)
+        ~some:(fun (build : Store.t -> Tea_server.Rpc_once.t -> Dream.route list) () ->
+          Some
+            (Option.value rpc ~default:[]
+            @ build repo
+                (Tea_server.Rpc_once.v ~guard:rpc_guard
+                   ~floor_replica:Store.main_replica)))
+        ()
     in
     let stop, wake = Lwt.wait () in
     List.iter
@@ -253,5 +347,11 @@ module Make_pack (A : Tea_core.App.APP) = struct
     Lwt_main.run
       (let open Lwt.Syntax in
        let* () = Store.close repo in
-       Option.fold journal ~none:Lwt.return_unit ~some:Guard_file.close))
+       (* Both journals, and the order BETWEEN them does not matter for the same
+          reason the order against the repo does: each channel's floors are only
+          ever compared against commits, never against the other channel's. What
+          matters is that neither is skipped, since an unclosed journal is the
+          silent-loss direction this whole teardown exists to avoid. *)
+       let* () = Option.fold journal ~none:Lwt.return_unit ~some:Guard_file.close in
+       Option.fold rpc_journal ~none:Lwt.return_unit ~some:Guard_file.close))
 end

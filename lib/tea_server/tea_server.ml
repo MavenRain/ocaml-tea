@@ -24,11 +24,79 @@ module Replay_guard = Replay_guard
 module Guard_sink = Guard_sink
 module Durable_guard = Durable_guard
 
+(** The RPC channel's reply store (roadmap step 15, D20.2), re-exported for the
+    same reason: it is the one half of the exactly-once pump whose laws can be
+    driven directly, so [reply_cache_test] owns both sides of the window
+    instead of racing for it. *)
+module Reply_cache = Reply_cache
+
 (** Where a browser's identity lives and for how long (roadmap step 12, D17),
     re-exported for the same reason: the session id names the Irmin branch and
     {i is} the CRDT replica id, so choosing a back end is choosing how long a
     model, its undo history, and its replay floor survive. *)
 module Session_secret = Session_secret
+
+(** The exactly-once RPC channel's server-side state, {i outside} the {!Rpc}
+    functor although that is where it is used (roadmap step 15, D20).
+
+    None of the three fields mentions the [Api], so keeping the record inside
+    the functor would make it a fresh nominal type per instantiation - and the
+    composition sites that must hand one over ({!Make.serve},
+    {!Tea_server_pack.Make_pack.serve_pack}) know nothing of any [Api]. The
+    journal is opened by the entry point, which also owns its teardown close,
+    so the value can only travel in that direction: framework builds it, the
+    app's route builder receives it. {!Rpc.once} re-exports this type with its
+    fields, so an app still spells it [Rpc.once]. *)
+module Rpc_once = struct
+  type t =
+    { guard : Durable_guard.t
+    ; replies : Reply_cache.Cell.cell
+    ; floor_replica : Tea_core.Crdt.Replica.t
+    }
+
+  (** The general constructor: an already-composed guard (durable or not) plus
+      the branch its keyed handlers commit on. The reply cache is minted here
+      rather than accepted, because one [t] {i is} one channel: two values
+      sharing a cache would answer each other's retries from bytes their own
+      guard never took, and two caches behind one guard would answer [Gone]
+      for deliveries the other is still holding. *)
+  let v ~(guard : Durable_guard.t) ~(floor_replica : Tea_core.Crdt.Replica.t) : t =
+    { guard; replies = Reply_cache.Cell.v (); floor_replica }
+
+  (** The mem tier's value, which is D16's default exactly: the RPC guard over
+      {!Guard_sink.null} and empty floors. Nothing here outlives the process,
+      which is the whole of what the mem tier ever promised. No [?mirror] is
+      passed, so the bound is [Durable_guard.default_mirror ~sessions ~tabs ()]
+      with no journal cap to clear - the sinkless composition the derivation
+      was written for (D20.4). *)
+  let mem ~(floor_replica : Tea_core.Crdt.Replica.t) : t =
+    v ~floor_replica
+      ~guard:
+        (Durable_guard.v ~sessions:Replay_guard.default_rpc_replicas
+           ~tabs:Replay_guard.default_rpc_tabs ~sink:Guard_sink.null
+           ~floors:Durable_guard.Floors.empty ())
+end
+
+(* Dream session ids are opaque strings; hex-encoding maps them injectively
+   into the [Session_id] alphabet (never empty, no '/'), so every browser
+   session gets exactly its own Irmin branch.
+
+   Top-level rather than functor-local since roadmap step 15: the RPC channel's
+   floor-tab derivation hashes the SAME encoding of the SAME cookie
+   ({!Rpc.floor_tab}, D20.1), and two spellings of "the session's hex id" would
+   put the guard's dedup namespace and the store's branch name on different
+   keys with no symptom either way. Injectivity is also what lets that
+   derivation use NUL as a field separator: a hex-encoded half can contain no
+   NUL, so no two different (session, tab) pairs can slide into one digest
+   input.
+
+   Written over [String.to_seq] rather than the index arithmetic it replaces:
+   same bytes for every input ([Char.code] is always [0..255] and ["%02x"] is
+   the two lowercase nibbles), no partial accessor. *)
+let hex (s : string) : string =
+  String.to_seq s
+  |> Seq.map (fun (c : char) -> Printf.sprintf "%02x" (Char.code c))
+  |> List.of_seq |> String.concat ""
 
 (** The backend-generic handler bodies (roadmap step 8, D2): every current
     handler, router, step, and WS pump, functorized over any
@@ -61,17 +129,6 @@ struct
   let msg_path = "/msg"
 
   let undo_path = "/undo"
-
-  (* Dream session ids are opaque strings; hex-encoding maps them injectively
-     into the [Session_id] alphabet (never empty, no '/'), so every browser
-     session gets exactly its own Irmin branch. *)
-  let hex (s : string) : string =
-    String.init
-      (2 * String.length s)
-      (fun i ->
-        let byte = Char.code s.[i / 2] in
-        let nibble = if i mod 2 = 0 then byte lsr 4 else byte land 0xf in
-        "0123456789abcdef".[nibble])
 
   let session_of_request (repo : St.t) (request : Dream.request) :
       (St.session, string) result Lwt.t =
@@ -202,7 +259,7 @@ struct
   let guard : Durable_guard.t =
     Durable_guard.v ~sessions:Replay_guard.default_sessions
       ~tabs:Replay_guard.default_tabs ~sink:Guard_sink.null
-      ~floors:Durable_guard.Floors.empty
+      ~floors:Durable_guard.Floors.empty ()
 
   let live_session ?(coalesce = Tea_core.Coalesce_spec.Keep_all) ?(guard = guard)
       ?(interpose : unit -> unit Lwt.t = fun () -> Lwt.return_unit) (s : St.session)
@@ -534,9 +591,35 @@ module Make (A : Tea_core.App.APP) = struct
       here rather than merely a default. {!Handlers.handler} keeps [?sessions],
       because {!Tea_server_pack.Make_pack.serve_pack} genuinely needs it and
       {!Tea_server_pack.Make_pack} pairs it with a durable store. *)
-  let serve ?(interface = "localhost") ?(port = 8080) ?client_dir ?rpc ?coalesce ()
-      : unit =
+  let serve ?(interface = "localhost") ?(port = 8080) ?client_dir ?rpc ?rpc_once
+      ?coalesce () : unit =
     let repo = Lwt_main.run (Store.create ()) in
+    (* [?rpc_once] takes a route BUILDER, not a built list, because the value it
+       needs does not exist until the entry point makes it. On this tier that is
+       merely a fresh mem channel; on {!Tea_server_pack.Make_pack.serve_pack} it
+       is a guard over a journal that same function opens and closes, so the app
+       could not have composed it beforehand even in principle. Keeping both
+       tiers on the one shape means an app moves between them by swapping the
+       entry point, not by restructuring its wiring.
+
+       The builder also receives the STORE, and that is not a convenience: an
+       app's keyed handler is a function of the repo (it commits through
+       {!step}), and this entry point is where the repo is created, so a builder
+       that saw only the channel could be written by no app that touches its own
+       model. The counter, whose pack tier has no RPC at all, is why the
+       narrower shape survived its first increment unchallenged.
+
+       Both [Option.fold] arms are closures applied once: [~none:] is eager, and
+       an eager arm here would mint a guard and a reply cache for every caller
+       that never asked for the keyed channel. *)
+    let rpc =
+      Option.fold rpc_once ~none:(fun () -> rpc)
+        ~some:(fun (build : Store.t -> Rpc_once.t -> Dream.route list) () ->
+          Some
+            (Option.value rpc ~default:[]
+            @ build repo (Rpc_once.mem ~floor_replica:Store.main_replica)))
+        ()
+    in
     Dream.run ~interface ~port
       (Dream.logger (handler ?client_dir ?rpc ?coalesce repo))
 end
@@ -680,6 +763,27 @@ module Rpc (Api : Tea_rpc.API) = struct
   let route (h : handler) (p : Api.any) : Dream.route =
     match p with
     | Api.Any ep ->
+      (* A [Mutating] endpoint's 200 body ALWAYS rides the [keyed_resp]
+         envelope, keyed request or not (roadmap step 15): the client's
+         [expect] closure is fixed when [call] builds the command and cannot
+         see whether the runtime attached a delivery key, so a body shape that
+         varied with the header would be undecodable by construction. Until
+         the guard lands, every enveloped answer is [Reply]; [Replayed] is what
+         the de-duplicating route will add. [Read_only] is untouched.
+
+         The match is wildcard-free, so a third kind cannot silently pick a
+         wire shape here. *)
+      let encode_reply resp =
+        (* Unannotated on purpose: [resp] has the existential type [Any] bound,
+           which a written-out ['resp] would rebind to a fresh variable and
+           then let escape its scope. *)
+        match (Api.kind ep : Tea_rpc.endpoint_kind) with
+        | Read_only -> R.encode_resp ep resp
+        | Mutating ->
+          Tea_core.Codec.to_json
+            (Tea_rpc.keyed_resp_t (Api.resp_t ep))
+            (Tea_rpc.Reply resp)
+      in
       (* Content-type gate, then the streaming size cap, then decode, then the
          app's handler. Shared by both kinds: gating is the only difference a
          [Mutating] classification makes. *)
@@ -702,7 +806,7 @@ module Rpc (Api : Tea_rpc.API) = struct
                  ~ok:(fun req ->
                    let* resp = h.handle ep req in
                    Dream.respond ~status:`OK ~headers:json_content_type
-                     (R.encode_resp ep resp))
+                     (encode_reply resp))
       in
       (* The gated path demands the [same_origin] proof, so it cannot be taken
          without one. It is not a full [accept_ws]-style isolated sink, though:
@@ -731,4 +835,312 @@ module Rpc (Api : Tea_rpc.API) = struct
                        "cross-origin mutating rpc rejected"))
 
   let routes (h : handler) : Dream.route list = List.map (route h) Api.all
+
+  (** The floor-tab derivation (roadmap step 15, D20.1): the namespace half of
+      the delivery key, and the reason the wire half can be forged freely
+      without reaching anyone else's floor.
+
+      The tab in [x-tea-key] is client-asserted, so it never keys a floor on
+      its own. What keys a floor is
+      [Digest.to_hex (Digest.string ("tea-rpc-floor\000" ^ session_id_hex ^ "\000" ^ client_tab))],
+      which binds the session cookie to the client stream. That is exactly 32
+      lowercase hex characters, exactly {!Tea_core.Prim.Tab_id}'s grammar, so
+      the parse back succeeds by construction; its unreachable error arm folds
+      to [None], which the route treats as keyless — the accept direction,
+      never an exception.
+
+      The journal therefore records the DERIVATION, not the input. The tab-id
+      disclosure DESIGN R14 documents confers no floor authority: an attacker
+      who wants a victim's floor needs the victim's cookie, which is the WS
+      tier's own precondition (T13). Both halves are hex, so neither can
+      contain the NUL that separates them and no two distinct (session, tab)
+      pairs can slide into one digest input.
+
+      Honest about the primitive (R23): this is the unkeyed stdlib [Digest]
+      (MD5, the {!Session_secret} precedent). Only preimage and second-preimage
+      resistance are relied on, and an attacker cannot choose the session half,
+      so collision weakness does not apply; a secret-keyed derivation is the
+      upgrade if the session secret is ever plumbed to this route.
+
+      On the pack tier the derivation is stable across restarts precisely
+      because D17 made identity durable. Under {!Session_secret.memory} it is
+      not, which is that tier's in-process-only sentence restated: a restart
+      lands every tab in a fresh namespace, so nothing is deduplicated across
+      it. *)
+  let floor_tab ~(session_id_hex : string) ~(client_tab : Tea_core.Prim.Tab_id.t) :
+      Tea_core.Prim.Tab_id.t option =
+    "tea-rpc-floor\000" ^ session_id_hex ^ "\000"
+    ^ Tea_core.Prim.Tab_id.to_string client_tab
+    |> Digest.string |> Digest.to_hex |> Tea_core.Prim.Tab_id.of_string
+    |> Result.fold
+         ~ok:(fun (t : Tea_core.Prim.Tab_id.t) -> Some t)
+         ~error:(fun (_ : Tea_core.Prim.Tab_id.err) ->
+           (* Unreachable: [Digest.to_hex] is 32 lowercase hex by construction.
+              [None] is the accept direction regardless. *)
+           None)
+
+  (** The keyed handler: the rank-2 {!handler} plus the one fact the guard
+      cannot learn on its own, which store water the effect's commit returned.
+
+      {!Tea_core.Prim.Store_water.bottom} when nothing committed — a no-op
+      update, a fuel-exhausted step, an app-level rejection — because the D16
+      "taken, never applied" sentence needs exactly that arm: a floor claiming
+      a water no commit ever minted would survive a boot filter it should not.
+      The app already holds the value as [step_outcome.water], which is
+      [commit]'s own winning-round mint and never a head read (a head read
+      could belong to a later writer). *)
+  type keyed_handler =
+    { handle_keyed :
+        'req 'resp.
+        ('req, 'resp) Api.t -> 'req -> ('resp * Tea_core.Prim.Store_water.t) Lwt.t
+    }
+
+  (** The exactly-once channel's server half, built once per app at wiring
+      time.
+
+      [floor_replica] names the ONE branch keyed handlers may commit on: the
+      single-branch contract, a wiring-time declaration in the idiom of
+      "request-free by contract", pinned by a test rather than hoped. It is
+      what keeps the boot filter's question meaningful and
+      {!Durable_guard}'s only-rollback-is-evidence law true — floors keyed on a
+      branch the filter never checks would be adopted blind. Multi-branch apps
+      need a [floor_replica] per route group (DESIGN R26); the journal, filter
+      and [Floors] already handle arbitrary replicas, so that extension is
+      wiring rather than redesign.
+
+      [replies] is deliberately in-process. A durable reply store would be a
+      fourth restore-coherence artifact beside the pack root, the journal and
+      the secret, and the consumed marker and the reply bytes would then have
+      to land as ONE record with their own witness and boot filter (R20
+      recursed). Losing the bytes is the direction this family always
+      degrades toward: a visible [Replayed], never a silent second apply.
+
+      The record itself lives at {!Rpc_once}, one nominal type shared by every
+      instantiation, because the entry points that build it (and own the
+      journal behind [guard]) are not parameterised by any [Api]. The
+      re-export below carries the fields, so [Rpc.once] reads and constructs
+      exactly as a functor-local record would. *)
+  type once = Rpc_once.t =
+    { guard : Durable_guard.t
+    ; replies : Reply_cache.Cell.cell
+    ; floor_replica : Tea_core.Crdt.Replica.t
+    }
+
+  (** The mem tier's [once], which is D16's default exactly: the RPC guard over
+      {!Guard_sink.null} and empty floors, plus a fresh reply cache. Nothing
+      here outlives the process, which is the whole of what the mem tier ever
+      promised. The durable tier composes the same record over a journal-backed
+      sink instead. *)
+  let once_mem ~(floor_replica : Tea_core.Crdt.Replica.t) () : once =
+    Rpc_once.mem ~floor_replica
+
+  let route_once ?(on_taken = fun () -> Lwt.return_unit) (o : once) (h : keyed_handler)
+      (p : Api.any) : Dream.route =
+    match p with
+    | Api.Any ep ->
+      (* The reply cache keys on the endpoint as well as the seq (D20.2, J3):
+         the mounted path is this endpoint's unique wire identity already, so
+         reusing it here cannot drift from what the router answers. The
+         endpoint is defence in depth, not a key axis — a client that reuses
+         one seq across two endpoints is malformed, and this makes it read
+         [Replayed] rather than another endpoint's bytes. *)
+      let endpoint = Tea_core.Prim.Rpc_path.to_string (R.path_of ep) in
+      let ok_json (payload : string) : Dream.response Lwt.t =
+        Dream.respond ~status:`OK ~headers:json_content_type payload
+      in
+      let enveloped resp =
+        (* Unannotated for the same reason [route]'s [encode_reply] is: [resp]
+           carries the existential bound by [Any]. *)
+        Tea_core.Codec.to_json (Tea_rpc.keyed_resp_t (Api.resp_t ep)) (Tea_rpc.Reply resp)
+      in
+      let replayed_body : string =
+        Tea_core.Codec.to_json (Tea_rpc.keyed_resp_t (Api.resp_t ep)) Tea_rpc.Replayed
+      in
+      (* Step 1 of the pump, shared by both kinds: content-type gate, streaming
+         size cap, decode. Everything that can refuse without consuming refuses
+         here, BEFORE any [take]. *)
+      let with_decoded (request : Dream.request) k : Dream.response Lwt.t =
+        if not (content_type_is_json request) then
+          Dream.respond ~status:`Unsupported_Media_Type ~headers:text_plain
+            "rpc requires Content-Type: application/json"
+        else
+          let* capped = Body.of_request ~max:max_body_bytes request in
+          match (capped : Body.capped) with
+          | Body_too_large ->
+            Dream.respond ~status:`Payload_Too_Large ~headers:text_plain
+              "rpc body too large"
+          | Within_cap body ->
+            R.decode_req ep body
+            |> Result.fold
+                 ~error:(fun (Tea_core.Codec.Decode_failed reason) ->
+                   Dream.respond ~status:`Bad_Request ~headers:text_plain
+                     ("undecodable rpc request: " ^ reason))
+                 ~ok:k
+      in
+      (* [Read_only] dispatches exactly as today: no key is read, no floor is
+         touched, and the answer is a bare ['resp]. The water a keyed handler
+         returns is meaningless here and is discarded rather than recorded. *)
+      let dispatch_read_only (request : Dream.request) : Dream.response Lwt.t =
+        with_decoded request (fun req ->
+            let* resp, (_ : Tea_core.Prim.Store_water.t) = h.handle_keyed ep req in
+            Dream.respond ~status:`OK ~headers:json_content_type (R.encode_resp ep resp))
+      in
+      (* Steps 2 and 3 of the pump's legacy arm: no key at all, or a
+         derivation that declined. Today's semantics — no dedup, no consume —
+         and the answer is still enveloped, because the 200 shape is fixed by
+         KIND, not by the request. *)
+      let unkeyed req : Dream.response Lwt.t =
+        let* resp, (_ : Tea_core.Prim.Store_water.t) = h.handle_keyed ep req in
+        ok_json (enveloped resp)
+      in
+      (* Steps 3 to 6: the verdict and its arms. *)
+      let pump req (floor : Tea_core.Prim.Tab_id.t) (seq : Tea_core.Prim.Msg_seq.t) :
+          Dream.response Lwt.t =
+        match Durable_guard.take o.guard ~replica:o.floor_replica ~tab:floor ~seq with
+        | Replay_guard.Gapped ->
+          (* Nothing consumed, nothing applied, no state touched. The seq space
+             is dense per tab (the client queue is one-in-flight over dense
+             numbering), so an honest client never gaps. The WS tier's
+             silent-ignore arm is unavailable because HTTP must answer
+             something, and answering on the 200 channel would type a protocol
+             violation into every endpoint's contract. *)
+          Dream.respond ~status:`Bad_Request ~headers:text_plain "rpc delivery gap"
+        | Replay_guard.Duplicate (_ : Tea_core.Prim.Msg_seq.t) ->
+          (* Never invoke the handler, never persist: the effect already
+             happened, and this arm exists only to answer for it. *)
+          (match Reply_cache.Cell.find o.replies ~tab:floor ~seq ~endpoint with
+          | Reply_cache.Busy ->
+            (* The taken delivery is still inside its window. 503 means "the
+               effect's fate is unknown at this instant, ask again", a
+               transport-channel meaning the client runtime's 5xx retry arm
+               consumes; it never reaches the app's [expect]. *)
+            Dream.respond ~status:`Service_Unavailable ~headers:text_plain
+              "rpc delivery in flight"
+          | Reply_cache.Original bytes ->
+            (* Byte-identical to what the one taken delivery computed: replayed
+               verbatim, never recomputed at replay time. *)
+            ok_json bytes
+          | Reply_cache.Gone ->
+            (* Effect certain, value lost. The typed arm the whole envelope
+               exists for; the client surfaces it as [Applied_reply_lost]. *)
+            ok_json replayed_body)
+        | Replay_guard.Fresh (_ : Tea_core.Prim.Msg_seq.t) ->
+          (* [mark_pending] in the SAME continuation as the verdict, with no
+             Lwt bind between them: a yield here would let a concurrent
+             duplicate read "no entry" and be told [Replayed] for an effect
+             still running, which is the one answer that would be a lie. *)
+          Reply_cache.Cell.mark_pending o.replies ~tab:floor ~seq;
+          Lwt.try_bind
+            (fun () ->
+              let* () = on_taken () in
+              h.handle_keyed ep req)
+            (fun (resp, water) ->
+              let body = enveloped resp in
+              let* persisted =
+                Durable_guard.persist o.guard ~replica:o.floor_replica ~tab:floor ~seq
+                  ~water
+              in
+              let () =
+                Result.fold persisted
+                  ~ok:(fun () -> ())
+                  ~error:(fun (e : Guard_sink.err) ->
+                    (* One stderr line and in-process semantics, never a failed
+                       response: the effect landed, and refusing to answer for it
+                       would lose the reply on top of the floor. The pump
+                       precedent. *)
+                    let reason =
+                      match e with
+                      | Guard_sink.Sink_closed -> "sink closed"
+                      | Guard_sink.Io reason -> reason
+                    in
+                    Printf.eprintf
+                      "tea_server: rpc delivery floor NOT recorded (%s); this delivery keeps in-process semantics and may re-apply as a visible duplicate after a restart\n%!"
+                      reason)
+              in
+              Reply_cache.Cell.settle o.replies ~tab:floor ~seq ~endpoint ~body;
+              (* The 200 IS this channel's acknowledgement, and it is written
+                 strictly after the persist attempt completes, on BOTH persist
+                 outcomes. Answering first would acknowledge a delivery whose floor
+                 might never reach the journal. *)
+              ok_json body)
+            (fun (exn : exn) ->
+              (* The barrier (R27): the delivery was consumed but its apply
+                 REJECTED before any floor could be appended. Un-take in this
+                 same continuation: the retry must read [Fresh] and re-run the
+                 handler, because a consumed seq with no effect drains through
+                 the reply cache into a 200 [Replayed] for an effect that never
+                 happened, the silent-loss direction the family forbids. The
+                 [Pending] marker is deliberately LEFT standing: a duplicate
+                 racing the retry must read [Busy] (503, ask again), never
+                 [Gone] and a [Replayed] lie, and the retry's own [Fresh]
+                 re-take re-marks the window. If the handler half-applied
+                 before rejecting, the retry re-applies: a visible convergent
+                 duplicate, the licensed direction. [release] is conditional on
+                 the high water still being exactly [seq], so a non-conforming
+                 pipeliner's later take is never un-taken by this one's
+                 failure. *)
+              Durable_guard.release o.guard ~replica:o.floor_replica ~tab:floor ~seq;
+              Printf.eprintf
+                "tea_server: rpc keyed handler failed before persist (%s); delivery released for retry\n%!"
+                (Printexc.to_string exn);
+              Dream.respond ~status:`Internal_Server_Error ~headers:text_plain
+                "rpc handler failed")
+      in
+      (* The gated path demands the [same_origin] proof, so it cannot be taken
+         without one — the origin gate runs first, before the body is read and
+         long before anything is consumed. *)
+      let dispatch_mutating (_ : Tea_safe.Origin_gate.same_origin Tea_safe.Proof.t)
+          (request : Dream.request) : Dream.response Lwt.t =
+        with_decoded request (fun req ->
+            (* Step 1's last refusal: the key parse. A malformed key is a 400
+               that burns no sequence number. *)
+            (Dream.header request Tea_rpc.key_header
+            |> Option.fold
+                 ~none:(fun () -> unkeyed req)
+                 ~some:(fun (raw : string) () ->
+                   Tea_rpc.Key.of_string raw
+                   |> Result.fold
+                        ~error:(fun (_ : Tea_rpc.Key.err) ->
+                          Dream.respond ~status:`Bad_Request ~headers:text_plain
+                            "malformed rpc delivery key")
+                        ~ok:(fun (key : Tea_rpc.Key.t) ->
+                          (floor_tab
+                             ~session_id_hex:(hex (Dream.session_id request))
+                             ~client_tab:(Tea_rpc.Key.tab key)
+                          |> Option.fold
+                               ~none:(fun () -> unkeyed req)
+                               ~some:(fun (floor : Tea_core.Prim.Tab_id.t) () ->
+                                 pump req floor (Tea_rpc.Key.seq key)))
+                            ())))
+              ())
+      in
+      Dream.post
+        (Tea_core.Prim.Rpc_path.to_string (R.path_of ep))
+        (fun request ->
+          match (Api.kind ep : Tea_rpc.endpoint_kind) with
+          | Read_only -> dispatch_read_only request
+          | Mutating ->
+            Tea_safe.Origin_gate.check
+              ~origin:(Dream.header request "Origin")
+              ~host:(Dream.header request "Host")
+            |> Result.fold
+                 ~ok:(fun proof -> dispatch_mutating proof request)
+                 ~error:(fun (d : Tea_safe.Origin_gate.denial) ->
+                   match d with
+                   | Origin_missing | Host_missing | Both_missing | Origin_mismatch ->
+                     Dream.respond ~status:`Forbidden ~headers:text_plain
+                       "cross-origin mutating rpc rejected"))
+
+  (** One POST route per {!Api.all} element, as {!routes}, but with the
+      [Mutating] tier under the exactly-once guard (roadmap step 15, D20).
+      [Read_only] endpoints dispatch exactly as today.
+
+      [?on_taken] is a tests-only seam defaulting to [Lwt.return_unit], invoked
+      between the [Fresh] verdict (with its synchronous [mark_pending] already
+      recorded) and the handler call. It is the only way to land a duplicate or
+      a sibling writer inside the one window that matters while still driving
+      the REAL app handler, which is what keeps the two-writer and 503 checks
+      honest instead of testing a forked copy of the pipeline. *)
+  let routes_once ?on_taken (o : once) (h : keyed_handler) : Dream.route list =
+    List.map (route_once ?on_taken o h) Api.all
 end

@@ -31,7 +31,7 @@ module Dguard = Tea_server.Durable_guard
    instead. *)
 let mem_guard () : Dguard.t =
   Dguard.v ~sessions:Guard.default_sessions ~tabs:Guard.default_tabs
-    ~sink:Tea_server.Guard_sink.null ~floors:Dguard.Floors.empty
+    ~sink:Tea_server.Guard_sink.null ~floors:Dguard.Floors.empty ()
 module Msg_seq = Tea_core.Prim.Msg_seq
 module App = Counter_app.App
 
@@ -266,7 +266,7 @@ let () =
      let sink, recorded = Tea_server.Guard_sink.memory () in
      let guard_a =
        Dguard.v ~sessions:Guard.default_sessions ~tabs:Guard.default_tabs ~sink
-         ~floors:Dguard.Floors.empty
+         ~floors:Dguard.Floors.empty ()
      in
      let l4 = link () in
      let session4 = Server.live_session ~guard:guard_a s4 l4.transport in
@@ -290,7 +290,7 @@ let () =
      (* The new process: an EMPTY cell, floors folded from the record alone. *)
      let guard_b =
        Dguard.v ~sessions:Guard.default_sessions ~tabs:Guard.default_tabs ~sink
-         ~floors:(Dguard.Floors.of_events (recorded ()))
+         ~floors:(Dguard.Floors.of_events (recorded ())) ()
      in
      let l5 = link () in
      let session5 = Server.live_session ~guard:guard_b s4 l5.transport in
@@ -315,7 +315,7 @@ let () =
      let* s5 = Server.Store.session repo (sid "norestore") in
      let guard_c =
        Dguard.v ~sessions:Guard.default_sessions ~tabs:Guard.default_tabs
-         ~sink:Tea_server.Guard_sink.null ~floors:Dguard.Floors.empty
+         ~sink:Tea_server.Guard_sink.null ~floors:Dguard.Floors.empty ()
      in
      let l6 = link () in
      let session6 = Server.live_session ~guard:guard_c s5 l6.transport in
@@ -328,7 +328,7 @@ let () =
      let* (_ : unit) = session6 in
      let guard_d =
        Dguard.v ~sessions:Guard.default_sessions ~tabs:Guard.default_tabs
-         ~sink:Tea_server.Guard_sink.null ~floors:Dguard.Floors.empty
+         ~sink:Tea_server.Guard_sink.null ~floors:Dguard.Floors.empty ()
      in
      let l7 = link () in
      let session7 = Server.live_session ~guard:guard_d s5 l7.transport in
@@ -356,7 +356,7 @@ let () =
      let* s6 = Server.Store.session repo (sid "sinkdown") in
      let guard_e =
        Dguard.v ~sessions:Guard.default_sessions ~tabs:Guard.default_tabs
-         ~sink:failing ~floors:Dguard.Floors.empty
+         ~sink:failing ~floors:Dguard.Floors.empty ()
      in
      let l8 = link () in
      let session8 = Server.live_session ~guard:guard_e s6 l8.transport in

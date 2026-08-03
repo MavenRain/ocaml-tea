@@ -18,7 +18,12 @@
       on both the restart miss and the LRU-eviction miss.
     - The failure direction: a failing append still raises the mirror
       ([persist]) and still scrubs the state ([forget]), so every degradation
-      falls toward duplicating, never losing. *)
+      falls toward duplicating, never losing.
+    - The mirror's own bound (roadmap step 15, R12 as amended by R15): it
+      evicts least-recently-touched, it evicts toward {i acceptance}, the
+      durable record outlives the eviction so the next boot heals, and no
+      interleaving of eviction, replay and append folds to a floor other than
+      the true max. The bound itself is derived from the table it fronts. *)
 
 module Dg = Tea_server.Durable_guard
 module Guard = Tea_server.Replay_guard
@@ -144,7 +149,15 @@ let failing_sink : Sink.t =
 (** A guard over the default bounds, for every test that is not about
     eviction. *)
 let guard ~(sink : Sink.t) ~(floors : Dg.Floors.t) : Dg.t =
-  Dg.v ~sessions:Guard.default_sessions ~tabs:Guard.default_tabs ~sink ~floors
+  Dg.v ~sessions:Guard.default_sessions ~tabs:Guard.default_tabs ~sink ~floors ()
+
+(** A guard whose mirror is deliberately small, for the ride-along's eviction
+    checks. [tabs_bound] is the {i Cell}'s, held at one throughout so that
+    every take below the top tab is a genuine Cell miss and the mirror is the
+    only layer that could answer; [mirror] is the new cap under test. *)
+let bounded_guard ~(tabs_bound : int) ~(mirror : int) ~(sink : Sink.t) : Dg.t =
+  Dg.v ~sessions:(bound 4) ~tabs:(bound tabs_bound) ~mirror:(bound mirror) ~sink
+    ~floors:Dg.Floors.empty ()
 
 (* --- 1. The floor algebra a journal folds into ----------------------------- *)
 
@@ -290,7 +303,7 @@ let () =
 let () =
   let r = replica "evictee" in
   let sink, (_ : unit -> Sink.event list) = Sink.memory () in
-  let g = Dg.v ~sessions:(bound 4) ~tabs:(bound 1) ~sink ~floors:Dg.Floors.empty in
+  let g = Dg.v ~sessions:(bound 4) ~tabs:(bound 1) ~sink ~floors:Dg.Floors.empty () in
   check "tab 1 lands its first seq and persists it"
     (is_fresh (Dg.take g ~replica:r ~tab:(tab 1) ~seq:(seq 1)) ~at:1
     && Result.is_ok (Lwt_main.run (Dg.persist g ~replica:r ~tab:(tab 1) ~seq:(seq 1) ~water:Water.bottom)));
@@ -369,3 +382,174 @@ let () =
     && Result.is_ok (Lwt_main.run (Dg.forget g ~replica:r)));
   check "the journal records Advance then Forget, and the tombstone is the last word"
     (List.equal String.equal (List.map event_tag (reader ())) [ "advance:1"; "forget" ])
+
+(* --- 9. The mirror is bounded, and it evicts toward acceptance -------------
+
+   Roadmap step 15 (R12 as amended by R15). Until now the mirror was the last
+   uncapped table in the stack, which the keyed RPC channel would have grown
+   at the rate a same-origin page can POST. The cap evicts the
+   least-recently-TOUCHED floor and REMOVES it, so what an over-full mirror
+   costs is a duplicate, never a loss; and the durable record outlives the
+   eviction, which makes this the one self-healing eviction in the stack. *)
+
+let () =
+  let r = replica "mirror-lru" in
+  let sink, reader = Sink.memory () in
+  let g = bounded_guard ~tabs_bound:1 ~mirror:3 ~sink in
+  let land_first (n : int) : bool =
+    is_fresh (Dg.take g ~replica:r ~tab:(tab n) ~seq:(seq 1)) ~at:1
+    && Result.is_ok
+         (Lwt_main.run
+            (Dg.persist g ~replica:r ~tab:(tab n) ~seq:(seq 1)
+               ~water:Water.bottom))
+  in
+  check "three tabs land their first seq and fill the mirror exactly"
+    (List.for_all land_first [ 1; 2; 3 ]
+    && Int.equal (Dg.Floors.cardinal (Dg.floors g)) 3);
+  (* This take is the recency event the next eviction turns on: a Cell miss
+     that the mirror answers is the mirror being told its key is live. *)
+  check "a Cell miss on tab 1 is answered by the mirror"
+    (is_duplicate (Dg.take g ~replica:r ~tab:(tab 1) ~seq:(seq 1)) ~high:1);
+  check "a fourth tab pushes the mirror past its bound, which holds"
+    (land_first 4 && Int.equal (Dg.Floors.cardinal (Dg.floors g)) 3);
+  check
+    "THE POINT: the victim is the least-recently-TOUCHED floor, so the tab \
+     just asked about survives and the untouched elder does not"
+    (Option.is_none (Dg.Floors.find ~replica:r ~tab:(tab 2) (Dg.floors g))
+    && floor_is (Dg.Floors.find ~replica:r ~tab:(tab 1) (Dg.floors g)) ~at:1);
+  check
+    "eviction falls toward acceptance: the evicted tab's consumed seq reads \
+     Fresh again (a visible duplicate), the survivor still reads Duplicate"
+    (is_fresh (Dg.take g ~replica:r ~tab:(tab 2) ~seq:(seq 1)) ~at:1
+    && is_duplicate (Dg.take g ~replica:r ~tab:(tab 1) ~seq:(seq 1)) ~high:1);
+  let reopened =
+    guard ~sink:Sink.null ~floors:(Dg.Floors.of_events (reader ()))
+  in
+  check
+    "self-healing: the journal outlived the eviction, so a reopened mirror \
+     answers Duplicate for the evicted tab again"
+    (is_duplicate (Dg.take reopened ~replica:r ~tab:(tab 2) ~seq:(seq 1))
+       ~high:1)
+
+(* --- 10. Eviction, replay and reopen cohere to the true floor --------------
+
+   The monotone-convergence pin: no interleaving of eviction, replay and
+   append folds to a floor above what was consumed, and none folds to one
+   below it either. An evicted key re-accepts an old seq in process — the
+   documented duplicate — and appends a LOWER record for it; the next boot
+   folds the max over the whole journal, so the true floor comes back rather
+   than the last record written. *)
+
+let () =
+  let r = replica "converge" in
+  let t = tab 1 in
+  let sink, reader = Sink.memory () in
+  let g = bounded_guard ~tabs_bound:1 ~mirror:1 ~sink in
+  let consume (n : int) : bool =
+    is_fresh (Dg.take g ~replica:r ~tab:t ~seq:(seq n)) ~at:n
+    && Result.is_ok
+         (Lwt_main.run
+            (Dg.persist g ~replica:r ~tab:t ~seq:(seq n) ~water:Water.bottom))
+  in
+  check "the tab consumes and journals seqs 1..3" (List.for_all consume [ 1; 2; 3 ]);
+  check "a second tab floods the one-entry mirror and evicts the first"
+    (is_fresh (Dg.take g ~replica:r ~tab:(tab 2) ~seq:(seq 1)) ~at:1
+    && Result.is_ok
+         (Lwt_main.run
+            (Dg.persist g ~replica:r ~tab:(tab 2) ~seq:(seq 1)
+               ~water:Water.bottom))
+    && Option.is_none (Dg.Floors.find ~replica:r ~tab:t (Dg.floors g)));
+  check
+    "the evicted tab re-accepts its oldest seq in process: at-least-once, on \
+     purpose, and it journals a record BELOW the true floor"
+    (is_fresh (Dg.take g ~replica:r ~tab:t ~seq:(seq 1)) ~at:1
+    && Result.is_ok
+         (Lwt_main.run
+            (Dg.persist g ~replica:r ~tab:t ~seq:(seq 1) ~water:Water.bottom)));
+  let reopened =
+    guard ~sink:Sink.null ~floors:(Dg.Floors.of_events (reader ()))
+  in
+  check
+    "THE POINT: the reopened fold is the true max, not the last record \
+     written, so dedup resumes where it left off"
+    (floor_is (Dg.Floors.find ~replica:r ~tab:t (Dg.floors reopened)) ~at:3
+    && is_duplicate (Dg.take reopened ~replica:r ~tab:t ~seq:(seq 1)) ~high:3)
+
+(* --- 11. The mirror bound is derived, never a constant ---------------------
+
+   D20.4. Two obligations ride on the default, and both are arithmetic a check
+   can read back: out-remember the Cell it seeds (the factor of four, so the
+   two tables do not evict in lockstep and the mirror buys nothing), and hold
+   every floor the journal can replay at boot (the journal-cap floor, so the
+   boot fold cannot overflow it). The composition half of the rule — that the
+   pack tier's wiring actually satisfies it — is pinned where those journals
+   are opened. *)
+
+let () =
+  let mirror_of ?(journal_cap : int option) ~(sessions : int) ~(tabs : int) () :
+      int =
+    Guard.Bound.to_int
+      (Dg.default_mirror ~sessions:(bound sessions) ~tabs:(bound tabs)
+         ?journal_cap ())
+  in
+  check "the default is four times the Cell it seeds"
+    (Int.equal (mirror_of ~sessions:4 ~tabs:8 ()) 128);
+  check "a journal cap above that product raises the bound"
+    (Int.equal (mirror_of ~sessions:1 ~tabs:4096 ~journal_cap:65536 ()) 65536);
+  check "a journal cap below it changes nothing"
+    (Int.equal (mirror_of ~sessions:4 ~tabs:8 ~journal_cap:10 ()) 128);
+  check
+    "the RPC channel's own composition satisfies both obligations at once"
+    (Int.equal (mirror_of ~sessions:1 ~tabs:4096 ~journal_cap:16384 ()) 16384);
+  check "an unspecified mirror composes the derived default"
+    (Int.equal
+       (Guard.Bound.to_int (Dg.mirror_bound (guard ~sink:Sink.null ~floors:Dg.Floors.empty)))
+       (Guard.Bound.to_int
+          (Dg.default_mirror ~sessions:Guard.default_sessions
+             ~tabs:Guard.default_tabs ())));
+  check "an explicit mirror is the one reported back"
+    (Int.equal
+       (Guard.Bound.to_int
+          (Dg.mirror_bound (bounded_guard ~tabs_bound:1 ~mirror:7 ~sink:Sink.null)))
+       7)
+
+(* --- 12. release: a rejected apply un-takes its own seq, and only its own --
+
+   R27, the step-15 review's F2. The barrier in the keyed dispatch calls this
+   when an apply REJECTS before [persist]: the retry must read [Fresh] again,
+   because a consumed seq with no effect and no floor drains through the reply
+   cache into a 200 [Replayed] for an effect that never happened - the
+   silent-loss direction. Conditional by construction: it restores only while
+   the high water is still exactly the released seq, so a later take (a
+   non-conforming pipeliner's) is never un-taken by an elder's failure, and a
+   persisted floor beneath the release stays consumed. *)
+
+let () =
+  let r = replica "release" in
+  let g = guard ~sink:Sink.null ~floors:Dg.Floors.empty in
+  check "the first seq on a tab reads Fresh"
+    (is_fresh (Dg.take g ~replica:r ~tab:(tab 1) ~seq:(seq 1)) ~at:1);
+  Dg.release g ~replica:r ~tab:(tab 1) ~seq:(seq 1);
+  check "a released first-seq take reads Fresh again, not Duplicate"
+    (is_fresh (Dg.take g ~replica:r ~tab:(tab 1) ~seq:(seq 1)) ~at:1);
+  let (_ : (unit, Sink.err) result) =
+    Lwt_main.run
+      (Dg.persist g ~replica:r ~tab:(tab 1) ~seq:(seq 1) ~water:Water.bottom)
+  in
+  check "the next seq reads Fresh"
+    (is_fresh (Dg.take g ~replica:r ~tab:(tab 1) ~seq:(seq 2)) ~at:2);
+  Dg.release g ~replica:r ~tab:(tab 1) ~seq:(seq 2);
+  check "the released seq reads Fresh again"
+    (is_fresh (Dg.take g ~replica:r ~tab:(tab 1) ~seq:(seq 2)) ~at:2);
+  check "and the seq beneath the release is still consumed"
+    (is_duplicate (Dg.take g ~replica:r ~tab:(tab 1) ~seq:(seq 1)) ~high:2);
+  check "a pipelined later seq reads Fresh"
+    (is_fresh (Dg.take g ~replica:r ~tab:(tab 1) ~seq:(seq 3)) ~at:3);
+  Dg.release g ~replica:r ~tab:(tab 1) ~seq:(seq 2);
+  check "an elder's release under a later take is a no-op: the later stays consumed"
+    (is_duplicate (Dg.take g ~replica:r ~tab:(tab 1) ~seq:(seq 3)) ~high:3);
+  check "and the stream continues where the later take left it"
+    (is_fresh (Dg.take g ~replica:r ~tab:(tab 1) ~seq:(seq 4)) ~at:4);
+  Dg.release g ~replica:r ~tab:(tab 2) ~seq:(seq 5);
+  check "release on an absent tab is a no-op and the tab still accepts any seq"
+    (is_fresh (Dg.take g ~replica:r ~tab:(tab 2) ~seq:(seq 5)) ~at:5)

@@ -48,6 +48,8 @@ toolchain removes an entire tier lean-tea had to hand-write.
 | `test/guard_water_test` (W1-W6 real waters on a pack store incl. a real dir-copy snapshot/restore, G1-G8 hand-built floors) + C1-C3 in `guard_sink_test` + browser B8 three-lives rollback scenario | **passes** (confirmed by mutation) |
 | `Store_core.based`/`load_based`/`based_model`/`committed`/`commit_based` + `commit_coalesced` and `append_commit` re-pinned to the witness + `step_with ?interpose` taking the token - the TEA step is a compare-and-set whose denial reconciles through the app's own `Merge_spec.t` instead of refusing or re-running, and `shared_doc_serve`'s `Lwt_mutex` is retired | **built, green** (roadmap step 14, D19) |
 | `test/contention_test` C1-C15, S1-S2 over four local apps (`Or_set`, a merging `Three_way`, a refusing `Three_way`, `Last_write_wins`) - the program-order interleave, distinct dots, parentage, the winning round's water, round count, the true ancestor across two rounds, both non-CRDT arms, a reap under the witness, pack close/reopen for both write arms, the coalesced append and the interrupted amend, undo as an R10b characterization, and the server seam through `?interpose` | **passes** (confirmed by mutation, except C11/C12 which are pins: see roadmap 14) |
+| `Cmd.Http_delivery` + `Cmd.http_keyed` + `Tea_rpc.Key`/`keyed_resp`/`Applied_reply_lost` + `Tea_server.Reply_cache`/`Rpc_once`/`routes_once ?on_taken` + `Tea_client.Rpc_delivery` + a second `Guard_file` journal at `<root>.guard/rpc` behind `Tea_server_pack.open_guards` + `Durable_guard ?mirror` - the RPC tier routed through the D15-D18 guard family as a second channel (server-derived floor tabs, a bounded newest-reply cache, the `Mutating` 200 enveloped), with the floors mirror bounded as the ride-along | **built, green** (roadmap step 15, D20) |
+| `test/rpc_once_test` (incl. T1's ordering arm: the keyed 200 waits for the floor's append), `test/rpc_pack_once_test` (the native B10: two lives over one pack root), `test/rpc_window_test` (the `?on_taken` two-writer checks), `test/reply_cache_test`, `test/rpc_delivery_test`, `test/rpc_journal_test`, `test/pack_guards_test` + browser B9/B10 lost-response scenarios | **passes** (confirmed by mutation: 19 ids, full dual-suite sweep) |
 
 Toolchain: OCaml 5.3.0, dune 3.24, a dedicated opam switch (`irmin-tea` locally) with
 `irmin 3.11`, `dream 1.0.0~alpha8`, `repr 0.8`, `vdom 0.3`, `js_of_ocaml 6.4`.
@@ -490,9 +492,11 @@ nothing is lost.
 > **Left open, deliberately:** the client's unacknowledged queue is unbounded,
 > exactly as the outbox was - and that is what lets the server refuse a gap
 > outright, since an honest client never skips a seq because it never discards
-> one. The RPC tier is not covered: `/rpc/*` is a non-idempotent POST with the
+> one. The RPC tier was not covered: `/rpc/*` is a non-idempotent POST with the
 > same problem and a different retry origin (the browser's, not this
-> framework's). A frame whose *envelope* cannot be decoded has no seq to consume
+> framework's) - **closed in step 15 (D20 below)**, which routes `/rpc/*`
+> through this same guard family as a second channel rather than building a
+> sibling stack. A frame whose *envelope* cannot be decoded has no seq to consume
 > and still closes the session, which needs the two tiers' `up_t` witnesses to
 > disagree - a deploy skew, the state T3 calls disallowed.
 >
@@ -780,6 +784,142 @@ nothing is lost.
 > a head after the fact: a head read after a successful commit can belong to a
 > later writer, and a floor stamped with it is a forged witness.
 
+> **D20 - rpc-exactly-once: the RPC tier as a second channel through the
+> D15-D18 guard family (roadmap step 15).** The WS tier already owned a
+> complete exactly-once stack: a dense per-tab seq space (D15), a synchronous
+> consume-before-apply verdict, a durable floor journal with a boot-time
+> store witness (D16, D18), and one law for every degradation - toward the
+> visible duplicate, never silent loss. Step 15 does not build an RPC sibling
+> of that stack; it routes the RPC tier *through* it: one verdict type, one
+> boot filter, one `Floors` shape, one sink type, and the pump discipline
+> transcribed onto the RPC dispatch path (origin gate first, then the key
+> parse, then the verdict, then the witnessed step, then the floor's persist,
+> and only then the 200). The load-bearing insight: **an RPC floor is keyed
+> by the branch the effect lands on, not by the client that asked for it.**
+> The key is `(floor_replica, floor_tab)` with `floor_replica` the canonical
+> replica minted by the same path `branch_waters` and `ctx_of_session` share,
+> so the D18 boot filter works unchanged - `branch_waters` already lists
+> `main`, the floor's water is the canonical commit's own mint, and `covers`
+> asks its question about one branch. WS floors are keyed by session replicas
+> whose branch names are `"session-" ^ hex` by construction, so the two
+> channels' key spaces are disjoint by grammar even before the two-journal
+> separation makes the partition structural.
+>
+> Four sub-decisions carry the design:
+>
+> - **D20.1 - the floor tab is server-derived, never client-asserted.** The
+>   wire key stays `x-tea-key: <client tab hex> ":" <seq>`, but the guard,
+>   the reply cache, the journal record and the boot filter are keyed on
+>   `floor_tab`, the digest of
+>   `"tea-rpc-floor\000" ^ hex(session_id) ^ "\000" ^ client_tab` - the
+>   session id enters HEX-ENCODED, so both halves are hex and neither can
+>   contain the NUL separator: no two distinct (session, tab) pairs slide
+>   into one digest input. The output is exactly 32 lowercase hex
+>   characters, exactly `Tab_id`'s grammar, so the parse is total in fact. A forger who knows a victim's client tab but not its
+>   cookie lands in its own namespace (T13). The unkeyed-`Digest` honesty
+>   is R23 (§10).
+> - **D20.2 - the concurrent-duplicate window is a Pending marker plus a
+>   framework 503, never a promise join and never a spurious `Replayed`.**
+>   The `Reply_cache` slot is a sum. The Fresh arm marks Pending
+>   synchronously in the continuation that received the verdict - no yield,
+>   the D15 consume-before-apply law untouched - and settles it with the
+>   reply bytes after the persist attempt. A duplicate finding Pending is
+>   answered 503, consumed by the client runtime's existing 5xx retry arm
+>   and never surfaced to `expect`; the retry then reads Settled and gets
+>   the original bytes. `pending_grace` is a per-window POLL BUDGET, not an
+>   age: only the window's own tab's Busy answers spend it, so foreign
+>   traffic can never age a live window into a spurious `Replayed`, while a
+>   wedged apply's own polling still drains the window to `Gone` rather
+>   than holding its client hostage. `settle` compares seqs and discards a
+>   stale settle whole, so newest-wins is enforced rather than assumed. And
+>   a rejecting apply is caught by a barrier around the keyed handler: the
+>   failure arm releases the take (`Durable_guard.release`, conditional on
+>   the high water still being exactly the taken seq), leaves the Pending
+>   marker standing for racing duplicates, and answers 500 for the client's
+>   5xx retry arm to re-send - toward the visible duplicate, never silent
+>   loss (R27).
+> - **D20.3 - two journals, no `Floors.split`.** The RPC channel opens its
+>   own `Guard_file` at `<root>.guard/rpc`: caps and compaction are per
+>   channel, and each boot filter runs per journal against one shared
+>   `branch_waters` read. `Tea_server_pack.open_guards` is the exported
+>   seam - a `guards` record over both channels' guards and journals - and
+>   the ws journal opens first because `Guard_file` creates its own
+>   directory, not its parent: `<root>.guard/rpc` is only creatable after
+>   `<root>.guard` exists.
+> - **D20.4 - bounds are derived from the tables they front, not written as
+>   constants.** `Durable_guard.v ?mirror` bounds the floors mirror (the
+>   R12 ride-along), defaulting to `default_mirror = max (4 * sessions *
+>   tabs) journal_cap`; `Reply_cache.v` takes `~entries ~max_bytes
+>   ~body_cap ~pending_grace` with stated defaults and a byte budget.
+>   Mirror eviction is LRU over a monotone recency tick and REMOVES a
+>   floor, never lowers one - absence is the accept side - and it is the
+>   stack's only self-healing eviction: the journal record survives its own
+>   cap, so the evicted floor returns at the next boot. Within one process
+>   lifetime, dedup for an evicted key is suspended until restart; across
+>   restarts it resumes if the journal record survived. (T11, T16, T17;
+>   §10 R12 closes on this.)
+>
+> **The guarantee, in the D16 three-case voice.** For a `Mutating` RPC that
+> carries a delivery key, whose retries present the same session cookie, and
+> whose encoded reply fits `body_cap`, on the pack tier with the RPC journal
+> open and durable session identity (D17):
+>
+> - **Exactly-once effect across browser retries and an orderly restart**
+>   (SIGINT/SIGTERM: store closed, then journal): the endpoint's effect is
+>   applied exactly once however many times the key is delivered, and the
+>   reply is answered byte-identically to every retry while the process that
+>   computed it lives, degrading to the typed `Replayed` marker across a
+>   restart or a reply-cache eviction. Never a silently re-applied effect;
+>   never recomputed at replay time: the bytes answered to a retry are the
+>   bytes computed by the one delivery that was taken.
+> - **At-least-once - a visible convergent double apply - when the floor is
+>   lost:** a torn RPC-journal tail, an RPC-journal cap eviction, a
+>   mirror-bound eviction, or a failed append. Each loses only a floor, and
+>   an absent floor accepts anything.
+> - **`kill -9` out of scope on the loss side, exactly as D16/D18 state
+>   it:** the journal reaches the page cache per record while irmin-pack
+>   buffers commits in user space, so a floor can outlive the
+>   canonical-branch commit it witnesses; at the next boot the filter drops
+>   every witnessed such floor and the retry re-applies as a visible
+>   duplicate. What remains exposed is bottom-water floors (fuel-exhausted
+>   or no-op takes) and divergence after the boot snapshot, bounded by the
+>   pack's auto-flush lag.
+>
+> The preconditions are part of the sentence, not footnotes: the key must be
+> present, the cookie stable across retries, and the reply within the cap,
+> for the first case to hold. A keyless request keeps today's semantics -
+> at-most-once effect per HTTP exchange, retry safety the caller's problem -
+> and a cookieless caller (curl, server-to-server) is keyless in effect,
+> since its Dream session, hence its floor namespace, is fresh per request:
+> the accept direction. On the mem tier the whole sentence collapses to
+> D16's honest first case, and with `Session_secret.memory` the namespace
+> derivation is not restart-stable, consistent with that tier claiming
+> nothing across restarts.
+>
+> **The 200 is strictly ordered after the floor's append**, exactly as the
+> pump's ack is: T1's ordering arm holds the sink's append open behind a
+> gated promise and pins that the keyed 200 is still unresolved while the
+> append is held, resolves once released, and followed exactly one append.
+> An acknowledgement that outruns its floor is the inversion the whole
+> D15-D18 family exists to forbid, on the second channel as on the first.
+>
+> The step-14 example-tier residual - no two-writer check against the real
+> `Mutating` handler, no interpose seam - closes here: `routes_once
+> ?on_taken` is the interpose-class hook (one-shot, re-pointed to a no-op
+> before it runs), and T7/T14 land a concurrent duplicate inside the
+> take-to-settle window against the real handler, while T2b pins reply
+> honesty under D19 reconciliation and browser B9 retries a genuinely lost
+> 200 through a response-eating route.
+>
+> **The reply-cache seam, conditionally:** the consumed marker (the floor)
+> and the reply bytes live in two stores with two lifetimes - the journal
+> survives restart, the cache does not, which is why `Replayed` exists at
+> all. IF a durable reply tier is ever added, the consumed marker and the
+> reply bytes must land as one record, with their own store-water witness
+> and boot filter (R20 recursed). Recorded as a conditional obligation of
+> that future step, never as a binding invariant of the current split
+> architecture.
+
 ## 8. Shared RPC contract - built (roadmap step 7; hardened step 8, D11/D12)
 
 lean-tea kept its tiers aligned by convention: route strings and encode/decode
@@ -802,10 +942,26 @@ name exists anywhere), and the literal wire paths are pinned by test.
 
 **Wire format.** Raw Repr-JSON request body POSTed to `/rpc/<name>`
 (`Content-Type: application/json`), raw Repr-JSON response on 200, no
-envelope. The HTTP status is exclusively the transport-error channel (404
-route-miss, 415 content-type gate, 413 size cap at 64 KiB post-read, 400
-decode refusal); app-level fallibility is declared as `'resp = ('ok,'err)
-result` inside the GADT and rides the 200 channel through `resp_t`.
+envelope - for requests and `Read_only` responses. Since step 15 (D20) a
+`Mutating` response is *always* the two-arm `keyed_resp` Repr variant
+(`Reply of 'resp | Replayed`), keyed or not: static-by-kind rather than
+dynamic-by-key, because `expect` is fixed at `call` time and cannot see
+headers, so a header-dependent response shape would be undecodable by
+construction. That is a breaking change to the public 200-channel contract
+for ALL callers, permanently and intentionally - curl and server-to-server
+consumers now decode `keyed_resp`, not bare `'resp`, a named non-browser
+break and not merely a stale-browser skew window - paid once, at the
+compile-driven boundary both tiers link. The HTTP status is exclusively the
+transport-error channel (404 route-miss, 415 content-type gate, 413 size cap
+at 64 KiB post-read, 400 decode refusal; step 15 adds two 400 reasons - a
+malformed delivery key, a delivery gap - and one framework 503 for the
+Pending window, each adjudicated transport, not app outcome, so the law
+stands); app-level fallibility is declared as `'resp = ('ok,'err)
+result` inside the GADT and rides the 200 channel through `resp_t`. D20's
+"never recomputed at replay time" clause makes that declaration
+load-bearing: a fuel-exhausted reply is a state-shaped value computed once
+at take time, so the applied-versus-attempted distinction belongs in a
+result-shaped `'resp` - the fallible-endpoint residual, still open (§7 D20).
 
 **Plumbing.** `Tea_core.Cmd` gained the documented `Http` constructor
 (`{path : Prim.Rpc_path.t; body; expect : (string, http_failure) result ->
@@ -864,6 +1020,28 @@ discipline): `test/rpc_stream_test` drives it with a *counting* source and
 asserts on bytes **pulled**, because a status code cannot distinguish "refused"
 from "refused without reading it all" - the post-read cap this replaced passes
 every status check.
+
+**Delivery keys (D20, step 15).** A `Mutating` request may carry
+`x-tea-key: <32 lowercase hex tab> ":" <positive decimal seq>`
+(`Tea_rpc.Key`; the header literal is pinned by T20; the seq parse accepts
+exactly the canonical print of the value it returns, so aliased spellings
+of one position - `"007"`, `"+7"`, `" 7"` - are closed by construction). Absent, the request
+keeps today's semantics: at-most-once effect per HTTP exchange, no dedup,
+the legacy/curl arm. Present but malformed, it is a 400 with nothing
+consumed (T9). Present and well-formed, the call is de-duplicated through
+the same guard family as the WS tier - the machinery, the floor-tab
+derivation and the guarantee sentence are §7 D20. The session cookie is
+thereby a *semantic input* to a keyed call: the dedup namespace derives
+from it, which is what makes a forged key land in the forger's own
+namespace (D20.1) - and what the native tests must thread `Set-Cookie` for
+explicitly. Legacy story, in two facts: the journal codec is untouched -
+RPC floors are ordinary tag-`'\003'` `Advance` records, a step-14 root
+opens under step 15 with the RPC journal simply absent (created on the
+first keyed take), a step-15 root opens under a step-14 binary that never
+looks at `.guard/rpc`, and nothing migrates (T10 pins both directions); and
+a cached pre-15 client bundle decoding a `Mutating` response fails as a
+loud typed `Decode` error, not a silent misread, because both tiers link
+one `Api` definition (T15).
 
 (Server-read-only is distinct from what a *client* does with the reply: the
 `shared_doc` example folds its `Doc_stats` reply into a `model_t` field, so
@@ -1064,13 +1242,24 @@ Each lean-tea private-constructor primitive → an OCaml `.mli` boundary:
   loss stays bounded by the
   pack's auto-flush lag. Every other durable-layer failure (torn tail, cap
   eviction, failed append) falls on the duplicate side.
-- **R12 (low) - `Durable_guard`'s in-process floor mirror is unbounded.** The
-  `Replay_guard.Cell` in front of it is bounded precisely because an attacker
-  mints session cookies freely, and `Guard_file`'s cap bounds the journal's
-  copy of the floors; the mirror between them has neither defense, so a
-  hostile cookie-minting client grows it without limit. Known gap, recorded in
-  D16's residuals (§7); a bound here needs the same eviction-direction
-  argument the Cell already carries.
+- **R12 (low) - `Durable_guard`'s in-process floor mirror is unbounded.
+  CLOSED in step 15 (D20.4, the ride-along).** The `Replay_guard.Cell` in
+  front of it is bounded precisely because an attacker mints session cookies
+  freely, and `Guard_file`'s cap bounds the journal's copy of the floors; the
+  mirror between them had neither defense, so a hostile cookie-minting client
+  grew it without limit. `Durable_guard.v ?mirror` now caps it with LRU
+  eviction over a monotone recency tick (touched on persist and on a
+  Cell-miss seed hit, deliberately not on a Cell hit), and the default is a
+  documented function of the bounds in force - `max (4 * sessions * tabs)
+  journal_cap` - never a constant that can drift from the tables it fronts.
+  Eviction carries the same direction argument the Cell already carries: it
+  REMOVES a floor, never lowers one, so absence lands on the
+  accept/duplicate side; and it is the stack's only self-healing eviction,
+  because the journal record survives its own cap and the evicted floor
+  returns at the next boot. Pinned by T11 (LRU order, recency, the boot
+  heal), T16 (eviction, replay and reopen cohere to the true floor) and T17
+  (the composed mirror satisfies the wiring rule, and `default_mirror`
+  computes the stated formula).
 - **R13 (med) - a durable session cookie is an unrevocable bearer credential
   with a sliding lifetime.** Step 12 replaces `Dream.memory_sessions` with
   `cookie_sessions` + `set_secret` on the pack tier, which removes an ACCIDENTAL
@@ -1096,8 +1285,15 @@ Each lean-tea private-constructor primitive → an OCaml `.mli` boundary:
   capability), and can mint CSRF tokens under the same key. It needs no search:
   branch names under `$TEA_ROOT` are literally `session-<hex>` and the
   world-readable `$TEA_ROOT.guard/journal` records the replica string in every
-  `Advance`/`Forget`, so a local read enumerates every live id. The session id's
-  144 bits defend against guessing only. Consequences, all implemented: the
+  `Advance`/`Forget`, so a local read enumerates every live id. Step 15's
+  ledger correction: the RPC journal additionally records `(main, floor_tab)`
+  entries, and the floor tab is a DERIVATION - a session-salted digest of the
+  client tab (D20.1) - not a client input, so the id disclosure this entry
+  documents confers no floor authority: forging a victim's floor key needs
+  the victim's cookie, the WS tier's own precondition. (That sentence
+  replaces the design draft's refuted "leaks no new authority" audit claim
+  with the reason it is now true; R23 records the unkeyed-`Digest` honesty
+  beside it.) The session id's 144 bits defend against guessing only. Consequences, all implemented: the
   secret file is `0600`, created `O_EXCL`, refused if it is not a regular file,
   if any group or other permission bit is set, or if it exceeds 4096 bytes, and
   it is NEVER rewritten on a validation failure (an unreadable secret may be a
@@ -1127,6 +1323,11 @@ Each lean-tea private-constructor primitive → an OCaml `.mli` boundary:
   removes an unbounded table this register never named on the pack tier:
   `memory_sessions` retains a hashtable entry per minted session and sweeps it
   only on explicit invalidation or on presenting an already-expired id.
+  Amended by step 15 (D20.3): the RPC journal's own drop-oldest cap pushes
+  RPC clients to the duplicate side across a restart, the same direction, on
+  its own file - `<root>.guard/rpc` - rather than the shared WS journal. The
+  in-process-mirror clause this entry amended is closed with R12; the
+  journal-cap direction is what R15 keeps naming.
 - **R16 (low today, high on first use) - the cookie session payload is
   rollback-able.** `cookie_sessions` stores the whole session client-side; AEAD
   proves the server issued SOME version, never that it issued the LATEST, and
@@ -1209,6 +1410,48 @@ Each lean-tea private-constructor primitive → an OCaml `.mli` boundary:
   fix rather than shipped. Until then the exposure also includes the first
   boot after a step-12 upgrade, whose floors decode at `bottom` and are
   adopted on trust (counted `unwitnessed`, one warning line).
+- **R21 (low) - delivery dedup is not intent dedup.** Repeated user intents
+  (a double-click) are distinct calls, distinct seqs, and apply twice,
+  visibly. App-level intent coalescing is out of scope because it would
+  reintroduce the app-visible key surface D20 closed, or fight the dense
+  one-in-flight numbering.
+- **R22 (low) - no framework path back to a reply lost to restart or
+  eviction.** On `Applied_reply_lost` the app re-reads through a `Read_only`
+  sibling of its own choosing, and that read races later writers, so it is
+  not "the reply your call earned". An opt-in declared read-only sibling is
+  a coherent future step, not designed here.
+- **R23 (low) - the floor-tab derivation uses an unkeyed stdlib `Digest`
+  (MD5; the `session_secret` staging precedent).** Only preimage and
+  second-preimage resistance are relied on, and the attacker cannot choose
+  the session half of the input, so collision weakness does not apply;
+  upgrade to a secret-keyed derivation if the session secret is ever plumbed
+  to the RPC route. R14's step-15 ledger correction points here.
+- **R24 (low, latent) - `Cmd.http_keyed` is public**, so an app can enable
+  the runtime's automatic retry against a POST path with no server-side
+  guard, turning at-most-once into at-least-once against an unguarded
+  endpoint. The doc comment carries the precondition; revisit if apps use
+  it.
+- **R25 (low, latent) - the new `Cmd.Http` `delivery` field is a breaking
+  change** for any future third-party interpreter contract; this step is
+  where that debt was taken knowingly.
+- **R26 (low) - multi-canonical-branch RPC apps need a `floor_replica` per
+  route group.** The journal, the boot filter and `Floors` already handle
+  arbitrary replicas, so the extension is wiring, not redesign.
+- **R27 (CLOSED in step 15) - a keyed handler that REJECTS after its take.**
+  Found by the step's adversarial review pass: the Fresh arm consumed the
+  seq before the apply, so a handler rejection left the take standing and
+  every retry read Duplicate against a reply that was never settled - a
+  wedged key, silent loss. Closed in the same change by the
+  barrier-plus-release pair: `Lwt.try_bind` around the keyed apply, and a
+  `release` un-take (`Replay_guard.release` through
+  `Durable_guard.release`, Cell-only because the failure arrives strictly
+  before the persist) conditional on the high water still being exactly
+  the taken seq. The Pending marker is left standing - dropping it would
+  hand a racing duplicate `Gone`, the exact spurious-`Replayed` lie D20.2
+  forbids - and the response is 500 for the client's 5xx retry arm. A
+  half-applied handler that rejects re-applies on the retry: the visible
+  convergent duplicate, the family's licensed degradation direction,
+  never the silent drop (T21).
 
 ## 11. Roadmap
 
@@ -1324,7 +1567,8 @@ Each lean-tea private-constructor primitive → an OCaml `.mli` boundary:
     server process lifetime and within the guard's bounds; at-least-once
     outside them*, and every bound degrades toward duplicating rather than
     losing (§7). The client's unacknowledged queue stays unbounded, which is
-    what makes refusing a gap free. The RPC tier is not covered. The D14
+    what makes refusing a gap free. The RPC tier is not covered (**closed in
+    step 15, D20**). The D14
     pre-announcement window is unchanged, and now pinned in two files.
     The process-lifetime bound itself is what step 11 (D16) narrows.
 
@@ -1470,11 +1714,14 @@ Each lean-tea private-constructor primitive → an OCaml `.mli` boundary:
     `undo`/`redo`/`fork` head moves, the non-CRDT arms keeping content only for
     the already-acked writer, the pre-existing cancellation loss, and
     per-socket liveness plus the unreferenced commits a lost round leaves in a
-    repo with no GC wired; the example tier is NOT driven by a two-writer
-    check, because the `Mutating` RPC handler exposes no interpose seam and,
+    repo with no GC wired; the example tier was NOT driven by a two-writer
+    check, because the `Mutating` RPC handler exposed no interpose seam and,
     under `Irmin_mem` with `Cmd.none`, two RPC calls simply serialize, so what
-    replaced the retired mutex is a type-level guarantee at the seam and not a
-    check at the example; and C11/C12, the pack close/reopen round trips that
+    replaced the retired mutex was a type-level guarantee at the seam and not
+    a check at the example (**closed in step 15**: `routes_once ?on_taken` is
+    that seam, and T7/T14 land a concurrent duplicate against the real
+    handler while browser B9 retries through it); and C11/C12, the pack
+    close/reopen round trips that
     were this step's U1 decision point, are **pins rather than
     mutation-confirmed** - both went green, so the `S.Commit.v` door is sound
     on pack and Irmin's contents-level `S.test_and_set` fallback stays
@@ -1485,3 +1732,75 @@ Each lean-tea private-constructor primitive → an OCaml `.mli` boundary:
     live head read instead of the witness falls into an append that reconciles
     to an identical landed state, so catching it would need a check on the
     orphaned amend commit or on the clock tick it burns.
+
+15. **rpc-exactly-once (+ the mirror bound)** - route the RPC tier through
+    the D15-D18 guard family as a second channel, and bound the floors
+    mirror as the ride-along (R12/R15, D20). **Done** (`Cmd.Http_delivery` +
+    the `delivery` field on `Cmd.Http` + `Cmd.http_keyed`, threaded
+    wildcard-free through both interpreters; `Tea_rpc.Key` - `x-tea-key`,
+    `<32 hex> ":" <decimal>`, a total `of_string` over `split_on_char`
+    whose seq arm accepts exactly the canonical print -
+    plus `keyed_resp = Reply of 'resp | Replayed` with its Repr codec and
+    `Applied_reply_lost`, `call` keying `Mutating` endpoints and unwrapping
+    the envelope while `Read_only` stays raw; `Tea_server.Reply_cache`, the
+    newest reply per floor tab - `Busy`/`Original`/`Gone`, four bounds
+    (`entries`, `max_bytes`, `body_cap`, and `pending_grace`, the
+    per-window poll budget of D20.2), a pure core whose
+    `find` returns `t * found` because a pure value cannot record its own
+    recency touch, under an imperative `Cell` with the plain arity;
+    `Rpc_once` - guard, replies, `floor_replica`, kept outside the
+    `Handlers` functor because none of its fields mentions `Api`, re-spelt
+    `Rpc.once` where an app writes it - and `routes_once ?on_taken`, the
+    keyed dispatch: origin gate, key parse, the server-derived floor tab
+    (D20.1), then the pump discipline transcribed - a gap is 400, a
+    duplicate reads the cache (503 while Pending, the original bytes once
+    Settled, `Replayed` when Gone), and Fresh marks Pending synchronously,
+    applies through the witnessed step, persists the floor at the canonical
+    commit's own water, settles, and only then answers 200;
+    `Tea_client.Rpc_delivery` and the runtime's keyed XHR arm - one live
+    request per head seq, the 5xx/network retry with backoff, `rotate` on a
+    4xx refusal; `Tea_server_pack.open_guards` and the second `Guard_file`
+    journal at `<root>.guard/rpc` (one `branch_waters` read feeding both
+    boot filters; the ws journal opens first, because `Guard_file` creates
+    its own directory and not its parent); `Durable_guard ?mirror` +
+    `default_mirror` + `mirror_bound`; `serve`/`serve_pack` re-signed to
+    take `?rpc_once:(Store.t -> Rpc_once.t -> Dream.route list)` - a
+    builder over the store, because an app's keyed handler is a function of
+    the store and those entry points open it themselves; `shared_doc` grown
+    a real `Publish_tag` mutation with a `publish_line` verdict readout and
+    a durable tier (`Make_rpc` functorized over the store, `main.ml`'s
+    `TEA_ROOT` arm - retiring its own "a durable shared_doc would need the
+    pack tier first" deferral); seven new test files carrying T1-T21:
+    `rpc_once_test` with T1's ordering arm (the keyed 200 still unresolved
+    while the floor's append is held open behind a gated sink - the check
+    the whole pre-existing suite could not red), `rpc_pack_once_test` (T5,
+    T6 and the native B10: two lives over one pack root sharing
+    `<root>.secret`, so life two decrypts life one's cookie),
+    `rpc_window_test` (T2b/T7/T14 through `?on_taken`, applying
+    `Dream.handler` directly because a nested `Lwt_main.run` dies under
+    `Dream.test`, plus T21's rejecting-handler arm: an armed failure
+    answers 500, commits nothing, and the retry lands the effect exactly
+    once - R27), `reply_cache_test`, `rpc_delivery_test`,
+    `rpc_journal_test`, `pack_guards_test`; browser B9 and B10 over a
+    genuinely lost 200 (Playwright `route.fetch()` then `route.abort()`, no
+    proxy process), B9 discriminating on commit COUNT because the tag set
+    is an `Or_set` and duplicate suppression is unobservable in it; 25
+    mutation ids in the dual-suite driver, every one confirmed RED against
+    green baselines of 986 native checks across 42 executables and 89
+    browser checks).
+
+    Left open, deliberately: R21-R26 and the R15 amendment (§10); the
+    client `Rpc_delivery` queue is unbounded, exactly as `Delivery` is and
+    for the same reason - a dropped entry is the silent loss this step
+    exists to remove, and `pending` is the honesty valve; one-in-flight
+    serializes a page's `Mutating` calls (per tab, mutating-only), and a
+    duplicate during a long Fresh window waits through the client's
+    backoff, bounded by the `pending_grace` poll budget draining to
+    `Replayed`; the
+    single-branch contract leans on prose plus T5 where the WS tier leans
+    on construction; the fallible-endpoint residual of §8 stays open - a
+    fuel-exhausted reply is a state-shaped value computed once at take
+    time, and the applied-versus-attempted distinction belongs in a
+    `('ok, 'err) result`-shaped `'resp`; the mem tier keeps only the
+    in-process sentence; and keyless or cookieless callers keep today's
+    at-most-once semantics by stated precondition.

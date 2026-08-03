@@ -90,6 +90,8 @@ const PORT_ORPHAN = Number(process.env.SMOKE_PORT_ORPHAN ?? 8142)
 /* B8 runs three lives in sequence on one port; nothing overlaps, because each
    life is stopped and awaited before the next is spawned. */
 const PORT_ROLLBACK = Number(process.env.SMOKE_PORT_ROLLBACK ?? 8143)
+const PORT_LOST_REPLY = Number(process.env.SMOKE_PORT_LOST_REPLY ?? 8144)
+const PORT_LOST_REPLY_RESTART = Number(process.env.SMOKE_PORT_LOST_REPLY_RESTART ?? 8145)
 const HEADED = process.env.SMOKE_HEADED === '1'
 const WAIT_MS = Number(process.env.SMOKE_TIMEOUT_MS ?? 15000)
 
@@ -328,7 +330,20 @@ async function sharedDocScenario(browser, base) {
       return { status: r.status, body: await r.text() }
     }, tag)
 
-  const tagCount = (r) => (r.status === 200 ? JSON.parse(r.body) : null)
+  /* Step 15's flag day (D20) changed this endpoint's 200 shape: a [Mutating]
+     reply is now ENVELOPED - {"reply": n} for an answer the one taken delivery
+     computed, "replayed" for a duplicate whose bytes are gone. The envelope is
+     on the wire whether or not the caller sent x-tea-key, and this POST
+     deliberately sends none, so it is unwrapped here unconditionally rather
+     than probed for. Reading `reply` by name (not JSON.parse alone) is what
+     keeps the check below honest: a bare integer, or a "replayed" that means
+     the effect is unconfirmed, both decode to null and fail rather than
+     passing as a count. */
+  const tagCount = (r) => {
+    if (r.status !== 200) return null
+    const v = JSON.parse(r.body)
+    return v !== null && typeof v === 'object' && 'reply' in v ? v.reply : null
+  }
   const first = await appendTag('smoke-one')
   const n1 = tagCount(first)
   const gate = check('shared_doc: same-origin POST /rpc/append_tag passes the D12 gate with 200', first.status === 200, show(first))
@@ -1341,6 +1356,281 @@ async function rollbackScenario(browser) {
 
 /* -------------------------------------------------------------------- main */
 
+/* --------------------------- scenario 9: the keyed RPC tier (step 15, D20) */
+
+/* The request header that carries <tab>:<seq>. Read from the intercepted
+   request rather than assumed: if the client ever stopped sending it the
+   endpoint would silently fall back to the unkeyed path, every check below
+   would still pass on a plain round trip, and only this assertion notices. */
+const KEY_HEADER = 'x-tea-key'
+
+/* B9, lost response. The proxy lets the POST reach the server, reads the real
+   200 upstream, then aborts the PAGE's request: the effect lands, the reply
+   never arrives. The client's keyed queue must retry THE SAME KEY, and the
+   server must answer that retry out of its reply cache with the bytes the one
+   taken delivery computed - so the app surfaces a real count, not a transport
+   error and not "tag applied, reply lost" (that marker is B10's, and here it
+   would mean the cache missed).
+
+   Only the FIRST response is eaten. A standing drop would starve the retry
+   ladder forever, and the scenario could not tell a working retry from a hung
+   one - the timeout would look identical either way.
+
+   On what this can and cannot witness: the document's tags are a set and the
+   button always publishes the same string, so the rendered count is 1 whether
+   the retry was refused or applied a second time. The count is therefore NOT
+   the exactly-once witness here. What carries the claim at this tier is that
+   both requests bore one key and that the second answer is BYTE-IDENTICAL to
+   the first - the reply cache returning what the taken delivery computed
+   rather than recomputing it. A double apply is caught where it is visible:
+   natively by the commit count (rpc_once_test, rpc_pack_once_test), and in
+   the browser by B10, whose marker cannot appear without a surviving floor. */
+async function lostReplyScenario(browser, base) {
+  const ctx = await browser.newContext()
+  const errors = []
+  const page = await ctx.newPage()
+  page.on('pageerror', (e) => errors.push(String(e)))
+
+  const keys = []
+  const bodies = []
+  let eaten = 0
+  await page.route('**/rpc/append_tag', async (route) => {
+    keys.push(route.request().headers()[KEY_HEADER] ?? '')
+    /* fetch() runs the request upstream for real, so the server applies it and
+       caches the reply; abort() is what the page sees. The order is the whole
+       point: aborting first would drop the EFFECT too, and this would be a
+       test of a plain retry rather than of a lost response. */
+    const upstream = await route.fetch()
+    const body = await upstream.text()
+    bodies.push(body)
+    if (eaten === 0) {
+      eaten += 1
+      await route.abort('connectionfailed')
+      return
+    }
+    /* Fulfil from the upstream response so its headers (the Dream session
+       cookie among them) survive; only the body is restated. */
+    await route.fulfill({ response: upstream, body })
+  })
+
+  await page.goto(`${base}/app/index.html`)
+  await page.waitForSelector('.doc .publish-line', { timeout: WAIT_MS })
+  const publishLine = () => page.$eval('.doc .publish-line', (el) => el.textContent)
+
+  const surfaced = await transition(
+    'B9: the reply is dropped, the client retries, and the app renders the cached count',
+    publishLine,
+    (v) => /^1 tags on the document$/.test(v),
+    { act: () => page.locator('.doc .publish button').click() }
+  )
+
+  /* "Exactly one tag in the canonical document", asserted where a browser can
+     actually observe it: the server computes this count from the canonical doc
+     AFTER applying, and ships it in the envelope.
+
+     Deliberately NOT read off `.doc ul.tags`. The keyed handler commits to the
+     canonical session, while this tab's live view watches its OWN session
+     branch, so the tag it just published is not in this tab's model and no
+     amount of waiting will put it there - an earlier draft of this check spun
+     for the full timeout on an empty list. The branch itself is asserted
+     natively, where the store is in hand (rpc_once_test, rpc_pack_once_test);
+     the count is the browser's share of that claim. */
+  const oneTag = check(
+    'B9: the server counts exactly one tag on the canonical document',
+    bodies.length >= 2 && JSON.parse(bodies[1]).reply === 1,
+    show(bodies[1] ?? null)
+  )
+
+  const retried = check(
+    'B9: the dropped response provoked a retry (more than one POST reached the server)',
+    keys.length >= 2,
+    `posts=${keys.length}`
+  )
+  const oneKey = check(
+    'B9: every attempt carried one and the same non-empty x-tea-key',
+    keys.length >= 2 && keys[0] !== '' && keys.every((k) => k === keys[0]),
+    show(keys)
+  )
+  /* The reply cache's own claim, checked on the wire: byte-identical, not
+     merely equivalent. A recomputed answer could coincide in value; it is this
+     equality that says the second POST never re-entered the handler. */
+  const cached = check(
+    'B9: the retry was answered with the byte-identical cached reply',
+    bodies.length >= 2 && bodies[1] === bodies[0],
+    show(bodies.slice(0, 2))
+  )
+  const notMarker = check(
+    'B9: the app saw a real reply, not the reply-lost marker (the cache held)',
+    bodies.length >= 2 && !/replayed/.test(bodies[1]),
+    show(bodies[1] ?? null)
+  )
+
+  await ctx.close()
+  return [
+    surfaced,
+    oneTag,
+    retried,
+    oneKey,
+    cached,
+    notMarker,
+    check('B9: no uncaught browser exception', errors.length === 0, errors.join(' | ')),
+  ]
+}
+
+/* B10, lost response plus restart (step 15, D20), the durable statement B9
+   cannot make. B9's retry is refused by a reply cache that lives in the same
+   process as the effect, so all it can witness is that one process did not
+   apply twice. Here the process itself goes away between the effect and the
+   retry: the only thing left to refuse the duplicate is the delivery floor on
+   disk. What the browser sees is the typed consequence - the client surfaces
+   [Applied_reply_lost], "tag applied, reply lost", which is the whole reason
+   the reply envelope has a second case at all.
+
+   The restart is performed INSIDE the route handler, after the real 200 has
+   been read upstream and before the page is told anything. That ordering is
+   what makes this scenario deterministic rather than a race. Aborting first and
+   then restarting would leave the client free to retry against a server that is
+   still alive - the backoff ladder starts at 500ms and a graceful SIGTERM plus
+   a fresh boot takes longer than that - and a retry answered from life 1's warm
+   cache is B9 again, wearing B10's name. Holding the page's request until life
+   2 is listening means the first thing the client can possibly do after the
+   failure is talk to life 2.
+
+   The count is again not the exactly-once witness (tags are a set, so a double
+   apply of one string is invisible in the document); here it is the wire that
+   carries the claim, and it carries a stronger one than B9's byte-identity: an
+   answer of "replayed" can only be produced by a guard that already knows this
+   key was delivered, and nothing in the new process knows that except the
+   journal beside the pack root. The probe below is the complement - it rules
+   out the degenerate reading where the effect never survived at all. */
+async function lostReplyRestartScenario(browser) {
+  /* Parent exists, leaf does not: the same pack-root shape B4 explains. */
+  const parent = await mkdtemp(join(tmpdir(), 'tea-smoke-b10-'))
+  const root = join(parent, 'store')
+  const server = () =>
+    spawnServer({
+      name: 'lost-reply-restart shared_doc server',
+      exe: '_build/default/examples/shared_doc/server/main.exe',
+      clientDir: '_build/default/examples/shared_doc/client',
+      port: PORT_LOST_REPLY_RESTART,
+      env: { TEA_ROOT: root },
+    })
+  let srv = null
+  let ctx = null
+  const errors = []
+  const out = []
+  const step = (r) => {
+    out.push(r)
+    return r.ok
+  }
+  try {
+    srv = await server()
+    const base = srv.base
+    const pidBefore = srv.proc.pid
+    let pidAfter = null
+    ctx = await browser.newContext()
+    const page = await ctx.newPage()
+    page.on('pageerror', (e) => errors.push(String(e)))
+
+    const keys = []
+    const bodies = []
+    let eaten = 0
+    await page.route('**/rpc/append_tag', async (route) => {
+      keys.push(route.request().headers()[KEY_HEADER] ?? '')
+      const upstream = await route.fetch()
+      const body = await upstream.text()
+      bodies.push(body)
+      if (eaten === 0) {
+        eaten += 1
+        /* Between the answer and the abort: life 1 dies having applied the tag
+           and cached the reply it will never deliver, and life 2 comes up over
+           the same root with an empty cache and the floor it inherits. */
+        await stop(srv, 'SIGTERM')
+        srv = await server()
+        pidAfter = srv.proc.pid
+        await route.abort('connectionfailed')
+        return
+      }
+      await route.fulfill({ response: upstream, body })
+    })
+
+    await page.goto(`${base}/app/index.html`)
+    await page.waitForSelector('.doc .publish-line', { timeout: WAIT_MS })
+    const publishLine = () => page.$eval('.doc .publish-line', (el) => el.textContent)
+
+    /* Not gated: every check after this one reads state already recorded by the
+       proxy, and if the marker never arrives those recordings are the diagnosis
+       (which POST was answered how, and whether a second one happened at all). */
+    step(await transition(
+      'B10: the retry crosses the restart and the app surfaces the reply-lost marker',
+      publishLine,
+      (v) => /^tag applied, reply lost$/.test(v),
+      { act: () => page.locator('.doc .publish button').click() }
+    ))
+
+    step(check(
+      'B10: the restart really happened (life 2 is a new process on the same root)',
+      pidAfter !== null && pidAfter !== pidBefore,
+      `pid ${pidBefore} -> ${pidAfter === null ? 'NEVER RESPAWNED' : pidAfter}`
+    ))
+    /* Life 1 answered for real before it died. Without this the scenario would
+       also pass if the first POST had been refused outright, which is a lost
+       REQUEST, not a lost response, and proves nothing about the floor. */
+    step(check(
+      'B10: life 1 applied the tag and computed a real reply before the drop',
+      bodies.length >= 1 && JSON.parse(bodies[0])?.reply === 1,
+      show(bodies[0] ?? null)
+    ))
+    step(check(
+      'B10: the dropped response provoked a retry that reached life 2',
+      keys.length >= 2,
+      `posts=${keys.length}`
+    ))
+    step(check(
+      'B10: the retry carried the same non-empty x-tea-key across the boot',
+      keys.length >= 2 && keys[0] !== '' && keys.every((k) => k === keys[0]),
+      show(keys)
+    ))
+    /* The durable claim, on the wire. Parsed rather than string-matched: the
+       envelope's other case is an object, so decoding to exactly the string
+       "replayed" says this was the reply-lost arm and not a reply that happens
+       to mention the word. */
+    step(check(
+      'B10: life 2 refused the duplicate from the journal alone (the wire says "replayed")',
+      bodies.length >= 2 && JSON.parse(bodies[1]) === 'replayed',
+      show(bodies[1] ?? null)
+    ))
+
+    /* The complement: "replayed" would also be the honest answer if the tag had
+       never survived the restart and the floor were all that was left, so the
+       document is asked directly. A DISTINCT tag is used deliberately - probing
+       with the published string would append into a set that already holds it
+       and answer 1 whether or not the original survived, which is a check that
+       cannot fail. Unkeyed on purpose: this probe is a reader, and giving it a
+       key would enrol it in the very guard it is meant to observe. */
+    const probe = await page.evaluate(async () => {
+      const r = await fetch('/rpc/append_tag', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify('probe'),
+      })
+      return { status: r.status, body: await r.text() }
+    })
+    step(check(
+      'B10: the canonical document holds exactly one published tag after the boot',
+      probe.status === 200 && JSON.parse(probe.body)?.reply === 2,
+      `${show(probe)} (a count of 1 = the published tag did not survive the restart)`
+    ))
+
+    step(check('B10: no uncaught browser exception', errors.length === 0, errors.join(' | ')))
+    return out
+  } finally {
+    if (ctx) await ctx.close().catch(() => {})
+    if (srv) await stop(srv, 'SIGTERM').catch(() => {})
+    await rm(parent, { recursive: true, force: true })
+  }
+}
+
 const main = async () => {
   const browser = await chromium.launch({ headless: !HEADED })
   /* A scenario that throws (a selector never appearing, a server that never
@@ -1393,7 +1683,35 @@ const main = async () => {
     /* B8 owns three server lives and a filesystem rollback between two of
        them, so like B4 it is not a withServer body. */
     const rollback = await guarded('rollback B8', () => rollbackScenario(browser))
-    return [...counter, ...sharedDoc, ...replay, ...durable, ...secret, ...preflight, ...orphan, ...rollback]
+    /* B9 runs on the mem tier deliberately: the binary's non-TEA_ROOT arm
+       still gates /rpc through Rpc_once.once_mem, so the keyed channel is
+       live, and the reply cache it exercises is per-process anyway. The
+       durable tier is B10's, where the guarantee is about what survives the
+       process rather than what the cache remembers inside it. */
+    const lostReply = await withServer(
+      {
+        name: 'lost-reply shared_doc server',
+        exe: '_build/default/examples/shared_doc/server/main.exe',
+        clientDir: '_build/default/examples/shared_doc/client',
+        port: PORT_LOST_REPLY,
+      },
+      ({ base }) => guarded('lost reply B9', () => lostReplyScenario(browser, base))
+    )
+    /* B10 restarts its server mid-scenario, so like B4 and B8 it owns its own
+       lifecycle rather than running as a withServer body. */
+    const lostReplyRestart = await guarded('lost reply restart B10', () => lostReplyRestartScenario(browser))
+    return [
+      ...counter,
+      ...sharedDoc,
+      ...replay,
+      ...durable,
+      ...secret,
+      ...preflight,
+      ...orphan,
+      ...rollback,
+      ...lostReply,
+      ...lostReplyRestart,
+    ]
   } finally {
     await browser.close()
   }

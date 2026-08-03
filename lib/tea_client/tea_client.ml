@@ -8,6 +8,7 @@ module Prim = Tea_core.Prim
 module Reconnect = Reconnect
 module Rebase = Rebase
 module Delivery = Delivery
+module Rpc_delivery = Rpc_delivery
 module Local_channel = Local_channel
 
 type 'msg Vdom.Cmd.t +=
@@ -16,6 +17,7 @@ type 'msg Vdom.Cmd.t +=
   | Http of
       { path : string  (* lowered at the vdom boundary, as [Navigate] lowers [Url] *)
       ; body : string
+      ; delivery : Cmd.Http_delivery.t
       ; expect : (string, Cmd.http_failure) result -> 'msg
       }
 
@@ -48,8 +50,15 @@ let rec cmd_to_vdom = function
   | Cmd.Emit msg -> Vdom.Cmd.Echo msg
   | Cmd.After (delay, msg) -> After (Prim.Delay.to_ms delay, msg)
   | Cmd.Navigate url -> Navigate (Prim.Url.to_string url)
-  | Cmd.Http { path; body; expect } ->
-    Http { path = Prim.Rpc_path.to_string path; body; expect }
+  | Cmd.Http { path; body; delivery; expect } ->
+    (* The classification crosses the vdom boundary intact rather than
+       branching here (roadmap step 15, I5): this module is pure and the two
+       channels differ only in effect - one XHR fired and forgotten, one entry
+       recorded in a queue that owns its own retries. Lowering to two
+       constructors would put that difference in a translation whose whole
+       contract is to preserve structure, and would double the interpreter's
+       arms for one field. *)
+    Http { path = Prim.Rpc_path.to_string path; body; delivery; expect }
 
 module Subs = struct
   type ('model, 'msg) spec =

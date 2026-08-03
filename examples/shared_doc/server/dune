@@ -3,9 +3,9 @@
 (library
  (name shared_doc_serve)
  (modules shared_doc_serve)
- (libraries tea_server shared_doc_app dream lwt))
+ (libraries tea_server tea_server_pack tea_persist shared_doc_app dream lwt))
 
 (executable
  (name main)
  (modules main)
- (libraries shared_doc_serve tea_server shared_doc_app dream))
+ (libraries shared_doc_serve tea_server tea_server_pack shared_doc_app dream))

@@ -18,6 +18,22 @@ type http_failure =
           [Loop] resolves every [Http] this way; the browser runtime never
           produces it *)
 
+(** Which delivery contract an [Http] command rides (roadmap step 15, D20). A
+    sum rather than a bool, so an interpreter matches it exhaustively and a
+    third channel becomes a compile error everywhere instead of a silent
+    default. *)
+module Http_delivery : sig
+  type t =
+    | Bare
+        (** today's semantics: no delivery key, no server-side dedup,
+            at-most-once effect per HTTP exchange, retry safety the caller's
+            problem. The only channel {!http} can build. *)
+    | Keyed
+        (** the exactly-once channel: the client runtime attaches a stable
+            delivery key, owns the retry, and re-sends under the same key
+            until a reply decodes — steps 10-13 transcribed onto HTTP. *)
+end
+
 type 'msg t = private
   | None_
   | Batch of 'msg t list
@@ -27,6 +43,10 @@ type 'msg t = private
   | Http of
       { path : Prim.Rpc_path.t
       ; body : string  (** opaque wire payload; Repr-JSON by convention *)
+      ; delivery : Http_delivery.t
+            (** which delivery contract the interpreter must honour; the key
+                itself is not here, because it is minted by the client runtime
+                where the tab entropy lives, never by the app *)
       ; expect : (string, http_failure) result -> 'msg
             (** total continuation from the raw transport outcome; the typed
                 decode lives in the closure [Tea_rpc.Make.call] builds *)
@@ -46,5 +66,21 @@ val http :
   body:string ->
   expect:((string, http_failure) result -> 'msg) ->
   'msg t
+(** Builds [delivery = Bare], today's semantics unchanged. *)
+
+val http_keyed :
+  path:Prim.Rpc_path.t ->
+  body:string ->
+  expect:((string, http_failure) result -> 'msg) ->
+  'msg t
+(** Builds [delivery = Keyed].
+
+    {b Precondition (R24).} The path must be served by a guarded route
+    ([Tea_server.Rpc.routes_once]). A keyed command against an unguarded POST
+    path turns at-most-once into at-least-once with nothing on the server side
+    to dedup it. In practice [Tea_rpc.Make.call] selects this constructor from
+    the endpoint's total [kind] witness and apps keep calling [call]; the key
+    is minted by the runtime's delivery queue, never here, so a hand-built
+    keyed command is still keyed correctly. *)
 
 val map : ('a -> 'b) -> 'a t -> 'b t

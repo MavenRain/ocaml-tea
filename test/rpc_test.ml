@@ -267,7 +267,7 @@ let () =
    a compile error here, never a silent [None]. *)
 let expect_of : type m.
     m Cmd.t -> ((string, Cmd.http_failure) result -> m) option = function
-  | Cmd.Http { expect; path = (_ : Prim.Rpc_path.t); body = (_ : string) } -> Some expect
+  | Cmd.Http { expect; delivery = (_ : Cmd.Http_delivery.t); path = (_ : Prim.Rpc_path.t); body = (_ : string) } -> Some expect
   | Cmd.None_ -> None
   | Cmd.Batch (_ : m Cmd.t list) -> None
   | Cmd.Emit (_ : m) -> None
@@ -293,7 +293,8 @@ let () =
       |> Result.fold ~ok:(fun (_ : S.stats_resp) -> false)
            ~error:(function
              | Tea_rpc.Decode _ -> true
-             | Tea_rpc.Transport (_ : Cmd.http_failure) -> false)
+             | Tea_rpc.Transport (_ : Cmd.http_failure) -> false
+             | Tea_rpc.Applied_reply_lost -> false)
     in
     (* Error (Http_status s) -> Error (Transport (Http_status s)) *)
     let status_lifts =
@@ -306,7 +307,8 @@ let () =
                       Prim.Status.to_int s' = Prim.Status.to_int s
                     | Tea_rpc.Transport Cmd.Network_error -> false
                     | Tea_rpc.Transport Cmd.No_transport -> false
-                    | Tea_rpc.Decode _ -> false))
+                    | Tea_rpc.Decode _ -> false
+                    | Tea_rpc.Applied_reply_lost -> false))
     in
     (* Error Network_error -> Error (Transport Network_error) *)
     let network_lifts =
@@ -316,11 +318,164 @@ let () =
              | Tea_rpc.Transport Cmd.Network_error -> true
              | Tea_rpc.Transport (Cmd.Http_status (_ : Prim.Status.t)) -> false
              | Tea_rpc.Transport Cmd.No_transport -> false
-             | Tea_rpc.Decode _ -> false)
+             | Tea_rpc.Decode _ -> false
+             | Tea_rpc.Applied_reply_lost -> false)
     in
     ok_decoded && ok_garbage && status_lifts && network_lifts
   in
   check "call's expect closure obeys the four transport/decode laws"
     (expect_of cmd |> Option.fold ~none:false ~some:law)
+
+(* --- the delivery key's wire grammar (roadmap step 15, D20) --------------- *)
+
+let key_err s =
+  Tea_rpc.Key.of_string s
+  |> Result.fold ~ok:(fun (_ : Tea_rpc.Key.t) -> None) ~error:Option.some
+
+(* Spelled out rather than sliced: [String.sub] would be a partial accessor in
+   a file whose whole subject is total parsing. *)
+let hex32 = "0123456789abcdef0123456789abcdef"
+let hex31 = "0123456789abcdef0123456789abcde"
+let hex32_upper_head = "A123456789abcdef0123456789abcdef"
+
+let a_tab =
+  Prim.Tab_id.of_string hex32
+  |> Result.fold ~error:(fun (_ : Prim.Tab_id.err) -> None) ~ok:Option.some
+
+let () =
+  (* The one surviving header-literal pin. Both tiers read this single
+     definition, so a one-byte drift is not a typo: it is a deploy where every
+     request arrives keyless and the de-duplication silently does nothing. *)
+  check "the key header literal is x-tea-key" (String.equal Tea_rpc.key_header "x-tea-key");
+  check "Key round-trips through to_string / of_string"
+    (a_tab
+    |> Option.fold ~none:false ~some:(fun tab ->
+           let k = Tea_rpc.Key.v ~tab ~seq:Prim.Msg_seq.one in
+           String.equal (Tea_rpc.Key.to_string k) (hex32 ^ ":1")
+           && Tea_rpc.Key.of_string (Tea_rpc.Key.to_string k)
+              |> Result.fold
+                   ~error:(fun (_ : Tea_rpc.Key.err) -> false)
+                   ~ok:(fun k' ->
+                     Prim.Tab_id.compare (Tea_rpc.Key.tab k') tab = 0
+                     && Prim.Msg_seq.compare (Tea_rpc.Key.seq k') Prim.Msg_seq.one = 0)));
+  check "Key.of_string rejects a missing and a doubled separator as Bad_shape"
+    (key_err hex32 = Some Tea_rpc.Key.Bad_shape
+    && key_err (hex32 ^ ":1:2") = Some Tea_rpc.Key.Bad_shape);
+  check "Key.of_string rejects a 31-hex tab as Bad_tab Wrong_length"
+    (key_err (hex31 ^ ":1") = Some (Tea_rpc.Key.Bad_tab Prim.Tab_id.Wrong_length));
+  check "Key.of_string rejects an uppercase tab byte as Bad_tab (Invalid_char 'A')"
+    (key_err (hex32_upper_head ^ ":1")
+    = Some (Tea_rpc.Key.Bad_tab (Prim.Tab_id.Invalid_char 'A')));
+  (* [int_of_string_opt] alone would ADMIT the sign, the hex, the underscore
+     AND the zero-padded spelling, giving one position in the stream several
+     accepted spellings - which is precisely what a dense-sequence guard
+     cannot tolerate. The parse accepts exactly the canonical print of the
+     value it returns, so the aliases are closed by construction rather than
+     by enumeration (F4 of the step-15 adversarial review). *)
+  check
+    "Key.of_string rejects 0, a sign, padding, hex, an underscore, and leading zeros as Bad_seq"
+    (List.for_all
+       (fun s -> key_err (hex32 ^ ":" ^ s) = Some Tea_rpc.Key.Bad_seq)
+       [ "0"; "-1"; "+1"; " 1"; "1 "; "0x10"; "1_0"; ""; "one"; "007"; "01"; "00" ])
+
+(* --- the keyed_resp envelope, and the deploy-skew wall -------------------- *)
+
+let keyed_int_t = Tea_rpc.keyed_resp_t Repr.int
+
+let () =
+  let enveloped = Codec.to_json keyed_int_t (Tea_rpc.Reply 7) in
+  let replayed = Codec.to_json keyed_int_t Tea_rpc.Replayed in
+  let bare = Codec.to_json Repr.int 7 in
+  check "keyed_resp round-trips both arms"
+    (Codec.of_json keyed_int_t enveloped
+     |> Result.fold
+          ~error:(fun (_ : Codec.err) -> false)
+          ~ok:(function
+            | Tea_rpc.Reply n -> n = 7
+            | Tea_rpc.Replayed -> false)
+    && Codec.of_json keyed_int_t replayed
+       |> Result.fold
+            ~error:(fun (_ : Codec.err) -> false)
+            ~ok:(function
+              | Tea_rpc.Reply (_ : int) -> false
+              | Tea_rpc.Replayed -> true));
+  (* A mixed deploy must fail LOUDLY rather than silently read a wrong value,
+     so neither codec may accept the other's bytes. Pinned in both directions:
+     a stale pre-envelope bundle gets a typed Decode, and a pre-envelope server
+     answering a current bundle gets one too. *)
+  check "a bare body does not decode as keyed_resp"
+    (Result.is_error (Codec.of_json keyed_int_t bare));
+  check "an enveloped body does not decode as the bare resp"
+    (Result.is_error (Codec.of_json Repr.int enveloped));
+  check "Replayed's wire form is not the bare resp either"
+    (Result.is_error (Codec.of_json Repr.int replayed))
+
+(* --- call reads the channel off the endpoint's kind ----------------------- *)
+
+(* The delivery classification of a built command, pulled out the same way
+   [expect_of] pulls the closure; every other verb enumerated so a new command
+   constructor is a compile error rather than a silent [None]. *)
+let delivery_of : type m. m Cmd.t -> Cmd.Http_delivery.t option = function
+  | Cmd.Http
+      { delivery
+      ; path = (_ : Prim.Rpc_path.t)
+      ; body = (_ : string)
+      ; expect = (_ : (string, Cmd.http_failure) result -> m)
+      } ->
+    Some delivery
+  | Cmd.None_ -> None
+  | Cmd.Batch (_ : m Cmd.t list) -> None
+  | Cmd.Emit (_ : m) -> None
+  | Cmd.After ((_ : Prim.Delay.t), (_ : m)) -> None
+  | Cmd.Navigate (_ : Prim.Url.t) -> None
+
+let is_bare (d : Cmd.Http_delivery.t) : bool =
+  match d with
+  | Cmd.Http_delivery.Bare -> true
+  | Cmd.Http_delivery.Keyed -> false
+
+let keyed_tag_t = Tea_rpc.keyed_resp_t (S.resp_t S.Append_tag)
+
+let () =
+  let read_only_cmd = R.call S.Doc_stats { S.title = "t"; body = "b" } ~reply:Fun.id in
+  let mutating_cmd = R.call S.Append_tag "urgent" ~reply:Fun.id in
+  (* An app never picks a delivery contract and never mints a key: the
+     endpoint's own [kind] witness picks the channel, which is what makes
+     "classify it Mutating" the whole of the app-facing story. *)
+  check "call puts a Read_only endpoint on the Bare channel"
+    (delivery_of read_only_cmd |> Option.fold ~none:false ~some:is_bare);
+  check "call puts a Mutating endpoint on the Keyed channel"
+    (delivery_of mutating_cmd
+    |> Option.fold ~none:false ~some:(fun d -> not (is_bare d)));
+  (* The decode follows the channel it chose. *)
+  check "the Mutating expect decodes Reply into Ok"
+    (expect_of mutating_cmd
+    |> Option.fold ~none:false ~some:(fun expect ->
+           expect (Ok (Codec.to_json keyed_tag_t (Tea_rpc.Reply 3))) = Ok 3));
+  (* The one outcome an app must act on rides the 200 channel as a typed arm,
+     never a status: effect certain, value lost, and distinguishable from a
+     transport failure, where the effect's fate is unknown. *)
+  check "the Mutating expect turns Replayed into Applied_reply_lost"
+    (expect_of mutating_cmd
+    |> Option.fold ~none:false ~some:(fun expect ->
+           expect (Ok (Codec.to_json keyed_tag_t Tea_rpc.Replayed))
+           = Error Tea_rpc.Applied_reply_lost));
+  check "the Mutating expect refuses a bare body as a typed Decode"
+    (expect_of mutating_cmd
+    |> Option.fold ~none:false ~some:(fun expect ->
+           expect (Ok (R.encode_resp S.Append_tag 3))
+           |> Result.fold
+                ~ok:(fun (_ : int) -> false)
+                ~error:(function
+                  | Tea_rpc.Decode _ -> true
+                  | Tea_rpc.Transport (_ : Cmd.http_failure) -> false
+                  | Tea_rpc.Applied_reply_lost -> false)));
+  check "the Read_only expect still reads a bare body"
+    (expect_of read_only_cmd
+    |> Option.fold ~none:false ~some:(fun expect ->
+           expect (Ok (R.encode_resp S.Doc_stats { S.title_len = 1; word_count = 1 }))
+           |> Result.fold
+                ~error:(fun (_ : Tea_rpc.error) -> false)
+                ~ok:(fun (s : S.stats_resp) -> s.S.title_len = 1)))
 
 let () = print_endline "rpc_test: all checks passed"

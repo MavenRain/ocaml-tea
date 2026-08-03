@@ -382,7 +382,23 @@ module R = Tea_rpc.Make (Shared_doc_rpc)
 (* Pull the lowered [Http] extension out of a [Vdom.Cmd.t]; the type is open,
    so the catch-all is required by the type system, not a shortcut. *)
 let http_of = function
-  | Tea_client.Http { path; body; expect } -> Some (path, body, expect)
+  | Tea_client.Http { path; body; delivery = (_ : Cmd.Http_delivery.t); expect } ->
+    Some (path, body, expect)
+  | other ->
+    ignore other;
+    None
+
+(* The channel classification alone, so the checks that care about the wire
+   shape and the one that cares about which contract the runtime owes are not
+   forced through one tuple (roadmap step 15, D20). *)
+let delivery_of = function
+  | Tea_client.Http
+      { path = (_ : string)
+      ; body = (_ : string)
+      ; delivery
+      ; expect = (_ : (string, Cmd.http_failure) result -> _)
+      } ->
+    Some delivery
   | other ->
     ignore other;
     None
@@ -401,6 +417,8 @@ let got_stats_of : Sd.msg -> (SR.stats_resp, Tea_rpc.error) result option = func
   | Sd.Remove_tag (_ : string) -> None
   | Sd.Sync_doc (_ : Sd.model) -> None
   | Sd.Request_stats -> None
+  | Sd.Publish_tag (_ : string) -> None
+  | Sd.Got_tag_count (_ : (int, Tea_rpc.error) result) -> None
 
 let stats_req_val = { SR.title = "hello"; body = "a b c d" }
 let resp_val = { SR.title_len = 5; word_count = 4 }
@@ -436,7 +454,35 @@ let () =
                                Prim.Status.to_int s' = 500
                              | Tea_rpc.Transport Cmd.Network_error -> false
                              | Tea_rpc.Transport Cmd.No_transport -> false
-                             | Tea_rpc.Decode _ -> false)))))
+                             | Tea_rpc.Decode _ -> false
+                             | Tea_rpc.Applied_reply_lost -> false)))))
+
+(* The lowering carries the endpoint's kind across the vdom boundary as a
+   delivery contract (roadmap step 15, D20): the read-only query stays on
+   today's fire-and-forget arm, the mutating call becomes the runtime's to
+   retry under a stable key. Reading it here, off the browser, is what keeps
+   [Tea_rpc.Make.call]'s classification from drifting silently into
+   at-least-once - the M10 anchor's client-side half. *)
+let () =
+  let append_cmd =
+    R.call SR.Append_tag "tag" ~reply:(fun (_ : (int, Tea_rpc.error) result) ->
+        Sd.Request_stats)
+  in
+  check "a Read_only call lowers as the bare delivery contract"
+    (delivery_of (Tea_client.cmd_to_vdom stats_cmd)
+    |> Option.fold ~none:false ~some:(function
+         | Cmd.Http_delivery.Bare -> true
+         | Cmd.Http_delivery.Keyed -> false));
+  check "a Mutating call lowers as the keyed delivery contract"
+    (delivery_of (Tea_client.cmd_to_vdom append_cmd)
+    |> Option.fold ~none:false ~some:(function
+         | Cmd.Http_delivery.Keyed -> true
+         | Cmd.Http_delivery.Bare -> false));
+  check "Cmd.map preserves the delivery contract it lowers"
+    (delivery_of (Tea_client.cmd_to_vdom (Cmd.map (fun m -> m) append_cmd))
+    |> Option.fold ~none:false ~some:(function
+         | Cmd.Http_delivery.Keyed -> true
+         | Cmd.Http_delivery.Bare -> false))
 
 (* --- Cmd.map post-composition over Http (both frames) + Batch distribution - *)
 
@@ -576,7 +622,8 @@ let () =
                    | Tea_rpc.Transport Cmd.No_transport -> true
                    | Tea_rpc.Transport (Cmd.Http_status (_ : Prim.Status.t)) -> false
                    | Tea_rpc.Transport Cmd.Network_error -> false
-                   | Tea_rpc.Decode _ -> false))));
+                   | Tea_rpc.Decode _ -> false
+                   | Tea_rpc.Applied_reply_lost -> false))));
   check "a reply that re-fires the call burns fuel like Emit (fuel 2 -> Fuel_exhausted)"
     (Prim.Fuel.of_int 2
     |> Option.fold ~none:false ~some:(fun fuel2 ->

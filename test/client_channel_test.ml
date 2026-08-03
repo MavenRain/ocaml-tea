@@ -60,7 +60,7 @@ let shows (h : 'm Html.t) (needle : string) : bool =
 
 let is_http_to (cmd : 'm Cmd.t) (path : string) : bool =
   match cmd with
-  | Cmd.Http { path = p; body = (_ : string); expect = (_ : (string, Cmd.http_failure) result -> 'm) }
+  | Cmd.Http { path = p; delivery = (_ : Cmd.Http_delivery.t); body = (_ : string); expect = (_ : (string, Cmd.http_failure) result -> 'm) }
     -> String.equal (Prim.Rpc_path.to_string p) path
   | Cmd.None_ | Cmd.Batch (_ : 'm Cmd.t list) | Cmd.Emit (_ : 'm) -> false
   | Cmd.After ((_ : Prim.Delay.t), (_ : 'm)) -> false
@@ -95,7 +95,8 @@ let () =
     | Cmd.After ((_ : Prim.Delay.t), (_ : App.msg)) -> false
     | Cmd.Navigate (_ : Prim.Url.t) -> false
     | Cmd.Http
-        { path = (_ : Prim.Rpc_path.t)
+        { delivery = (_ : Cmd.Http_delivery.t)
+        ; path = (_ : Prim.Rpc_path.t)
         ; body = (_ : string)
         ; expect = (_ : (string, Cmd.http_failure) result -> App.msg)
         } -> false);
@@ -163,7 +164,9 @@ module Claim_tags = struct
     | App.Remove_tag (_ : string)
     | App.Sync_doc (_ : App.model)
     | App.Request_stats
-    | App.Got_stats (_ : (Shared_doc_rpc.stats_resp, Tea_rpc.error) result) -> None
+    | App.Got_stats (_ : (Shared_doc_rpc.stats_resp, Tea_rpc.error) result)
+    | App.Publish_tag (_ : string)
+    | App.Got_tag_count (_ : (int, Tea_rpc.error) result) -> None
 
   let view (shared : shared) (_ : local) : msg Html.t = App.view shared
 end
@@ -214,7 +217,8 @@ let () =
         | Cmd.After ((_ : Prim.Delay.t), (_ : Counter.msg))
         | Cmd.Navigate (_ : Prim.Url.t)
         | Cmd.Http
-            { path = (_ : Prim.Rpc_path.t)
+            { delivery = (_ : Cmd.Http_delivery.t)
+        ; path = (_ : Prim.Rpc_path.t)
             ; body = (_ : string)
             ; expect = (_ : (string, Cmd.http_failure) result -> Counter.msg)
             }

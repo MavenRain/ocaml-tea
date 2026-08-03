@@ -95,9 +95,61 @@ type t
 val v :
   sessions:Replay_guard.Bound.t ->
   tabs:Replay_guard.Bound.t ->
+  ?mirror:Replay_guard.Bound.t ->
   sink:Guard_sink.t ->
   floors:Floors.t ->
+  unit ->
   t
+(** The trailing [unit] is what makes [?mirror] erasable, every other argument
+    being labelled.
+
+    [?mirror] caps the in-process floor mirror (roadmap step 15, R12 as
+    amended by R15: before this the mirror was the last uncapped table in the
+    stack, and the keyed RPC channel would have grown it at the rate a
+    same-origin page can POST). Default: [default_mirror ~sessions ~tabs ()],
+    a DERIVED value, never a constant (D20.4).
+
+    Eviction is LRU by a monotone recency tick — touched on {!persist} and on
+    a Cell-{i miss} seed hit, never on a Cell hit, because a key the Cell is
+    already serving is not a key the mirror was asked about — and it
+    {b removes} the floor, which is the accept direction: an absent floor
+    admits any sequence number, and a kept floor is never lowered, so the
+    floors-never-lower law is untouched. Floors handed in at boot are capped
+    on the way in, so the bound is an invariant of the value.
+
+    There is deliberately no journal read-back on a mirror miss. The sink is
+    append-only by design ({!Guard_sink}: the guard never learns file IO), and
+    decisively a read inside {!take} would be an Lwt yield between the verdict
+    and the record, which is the one gap this whole family exists to keep
+    closed. Eviction is therefore permanent-until-reboot, and self-healing at
+    the next boot: compaction rewrites from [Tea_server_pack.Guard_file]'s own
+    floor copy, so an evicted mirror floor RETURNS from the journal. Within
+    one process lifetime, dedup for an evicted key is suspended until restart;
+    across restarts it resumes if the journal record survived its own cap. *)
+
+val default_mirror :
+  sessions:Replay_guard.Bound.t ->
+  tabs:Replay_guard.Bound.t ->
+  ?journal_cap:int ->
+  unit ->
+  Replay_guard.Bound.t
+(** [max (4 * sessions * tabs) journal_cap], with [journal_cap] defaulting to
+    [0] for sinkless composition.
+
+    Two obligations, both direction rather than luck. The mirror must
+    {i out-remember} the {!Replay_guard.Cell} it seeds, hence the factor of
+    four: a mirror no larger than its Cell evicts in lockstep with it and buys
+    nothing. And it must hold every floor the journal can replay at boot,
+    hence the [journal_cap] floor: otherwise the boot fold overflows the
+    mirror and drops floors the journal still holds. The guard cannot see the
+    journal's cap through the append-only sink seam, so the composition site
+    that knows the cap passes it here; the mem tier composes without one. *)
+
+val mirror_bound : t -> Replay_guard.Bound.t
+(** The bound this instance was composed with. It exists so the wiring rule
+    [mirror >= max (journal cap) (4 * Cell capacity)] is a fact a check can
+    pin at the composition site rather than a runtime assertion, which house
+    law forbids. *)
 
 val take :
   t ->
@@ -110,6 +162,22 @@ val take :
     restarted process hears reads its verdict against the durable floor, not
     against an empty table; then the Cell takes as in step 10. [Gapped]
     performs no Cell write, exactly as before. *)
+
+val release :
+  t ->
+  replica:Tea_core.Crdt.Replica.t ->
+  tab:Tea_core.Prim.Tab_id.t ->
+  seq:Tea_core.Prim.Msg_seq.t ->
+  unit
+(** Un-take one [Fresh] verdict whose apply REJECTED before {!persist} ran
+    (roadmap step 15, D20.2's barrier; R27). Synchronous and Cell-only:
+    nothing durable happened for this take, so the mirror and the journal have
+    nothing to unwind, and the conditionality (restore only while the high
+    water is still exactly [seq]) lives in {!Replay_guard.release}. Must never
+    be called after a successful [persist]: that would re-open a recorded
+    floor's seq for a second apply. A half-applied handler whose take is
+    released re-applies on the retry as a visible convergent duplicate, the
+    licensed degradation direction. *)
 
 val persist :
   t ->

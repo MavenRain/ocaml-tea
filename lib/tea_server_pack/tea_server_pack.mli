@@ -6,6 +6,47 @@
 module Root = Tea_persist_pack.Store_pack.Root
 module Guard_file = Guard_file
 
+(** The exactly-once RPC channel's server state (roadmap step 15, D20),
+    re-exported so an app naming the [?rpc_once] builder's argument does not
+    have to reach past this library into {!Tea_server}. *)
+module Rpc_once = Tea_server.Rpc_once
+
+type guards =
+  { ws : Tea_server.Durable_guard.t
+  ; ws_journal : Guard_file.t option
+  ; rpc : Tea_server.Durable_guard.t
+  ; rpc_journal : Guard_file.t option
+  }
+(** Both delivery channels' guards (roadmap step 15, D20.3). A journal that
+    failed to open is [None] beside a null-sink guard, never an absent
+    channel: that channel serves at-least-once rather than not at all, so a
+    caller must close whichever journals are [Some] and must not read [None]
+    as "nothing to do". *)
+
+val open_guards :
+  guard_dir:string ->
+  head_water:(Tea_core.Crdt.Replica.t -> Tea_core.Prim.Store_water.t option) ->
+  guards
+(** Open the websocket channel's journal at [<guard_dir>/journal] and the keyed
+    RPC channel's at [<guard_dir>/rpc/journal], filtering both against
+    [head_water] (R20).
+
+    What {!serve_pack} calls, exposed because the pair is a unit and the
+    relation between its halves is the part that can silently break. The two
+    channels must land in DIFFERENT directories, or one channel's floors
+    adjudicate the other's replays; the websocket journal must be opened FIRST,
+    because [Guard_file.open_] creates its own directory but never the parent,
+    so an rpc-first boot dies ENOENT on a fresh root; and both must be filtered
+    against the SAME [head_water] snapshot, taken once between the store open
+    and this call, or the two boot filters can straddle a write and judge their
+    floors against different heads. None of that is observable from inside a
+    blocking [serve_pack], which is why it is a named function with a return
+    type rather than two call sites.
+
+    [head_water] comes from {!Guard_file.head_water_of_list} over one
+    [Store_core.CORE.branch_waters] read. Caller closes every [Some] journal at
+    teardown, after the repo. *)
+
 module Make_pack (A : Tea_core.App.APP) : sig
   module Store : module type of Tea_persist_pack.Store_pack.Make (A)
 
@@ -43,6 +84,7 @@ module Make_pack (A : Tea_core.App.APP) : sig
     ?port:int ->
     ?client_dir:string ->
     ?rpc:Dream.route list ->
+    ?rpc_once:(Store.t -> Rpc_once.t -> Dream.route list) ->
     ?coalesce:A.msg Tea_core.Coalesce_spec.t ->
     ?retention:Store.Retention.t ->
     ?lower_root:string ->
@@ -51,13 +93,27 @@ module Make_pack (A : Tea_core.App.APP) : sig
     unit ->
     unit
   (** Blocking entry point: open (or initialise) the pack store at [root] and
-      the guard journal at [<root>.guard/journal] (a {i sibling} of the pack
-      root, so irmin-pack GC and migration never meet a foreign file; a
-      failed journal open is one stderr line and a null-sink guard, never an
-      abort), serve until SIGINT/SIGTERM, then close the journal and the repo
-      — that teardown order and the graceful-signal boundary are what make
-      the delivery guarantee "exactly-once across an {i orderly} restart,
-      at-least-once otherwise" (D16).
+      the guard journals at [<root>.guard/journal] and [<root>.guard/rpc/journal]
+      (a {i sibling} of the pack root, so irmin-pack GC and migration never meet
+      a foreign file; a failed journal open is one stderr line and a null-sink
+      guard, never an abort), serve until SIGINT/SIGTERM, then close the
+      journals and the repo — that teardown order and the graceful-signal
+      boundary are what make the delivery guarantee "exactly-once across an
+      {i orderly} restart, at-least-once otherwise" (D16).
+
+      [?rpc_once] mounts the keyed RPC channel (roadmap step 15, D20). It is a
+      route {i builder} rather than a route list because both values it is
+      applied to are made by this function and cannot be composed in advance:
+      the channel wraps a guard over a journal opened and closed here, and the
+      store is the pack root this function opened, which no app could reopen
+      beside a live server. An app writes
+      [~rpc_once:(fun repo o -> Rpc.routes_once o (my_handler repo))] and gets
+      the durable channel, or omits it and gets today's unkeyed [Mutating]
+      semantics. The channel's floors ride their own journal at
+      [<root>.guard/rpc], with their own bounds, cap and boot filter (D20.3), so
+      a step-14 root opens here with that journal simply absent and a step-14
+      binary reading a step-15 root never looks inside the subdirectory. The
+      returned routes are appended to [?rpc].
 
       When [?sessions] is omitted, identity is made as durable as the model
       (roadmap step 12, D17): the secret is resolved via

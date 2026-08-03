@@ -11,6 +11,8 @@ end
 
 let default_sessions : Bound.t = 4096
 let default_tabs : Bound.t = 8
+let default_rpc_replicas : Bound.t = 1
+let default_rpc_tabs : Bound.t = 4096
 
 (* [tick] is a monotone counter this module keeps itself: it makes the eviction
    order total and tie-free without a clock parameter, without a [Unix]
@@ -136,6 +138,44 @@ let seed (t : t) ~(replica : Tea_core.Crdt.Replica.t) ~(tab : Tea_core.Prim.Tab_
          if Msg_seq.compare high existing > 0 then insert () else t)
   |> fun adopt -> adopt ()
 
+(* The compensation for a [Fresh] take whose apply REJECTED before anything
+   was persisted (roadmap step 15, D20.2's barrier; R27). Conditional on the
+   entry's high water still being exactly [seq] - the one shape a failed take
+   can have left - and a no-op otherwise: a later take moved the water (only a
+   non-conforming pipelining caller can arrange that), or the entry was
+   evicted, which already reads as released. Restoring re-opens [seq] alone,
+   and re-opening can only ever cause a visible duplicate, never a loss: the
+   apply that failed may have half-landed, and the family's licensed
+   degradation direction is the convergent re-apply, not the silent drop. *)
+let release (t : t) ~(replica : Tea_core.Crdt.Replica.t)
+    ~(tab : Tea_core.Prim.Tab_id.t) ~(seq : Msg_seq.t) : t =
+  let restore () : t =
+    Msg_seq.of_int (Msg_seq.to_int seq - 1)
+    |> Option.fold
+         ~none:(fun () ->
+           (* [seq] is the least sequence number, so the pre-take state was
+              "never heard from": restored by removing the entry, because an
+              absent entry accepts any seq, which re-admits exactly the
+              retry. *)
+           Rep_map.find_opt replica t.live
+           |> Option.fold ~none:(fun () -> t)
+                ~some:(fun (p : per_replica) () ->
+                  let kept = Tab_map.remove tab p.tabs in
+                  { t with
+                    live =
+                      (if Tab_map.is_empty kept then Rep_map.remove replica t.live
+                       else Rep_map.add replica { p with tabs = kept } t.live)
+                  })
+           |> fun step -> step ())
+         ~some:(fun (prev : Msg_seq.t) () -> record t ~replica ~tab ~high:prev)
+    |> fun step -> step ()
+  in
+  high_water t ~replica ~tab
+  |> Option.fold ~none:(fun () -> t)
+       ~some:(fun (high : Msg_seq.t) () ->
+         if Int.equal (Msg_seq.compare high seq) 0 then restore () else t)
+  |> fun step -> step ()
+
 let sessions (t : t) : int = Rep_map.cardinal t.live
 
 let tabs (t : t) ~(replica : Tea_core.Crdt.Replica.t) : int =
@@ -156,6 +196,10 @@ module Cell = struct
   let seed (c : cell) ~(replica : Tea_core.Crdt.Replica.t) ~(tab : Tea_core.Prim.Tab_id.t)
       ~(high : Msg_seq.t) : unit =
     c := seed !c ~replica ~tab ~high
+
+  let release (c : cell) ~(replica : Tea_core.Crdt.Replica.t)
+      ~(tab : Tea_core.Prim.Tab_id.t) ~(seq : Msg_seq.t) : unit =
+    c := release !c ~replica ~tab ~seq
 
   let forget (c : cell) ~(replica : Tea_core.Crdt.Replica.t) : unit =
     c := forget !c ~replica

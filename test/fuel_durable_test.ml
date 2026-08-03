@@ -163,7 +163,7 @@ let () =
      let sink, recorded = Sink.memory () in
      let guard_a =
        Dguard.v ~sessions:Guard.default_sessions ~tabs:Guard.default_tabs ~sink
-         ~floors:Dguard.Floors.empty
+         ~floors:Dguard.Floors.empty ()
      in
      (* --- 1. The fuel arm: attempted, not applied, and still taken -------- *)
      let l1 = link () in
@@ -189,7 +189,7 @@ let () =
      let seq1 = must "seq 1" (Msg_seq.of_int 1) in
      let guard_b =
        Dguard.v ~sessions:Guard.default_sessions ~tabs:Guard.default_tabs ~sink
-         ~floors:(Dguard.Floors.of_events (recorded ()))
+         ~floors:(Dguard.Floors.of_events (recorded ())) ()
      in
      check
        "a guard restarted from the journal answers Duplicate: the fuel-killed \
@@ -203,7 +203,7 @@ let () =
         than about the record the fuel arm wrote. *)
      let guard_amnesiac =
        Dguard.v ~sessions:Guard.default_sessions ~tabs:Guard.default_tabs
-         ~sink:Sink.null ~floors:Dguard.Floors.empty
+         ~sink:Sink.null ~floors:Dguard.Floors.empty ()
      in
      check "ANTI-VACUITY: with no journal the same seq IS Fresh again"
        (match Dguard.take guard_amnesiac ~replica ~tab ~seq:seq1 with

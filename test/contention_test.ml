@@ -608,7 +608,7 @@ let () =
      let replica = Crdt.Ctx.replica (Doc3_store.ctx_of_session s) in
      let guard =
        Dguard.v ~sessions:Guard.default_sessions ~tabs:Guard.default_tabs
-         ~sink:Guard_sink.null ~floors:Floors.empty
+         ~sink:Guard_sink.null ~floors:Floors.empty ()
      in
      let* seed = Doc3_store.load_based s in
      let* (_ : Doc3_store.committed) =
@@ -970,7 +970,7 @@ let () =
      let replica = Crdt.Ctx.replica ctx in
      let guard =
        Dguard.v ~sessions:Guard.default_sessions ~tabs:Guard.default_tabs
-         ~sink:Guard_sink.null ~floors:Floors.empty
+         ~sink:Guard_sink.null ~floors:Floors.empty ()
      in
      let incoming, push = Lwt_stream.create () in
      let sent : string list ref = ref [] in

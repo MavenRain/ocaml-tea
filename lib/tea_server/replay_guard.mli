@@ -95,6 +95,19 @@ val default_tabs : Bound.t
 (** 8 tabs per replica. A browser does not usefully hold more live tabs on one
     cookie, and the cap is per replica so one session cannot starve another. *)
 
+val default_rpc_replicas : Bound.t
+(** 1, for the RPC channel's guard (roadmap step 15). The single-branch
+    contract means there is one canonical replica per [once] value, so the
+    outer level of that guard is not a population at all; a multi-canonical
+    branch app passes its own bound (R26). *)
+
+val default_rpc_tabs : Bound.t
+(** 4096, for the RPC channel's guard: one floor tab per live client page, all
+    of them under the one canonical replica. {!default_tabs}'s 8-per-replica is
+    per cookie and would let a ninth page evict a live one permanently once the
+    whole population shares a replica, so the RPC channel sizes its inner level
+    the way the WS channel sizes its outer one. *)
+
 type t
 
 val v : sessions:Bound.t -> tabs:Bound.t -> t
@@ -149,6 +162,24 @@ val seed :
 
     Seeding touches recency, because the only reason to seed is that a frame for
     [(replica, tab)] just arrived. *)
+
+val release :
+  t ->
+  replica:Tea_core.Crdt.Replica.t ->
+  tab:Tea_core.Prim.Tab_id.t ->
+  seq:Tea_core.Prim.Msg_seq.t ->
+  t
+(** Un-take one [Fresh] verdict whose apply REJECTED before anything was
+    persisted (roadmap step 15, D20.2's barrier; R27), so the retry reads
+    [Fresh] and re-runs the apply instead of draining through the reply cache
+    into a [Replayed] for an effect that never happened.
+
+    Conditional by construction: it restores the pre-take high water only when
+    the entry's high is still exactly [seq] - the one shape a failed take can
+    have left - and is a no-op otherwise (a later take moved the water, or the
+    entry was evicted, which already reads as released). Re-opening [seq] can
+    only ever cause a visible duplicate, never a loss: a half-applied handler
+    re-applies convergently, the one degradation direction the family keeps. *)
 
 val forget : t -> replica:Tea_core.Crdt.Replica.t -> t
 (** Drop every tab entry for one replica.
@@ -207,6 +238,16 @@ module Cell : sig
       synchronous decision point. Two sockets that both seed before either takes
       is harmless: seeding cannot lower an entry, and [take] still admits
       exactly one of them. *)
+
+  val release :
+    cell ->
+    replica:Tea_core.Crdt.Replica.t ->
+    tab:Tea_core.Prim.Tab_id.t ->
+    seq:Tea_core.Prim.Msg_seq.t ->
+    unit
+  (** {!release} on the shell, synchronous like {!take}: the failure arm calls
+      it in the same continuation that observed the rejection, so there is no
+      yield between deciding the apply failed and re-opening its seq. *)
 
   val forget : cell -> replica:Tea_core.Crdt.Replica.t -> unit
   val snapshot : cell -> t

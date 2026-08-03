@@ -51,9 +51,21 @@ let post ?origin ?host ?(ct = json) ~path payload =
 let append_tag ?origin ?host ?ct tag =
   post ?origin ?host ?ct ~path:"/rpc/append_tag" (R.encode_req Shared_doc_rpc.Append_tag tag)
 
+(* [Append_tag] is [Mutating], so from roadmap step 15 its 200 body rides the
+   [keyed_resp] envelope: decode that, never a bare count. [Replayed] gets its
+   own sentinel rather than folding into the decode failure, so a check that
+   accidentally read a replay as a fresh count could not pass by looking like
+   an ordinary miss. *)
+let append_tag_resp_t = Shared_doc_rpc.resp_t Shared_doc_rpc.Append_tag
+
 let count_of response =
-  R.decode_resp Shared_doc_rpc.Append_tag (body response)
-  |> Result.fold ~error:(fun (_ : Tea_core.Codec.err) -> -1) ~ok:Fun.id
+  Tea_core.Codec.of_json (Tea_rpc.keyed_resp_t append_tag_resp_t) (body response)
+  |> Result.fold
+       ~error:(fun (_ : Tea_core.Codec.err) -> -1)
+       ~ok:(fun (k : int Tea_rpc.keyed_resp) ->
+         match k with
+         | Tea_rpc.Reply n -> n
+         | Tea_rpc.Replayed -> -2)
 
 (* The canonical branch as the RPC handler sees it - the only honest witness
    that a refused request changed nothing. *)
@@ -155,11 +167,17 @@ let () =
 let () =
   let h = Serve.rpc_handler repo in
   let before = tags () in
+  (* Since step 15 the app's handler is the KEYED one, so each answer arrives
+     paired with the store water its own commit minted. The water is what the
+     guarded route persists as that delivery's floor; these checks are about
+     the counts, so they read [fst] off each pair. *)
   let counts =
     Lwt_main.run
       (Lwt.both
-         (h.Serve.Rpc.handle Shared_doc_rpc.Append_tag "alpha")
-         (h.Serve.Rpc.handle Shared_doc_rpc.Append_tag "beta"))
+         (h.Serve.Rpc.handle_keyed Shared_doc_rpc.Append_tag "alpha")
+         (h.Serve.Rpc.handle_keyed Shared_doc_rpc.Append_tag "beta"))
+    |> fun ((a, (_ : Tea_core.Prim.Store_water.t)), (b, (_ : Tea_core.Prim.Store_water.t)))
+      -> (a, b)
   in
   let after = tags () in
   check "two appends driven together both land on the shared branch"
@@ -168,6 +186,27 @@ let () =
     (List.length after = List.length before + 2);
   check "the later of the two replies counts every tag then present"
     (Stdlib.max (fst counts) (snd counts) = List.length after)
+
+(* --- the 200 body shape is fixed by KIND, not by the request (step 15) ----- *)
+
+(* A [Mutating] endpoint answers the [keyed_resp] envelope on 200 always, keyed
+   request or not — these posts carry no delivery key at all and are still
+   enveloped. The reason is on the client: [expect] is fixed when [call] builds
+   the command and cannot see whether the runtime attached a key, so a body
+   shape that varied per request would be undecodable by construction. Pinned
+   in BOTH directions (enveloped decodes, bare does not) so a reclassification
+   that moved an endpoint between the two shapes reds here rather than in a
+   browser. The read-only half of the pair is the section below, which decodes
+   the same handler's answer bare and reads the real computation out of it. *)
+let () =
+  let ok = append_tag ~origin:"http://example.com" ~host:"example.com" "shaped" in
+  check "a keyless Mutating POST is still served 200" (status ok = 200);
+  check "the Mutating 200 body decodes as keyed_resp Reply, carrying the count"
+    (count_of ok > 0);
+  check "the Mutating 200 body does NOT decode as a bare resp (it is enveloped)"
+    (Result.is_error (R.decode_resp Shared_doc_rpc.Append_tag (body ok)));
+  check "a keyless Mutating POST still applies (no guard yet, at-most-once)"
+    (List.mem "shaped" (tags ()))
 
 (* --- read-only endpoints stay ungated ------------------------------------- *)
 

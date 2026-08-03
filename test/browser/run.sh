@@ -20,7 +20,18 @@ if [ ! -d "$here/node_modules/playwright" ]; then
 fi
 
 echo "== dune build =="
-opam exec --switch=irmin-tea -- dune build --root "$repo"
+# `@default` recursively, from the repo. Both halves are load-bearing, and both
+# fail the same silent way. A bare `dune build` is the NON-recursive default
+# alias: it builds each client's compiled bundle but not the index.html beside
+# it, because the page is a source file that only reaches _build through the
+# per-directory default alias each client dune declares. And dune resolves that
+# alias relative to the CURRENT DIRECTORY, so invoking this script from outside
+# the repo builds an empty set and exits 0. Either way the build reports
+# success, the server answers 404 under /app, and the failure surfaces three
+# layers away as every scenario below timing out on a selector that never
+# appears.
+cd "$repo"
+opam exec --switch=irmin-tea -- dune build --root "$repo" @default
 
 echo "== browser smoke =="
 cd "$here" && exec node smoke.mjs

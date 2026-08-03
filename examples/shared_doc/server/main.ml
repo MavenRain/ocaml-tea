@@ -12,13 +12,23 @@
     [Dream.run]. Everything routable lives in {!Shared_doc_serve}, which the
     test suite links directly.
 
-    This binary calls [Dream.run] directly on [Shared_doc_serve.handler] and is
-    a MEM-tier server, so its session identity is deliberately per-process
-    (roadmap step 12, D17): the model dies with the process, and a durable
+    [TEA_ROOT] picks the durable backend, exactly as the counter binary does it
+    (roadmap step 11, D16): unset, this is the MEM tier - [Dream.run] over
+    [Shared_doc_serve.handler], a model that dies with the process, and a
+    deliberately per-process session identity (step 12, D17), because a durable
     identity over a volatile store would send a reconnecting tab to a branch
-    name that resolves to an empty branch. Identity durability must never
-    exceed model durability. A durable shared_doc would need the pack tier
-    first. *)
+    name that resolves to an empty branch, and identity durability must never
+    exceed model durability. Set, it is the pack tier: the model, the session
+    secret and the delivery floors all live under that directory.
+
+    The durable arm arrived with roadmap step 15 (D20) and the keyed RPC channel
+    is why. [/rpc/append_tag] is this app's one [Mutating] endpoint, and the
+    guarantee the step states - a request whose response was lost is retried
+    under the same key and applied exactly once - is a statement about what
+    survives a restart. On the mem tier there is nothing to survive: the floors
+    and the document die together, so a retry that crosses a boot re-applies,
+    and the tier can offer at-least-once and no more. The browser harness's B10
+    reads the durable statement end to end, which needs this arm to exist. *)
 
 module Server = Shared_doc_serve.Server
 
@@ -41,6 +51,20 @@ let () =
               None))
          ~some:Option.some
   in
-  let repo = Lwt_main.run (Server.Store.create ()) in
-  Dream.run ~interface:"localhost" ~port
-    (Dream.logger (Shared_doc_serve.handler ?client_dir repo))
+  (* Closures on BOTH branches, applied once: [Option.fold]'s [~none:] is eager,
+     so a bare [Dream.run ...] there would create the memory repo and start
+     serving from it before the pack branch was ever consulted. *)
+  Sys.getenv_opt "TEA_ROOT"
+  |> Option.fold
+       ~none:(fun () ->
+         let repo = Lwt_main.run (Server.Store.create ()) in
+         Dream.run ~interface:"localhost" ~port
+           (Dream.logger (Shared_doc_serve.handler ?client_dir repo)))
+       ~some:(fun (root : string) () ->
+         (* No repo is created here: [serve_pack] opens the pack root itself
+            (refusing an unusable one before it listens), and hands it back to
+            the [?rpc_once] builder - which is why that builder takes a store.
+            Two handles on one pack root is not a thing to arrange. *)
+         Shared_doc_serve.Pack.serve ~port ?client_dir
+           ~root:(Tea_server_pack.Root.v root) ())
+  |> fun run -> run ()

@@ -61,6 +61,7 @@ module type CORE = sig
   val model_path_raw : string list
   val session : t -> Tea_core.Prim.Session_id.t -> session Lwt.t
   val main_session : t -> session Lwt.t
+  val main_replica : Tea_core.Crdt.Replica.t
   val fork : t -> from:session -> Tea_core.Prim.Session_id.t -> session Lwt.t
   val load : session -> model Lwt.t
   val commit : session -> label:string -> model -> Tea_core.Prim.Store_water.t Lwt.t
@@ -558,6 +559,13 @@ struct
      exactly one home. *)
   let replica_of_name (name : string) : Tea_core.Crdt.Replica.t =
     Tea_core.Crdt.Replica.v (Tea_core.Prim.Session_id.v name)
+
+  (* The canonical branch's replica, through the one mint above, so the RPC
+     channel's single-branch floor key (roadmap step 15) and the boot filter's
+     head lookup name the same thing by construction rather than by two
+     matching string literals. *)
+  let main_replica : Tea_core.Crdt.Replica.t =
+    replica_of_name Tea_core.Prim.Branch_name.(to_string main)
 
   let ctx_of_session (s : session) : Tea_core.Crdt.Ctx.t =
     Tea_core.Crdt.Ctx.v ~clock:s.clock ~replica:(replica_of_name s.name)
