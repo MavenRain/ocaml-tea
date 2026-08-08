@@ -22,45 +22,11 @@
     regression that merely moved the persist from one arm to the other could
     not pass either. *)
 
-module App = struct
-  open Tea_core
-
-  (** The smallest APP whose update can exhaust fuel: [Spin]'s command
-      re-emits [Spin], so {!Tea_core.Loop}'s interpreter burns its whole
-      budget and [step] returns [Error Fuel_exhausted]. [Bump] is the
-      ordinary message that settles at once, for the ok arm. *)
-  type model = int
-
-  type msg =
-    | Bump  (** apply: model + 1, command tail settles immediately *)
-    | Spin  (** the fuel poison: its reply re-emits itself forever *)
-
-  let model_t = Repr.int
-
-  let msg_t =
-    Repr.(
-      variant "msg" (fun bump spin ->
-        function
-        | Bump -> bump
-        | Spin -> spin)
-      |~ case0 "Bump" Bump
-      |~ case0 "Spin" Spin
-      |> sealv)
-
-  let init = (0, Cmd.none)
-
-  let update (_ : Crdt.Ctx.t) (msg : msg) (m : model) =
-    match msg with
-    | Bump -> (m + 1, Cmd.none)
-    | Spin -> (m, Cmd.emit Spin)
-
-  let view (m : model) = Html.text (string_of_int m)
-  let subscriptions (_ : model) = Sub.none
-  let merge = Merge.(to_spec (atomic ~eq:Int.equal))
-  let title = Prim.Title.v "fuel-probe"
-  let url_of_model (_ : model) = None
-  let msg_of_url (_ : Prim.Url.t) = None
-end
+(** [Fuel_app], the shared fuel-exhaustion fixture, one copy for this file
+    and [cancel_test]: [Spin]'s command re-emits [Spin], so the interpreter
+    burns its whole budget and [step] returns [Error Fuel_exhausted];
+    [Bump] settles at once, for the ok arm. *)
+module App = Fuel_app
 
 module _ : Tea_core.App.APP = App
 module Server = Tea_server.Make (App)

@@ -553,3 +553,46 @@ let () =
   Dg.release g ~replica:r ~tab:(tab 2) ~seq:(seq 5);
   check "release on an absent tab is a no-op and the tab still accepts any seq"
     (is_fresh (Dg.take g ~replica:r ~tab:(tab 2) ~seq:(seq 5)) ~at:5)
+
+(* --- 13. persist: a rejecting sink cannot cross the release barrier ------
+
+   The sink contract is total-return ([append] resolves [Error], never
+   rejects), but [Guard_sink.t] is a public record, so a caller-supplied
+   sink can break it. [persist] advances the floors mirror BEFORE the
+   append, so a rejection escaping [persist] would be born after that
+   advance, cross the WS release barrier, and roll the Cell back behind
+   the mirror - re-opening a seq the mirror already floors and breaking
+   the fuel arm's once-ever. [persist] therefore catches the rejection at
+   the one seam both tiers share and degrades it to the same audible
+   [Error] an honest sink returns, with the Cell untouched. *)
+
+let () =
+  let r = replica "rejecting-sink" in
+  let rejecting : Sink.t =
+    { Sink.append = (fun (_ : Sink.event) -> Lwt.fail Stdlib.Exit) }
+  in
+  let g = guard ~sink:rejecting ~floors:Dg.Floors.empty in
+  check "the seq is taken Fresh before the poisoned persist"
+    (is_fresh (Dg.take g ~replica:r ~tab:(tab 1) ~seq:(seq 1)) ~at:1);
+  let outcome =
+    Lwt_main.run
+      (Lwt.catch
+         (fun () ->
+           Lwt.map
+             (fun (res : (unit, Sink.err) result) -> `Resolved res)
+             (Dg.persist g ~replica:r ~tab:(tab 1) ~seq:(seq 1)
+                ~water:Water.bottom))
+         (fun (_ : exn) -> Lwt.return `Rejected))
+  in
+  check "a rejecting sink degrades persist to Error Io, never a rejection"
+    (match outcome with
+     | `Resolved res ->
+       Result.fold res
+         ~ok:(fun () -> false)
+         ~error:(fun (e : Sink.err) ->
+           match e with
+           | Sink.Io (_ : string) -> true
+           | Sink.Sink_closed -> false)
+     | `Rejected -> false);
+  check "the poisoned persist released nothing: the seq stays consumed"
+    (is_duplicate (Dg.take g ~replica:r ~tab:(tab 1) ~seq:(seq 1)) ~high:1)

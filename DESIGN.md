@@ -50,6 +50,8 @@ toolchain removes an entire tier lean-tea had to hand-write.
 | `test/contention_test` C1-C15, S1-S2 over four local apps (`Or_set`, a merging `Three_way`, a refusing `Three_way`, `Last_write_wins`) - the program-order interleave, distinct dots, parentage, the winning round's water, round count, the true ancestor across two rounds, both non-CRDT arms, a reap under the witness, pack close/reopen for both write arms, the coalesced append and the interrupted amend, undo as an R10b characterization, and the server seam through `?interpose` | **passes** (confirmed by mutation, except C11/C12 which are pins: see roadmap 14) |
 | `Cmd.Http_delivery` + `Cmd.http_keyed` + `Tea_rpc.Key`/`keyed_resp`/`Applied_reply_lost` + `Tea_server.Reply_cache`/`Rpc_once`/`routes_once ?on_taken` + `Tea_client.Rpc_delivery` + a second `Guard_file` journal at `<root>.guard/rpc` behind `Tea_server_pack.open_guards` + `Durable_guard ?mirror` - the RPC tier routed through the D15-D18 guard family as a second channel (server-derived floor tabs, a bounded newest-reply cache, the `Mutating` 200 enveloped), with the floors mirror bounded as the ride-along | **built, green** (roadmap step 15, D20) |
 | `test/rpc_once_test` (incl. T1's ordering arm: the keyed 200 waits for the floor's append), `test/rpc_pack_once_test` (the native B10: two lives over one pack root), `test/rpc_window_test` (the `?on_taken` two-writer checks), `test/reply_cache_test`, `test/rpc_delivery_test`, `test/rpc_journal_test`, `test/pack_guards_test` + browser B9/B10 lost-response scenarios | **passes** (confirmed by mutation: 19 ids, full dual-suite sweep) |
+| `live_session` teardown restructured (`handle_frame` never a cancellation target, sender death a `Lwt.wait`-based `died` signal raced through `Lwt.choose`) + ONE `Lwt.protected` span over `step_ws` and both `persist_taken` arms - cancellation atomicity for the take-to-ack span | **built, green** (roadmap step 16, D21) |
+| `test/cancel_test` s1-s7 - a deterministic mid-span sender death, the session promise waiting on the in-flight span, a `handle_frame` rejection releasing the taken seq for a Fresh replay that applies exactly once, an external cancel leaving a completed orphan with no ack minted, a replay raced against the still-parked orphan reading Duplicate, the fuel arm's once-ever bottom floor under cancellation, and a cancelled wrapper whose orphan then rejects still releasing for a Fresh replay | **passes** (confirmed by mutation: 7 s16 ids) |
 
 Toolchain: OCaml 5.3.0, dune 3.24, a dedicated opam switch (`irmin-tea` locally) with
 `irmin 3.11`, `dream 1.0.0~alpha8`, `repr 0.8`, `vdom 0.3`, `js_of_ocaml 6.4`.
@@ -766,7 +768,8 @@ nothing is lost.
 >   before and the inversion the D16/D18 family exists to prevent - a durable
 >   floor raised for an apply that was refused - is unrepresentable rather than
 >   handled. See §10 R10 for why a `Contended` refusal with a retry budget is
->   unsafe upstream of any floor, and R10d for the fate this does not close.
+>   unsafe upstream of any floor, and R10d for the fate this does not close
+>   (**closed in step 16**, D21).
 >
 > One door serves both the whole-blob and the exploded arms on the based path
 > (`S.Commit.v` + `S.Head.test_and_set`, layering onto `S.Commit.tree` of the
@@ -837,7 +840,11 @@ nothing is lost.
 >   the high water still being exactly the taken seq), leaves the Pending
 >   marker standing for racing duplicates, and answers 500 for the client's
 >   5xx retry arm to re-send - toward the visible duplicate, never silent
->   loss (R27).
+>   loss (R27). Step 16 mirrors this barrier in the WS pump's `Fresh` arm
+>   (D21), with one placement the keyed tier does not need: the WS catch
+>   sits INSIDE the `Lwt.protected` body, so it only ever sees
+>   body-originated exceptions and can never release while the protected
+>   orphan may yet persist the floor.
 > - **D20.3 - two journals, no `Floors.split`.** The RPC channel opens its
 >   own `Guard_file` at `<root>.guard/rpc`: caps and compaction are per
 >   channel, and each boot filter runs per journal against one shared
@@ -919,6 +926,176 @@ nothing is lost.
 > and boot filter (R20 recursed). Recorded as a conditional obligation of
 > that future step, never as a binding invariant of the current split
 > architecture.
+
+> **D21 - cancellation atomicity: the take-to-ack span outlives its socket
+> (roadmap step 16, R10d).** The pump's span - admit, `step_ws`,
+> `persist_taken`, ack - consumes the sequence number synchronously at its
+> head, and the guard outlives the socket. A cancellation landing anywhere
+> inside that span therefore left the seq consumed, the effect unapplied and
+> no floor persisted, so the reconnect's replay read `Duplicate` and was
+> acked without applying: window W1, the silent loss the whole D15-D18
+> family exists to forbid. And the old teardown manufactured exactly that
+> cancellation itself: `live_session` ended in `Lwt.finalize (fun () ->
+> Lwt.pick [ sender; pump ]) unwatch`, so a send failure cancelled the pump
+> mid-span.
+>
+> Two cancellation sources, two mechanisms. The **internal** one is closed
+> by construction: the per-frame body now lives in `handle_frame`, never an
+> element of any `Lwt.pick`/`Lwt.choose` list and never a `Lwt.cancel`
+> target. The sender's promise is bound as `drained`, never raced, and
+> joined by teardown; its death
+> is a `Lwt.wait`-based one-shot `died` signal, fired in the sender's own
+> catch arm - at most once, because `iter_s`'s promise rejects at most once
+> - and a `wait` promise is not cancelable, so no cancellation search can
+> reject it. The pump waits for next-frame-versus-died through `Lwt.choose`,
+> which never cancels the losing branch: a hung `receive_frame` cannot block
+> death detection, and death detection cannot cancel a receive. A
+> `Lwt.state` pre-check on `died` makes the between-frames observation
+> deterministic: `choose` picks uniformly at random among candidates that
+> are ALREADY resolved, so a death that fired during the previous span,
+> raced against a pipelining client's already-available frame, would
+> otherwise be a coin flip. With the pre-check, `choose` only ever starts
+> on two pending promises, and a frame that loses to `died` there is
+> abandoned unread - the client retransmits on reconnect and the guard
+> adjudicates the replay as usual. The `died` arm of that choose is minted
+> once, above the recursion: a per-iteration `Lwt.map` would register one
+> more permanent waiter on the pending `died` every frame - a leak that
+> grows for the life of a healthy session - while `choose`'s own waiters
+> are removable and cleaned up as each round settles. The
+> wait-for-the-in-flight-frame property costs nothing: the recursive bind
+> chain already forwards it, so the session's promise cannot settle while a
+> `handle_frame` is still running - pinned rather than assumed (s2).
+>
+> The **external** source - a caller cancelling the promise `live_session`
+> returned - is stopped by ONE `Lwt.protected` body covering `step_ws` and
+> BOTH `persist_taken` arms, the success floor and the fuel-exhaustion
+> bottom floor. The backwards cancellation search stops at the wrapper: the
+> wrapper rejects `Canceled`, the body runs to natural completion as an
+> orphan, and no ack is ever minted for it, so a torn window lands at worst
+> in W2's already-licensed visible-duplicate shape. `protected` and not
+> `no_cancel`, deliberately: under `no_cancel` the outer bind survives and
+> the continuation RUNS, so the pump would recurse past the death of its own
+> socket; under `protected` the outer chain rejects immediately and the
+> recursion is unreachable. Two Lwt truths bound the claim rather than
+> break it: a cancel landing in the callback-deferral window after the
+> body already resolved is a no-op (cancellation is advisory; the session
+> lives on as if the cancel came a frame later), and the catch's default
+> filter passes runtime exceptions (`Out_of_memory`, `Stack_overflow`)
+> through without the release. The fuel arm's once-ever contract now holds
+> under cancellation too: the orphan finishes `Loop.step`, observes
+> `Fuel_exhausted`, and persists the bottom floor.
+>
+> The third closure (rounds 2-3) is the REJECTION door. `protected` only
+> converts a cancellation into a completing orphan; a rejection of the
+> span's own body - the app's `update`, the commit door's I/O - propagated
+> with the seq already consumed by the synchronous take and no floor
+> persisted, so the reconnect replay read `Duplicate` and was acked without
+> applying: W1 through another door, and the very hazard the keyed HTTP
+> tier already closed with the R27 barrier. An `Lwt.catch` INSIDE the
+> protected body mirrors R27: a rejection runs `Durable_guard.release`
+> (conditional on the high water still being exactly the taken seq) and
+> re-fails, so the replay reads `Fresh` and re-applies - if the body
+> half-landed before rejecting, that is a visible convergent duplicate, the
+> licensed direction. The discrimination the barrier needs - release only
+> when the body is dead, never while a live orphan may yet persist the
+> floor - is POSITIONAL, not a match on the exception value: `protected`
+> never rejects its body, so the wrapper's cancel never reaches the catch,
+> and every exception the catch does see is body-originated, making the
+> release unconditionally its compensation. Round 2 seated the catch
+> OUTSIDE `protected` and matched on `Canceled`, and that shape had two
+> holes: a body that rejected AFTER the wrapper was cancelled re-failed
+> into an already-settled promise, so the rejection was dropped before any
+> release ran (cancel-then-orphan-rejects: W1 again), and a body-internal
+> `Canceled` - a third party cancelling something inside the span, with no
+> orphan behind it - was misread as orphan-alive and never released.
+> Inside the body both close: the orphan's own catch releases before the
+> re-fail is dropped, and a body-internal `Canceled` is a dead body like
+> any other. R27's HTTP path has no orphan, so it needs no such
+> positioning.
+>
+> The sink seam is totalized in the same spirit: `Durable_guard.persist`
+> advances the floors mirror BEFORE its append, so a caller-supplied sink
+> that REJECTED the append promise (the contract says resolve `Error`)
+> would carry a rejection born after the mirror advance across the release
+> barrier and roll the Cell back behind the mirror - re-opening a seq the
+> mirror already floors and, on the fuel arm, breaking once-ever.
+> `persist` catches the rejection at the one seam both tiers share and
+> degrades it to the same audible `Error` an honest sink returns
+> (durable_guard_test §13).
+>
+> Teardown is unconditional on WHY the pump settled, and its order is
+> load-bearing: `unwatch` first, so no NEW watch callback can be dispatched
+> after the stream closes. An already-in-flight delivery is not joined: one
+> that read the registration before `unwatch` removed it can still push
+> against the closed stream, where the push rejects and irmin's own protect
+> logs it - the frame had nowhere to go either way, so the guarantee is "no
+> frame is silently minted after teardown", never "no callback runs". Then
+> `push None`, and the cleanup BINDS the sender's drain promise: closing
+> the stream is what lets the backgrounded `iter_s` finish the queue and
+> terminate, and awaiting it is what puts the last ack of a promptly-closed
+> session on the wire before the session promise settles and the socket can
+> be closed over it - a sender that already died resolved its own promise
+> in its catch arm, so the bind never parks on a dead peer. An inner
+> `finalize` keeps the close unconditional even when `unwatch` itself
+> rejects. The span's guarantee keeps the three-case family form:
+> exactly-once (applied, floored, acked), a licensed visible convergent
+> duplicate, or the fuel arm's once-ever attempted-with-no-claim floor -
+> never a silently consumed-but-unapplied sequence number.
+>
+> The wording is deliberately narrower than "structurally unreachable": W1
+> is closed for the internal race by construction, for any other
+> cancellation source by the protected barrier, and for a rejection of the
+> span's own body by the release barrier. Whether Dream's own
+> WS-disconnect path cancels the promise `live_session` returns is an
+> **explicitly unconfirmed residual** - neither ruled in nor out - on the
+> same footing as the HTTP tier, where the R27 barrier already converts a
+> cancellation into a release.
+>
+> Two more residuals are DECLARED rather than closed. **The wedged-peer
+> drain**: teardown joins `drained` unconditionally, so a peer that ACKs
+> TCP but never reads - a held-open zero window - parks `send_frame`
+> forever and the session promise with it; cancellation is not prompt.
+> Bounded in practice by the transport erroring the write (the sender's
+> catch resolves `drained` on any rejection, and a crashed peer hits the
+> TCP retransmission timeout), and left with the socket layer on purpose:
+> a grace-bounded pick over the drain would reintroduce exactly the
+> send-cancellation s16-a exists to forbid and cut the final ack of
+> slow-but-honest peers. **A Duplicate ack riding an attempt that later
+> fails**: a `Duplicate` ack issued WHILE an attempt is in flight asserts
+> "consumed" on the strength of that attempt. The triple coincidence -
+> wrapper cancelled at seq n, the client reconnects and replays n while
+> the orphan is still parked (it reads `Duplicate` and is acked without
+> applying), and the orphan then REJECTS - releases n only after the
+> client has dropped it from its outbox on that ack, so the effect never
+> lands and no retransmission is coming. The late release itself is safe
+> (conditional on the water still being exactly n); closing the window
+> needs Duplicate acks to PARK on the in-flight attempt - per-key
+> in-flight tracking in the guard, a different step.
+>
+> `test/cancel_test` pins all of it (s1-s7, 41 checks). The deterministic W1
+> reproduction arms the transport's kill gate BEFORE the session opens, so
+> the sender parks mid-send on the session's own Hello frame; `?interpose`
+> then wakes the gate from inside the take-to-ack window, the parked send
+> rejects, and the sender dies exactly where W1 lived - the checks read that
+> the edit still landed exactly once, the floor persisted before the session
+> settled, and the reconnect replay was acked with the edit already applied.
+> Seven mutations (s16-a..e: the original pick race restored, `protected`
+> dropped to `Fun.id`, `protected` weakened to `no_cancel`, the `died`
+> signal never fired, the fuel arm's persist dropped; s16-f: the rejection
+> barrier's release dropped, killed by s3's reconnect ladder reading a
+> Duplicate-acked-without-apply; and round 3's s16-g: the round-2
+> `Canceled` arm reintroduced inside the inner catch, killed by s7's
+> rejected-orphan ladder - the released seq must replay as Fresh and apply
+> exactly once, where the mutant leaves it consumed and the replay is
+> Duplicate-acked with nothing applied; s6's parked-orphan ladder guards
+> the converse direction, a release firing while the orphan still owns the
+> seq), every one red. Two seams are excluded by
+> declaration rather than given a fake killer: dropping teardown's
+> `push None` merely parks the ended session's sender forever on a
+> never-closed stream, and dropping `unwatch` is swallowed at the same
+> seam, because the closed stream rejects the orphan callback's push and
+> irmin logs it - each a defect with no observable at the public seam,
+> named in cancel_test s3 so its check is not mistaken for coverage.
 
 ## 8. Shared RPC contract - built (roadmap step 7; hardened step 8, D11/D12)
 
@@ -1180,17 +1357,33 @@ Each lean-tea private-constructor primitive → an OCaml `.mli` boundary:
   loser was erased *and* unreachable: the loser is now the committed parent, and
   the conflict reason is durable in the commit message rather than on a stderr
   line that dies with the process. Pinned by C8 and C9.
-- **R10d (low) - a cancelled pump promise abandons a taken sequence number.**
-  `live_session` ends in `Lwt.pick [...; pump () ]`, so a dying socket cancels
-  the pump and anything it awaits, while the `Cell` has already consumed the
-  sequence number into a guard that outlives the socket: the reconnect's replay
-  reads `Duplicate` and is acked without applying. This is loss, it exists today
-  at every await inside the step (`fx.sleep`, every store IO), and D19 changes
-  the width of that window without changing its kind. Its fix is cancellation
-  atomicity around the take-to-floor span, which interacts with `Lwt.finalize`'s
-  unwatch and with the fuel arm's once-ever contract, and needs a cancellation
-  seam that does not exist. Named here rather than claimed away: D19 closes the
-  interleaving-writer loss, it does not make loss unrepresentable.
+- **R10d (CLOSED in step 16, D21) - a cancelled pump promise abandons a taken
+  sequence number.** `live_session` ended in `Lwt.pick [...; pump () ]`, so a
+  dying socket cancelled the pump and anything it awaited, while the `Cell` had
+  already consumed the sequence number into a guard that outlives the socket:
+  the reconnect's replay read `Duplicate` and was acked without applying -
+  window W1, silent loss, live at every await inside the step. Step 16 closes
+  W1 at every door, and the wording is deliberately narrower than "structurally
+  unreachable". The internal sender-vs-pump race is closed **by construction**:
+  the per-frame body now lives in `handle_frame`, never an element of any
+  `Lwt.pick`/`Lwt.choose` list, and sender death is a `Lwt.wait`-based `died`
+  signal raced against the next frame through `Lwt.choose`, which never cancels
+  the losing branch. Any other cancellation source reaching the take-to-ack
+  span is stopped **by the `Lwt.protected` barrier**: the span runs to natural
+  completion as an orphan, no ack is minted for it, and a torn window lands in
+  W2's already-licensed visible-duplicate shape - never in W1. And a rejection
+  of the span's own body is compensated **by the R27-mirror release barrier**,
+  seated INSIDE the protected body (round 3): `protected` never rejects its
+  body, so every exception the catch sees is body-originated and the release
+  is unconditionally correct - the still-running orphan is protected by
+  position (the wrapper's cancel never reaches the catch), not by a match on
+  `Canceled`. What remains
+  open, explicitly unconfirmed rather than ruled out: whether Dream's own
+  WS-disconnect path cancels the promise `live_session` returns, on the same
+  footing as the HTTP-tier residual, where the R27 barrier already converts a
+  cancellation into a release; plus two declared residuals, the wedged-peer
+  drain and the Duplicate-ack-riding-a-failing-attempt window (§7 D21).
+  Pinned by `test/cancel_test` s1-s7 and seven s16 mutations (§7 D21).
 - **R10e (low) - per-socket liveness under sustained fan-in.** A denied round
   certifies that the *system* progressed, not that this socket will. The
   reconcile loop is unbounded on purpose (every loss-free exhaustion arm is
@@ -1710,7 +1903,8 @@ Each lean-tea private-constructor primitive → an OCaml `.mli` boundary:
     never toward silent loss - therefore forbids the obvious `Contended` retry
     budget outright.
 
-    Left open, deliberately: R10b, R10c, R10d and R10e (§10) - unguarded
+    Left open, deliberately: R10b, R10c, R10d and R10e (§10; R10d since
+    **closed in step 16**, D21) - unguarded
     `undo`/`redo`/`fork` head moves, the non-CRDT arms keeping content only for
     the already-acked writer, the pre-existing cancellation loss, and
     per-socket liveness plus the unreferenced commits a lost round leaves in a
@@ -1804,3 +1998,71 @@ Each lean-tea private-constructor primitive → an OCaml `.mli` boundary:
     `('ok, 'err) result`-shaped `'resp`; the mem tier keeps only the
     in-process sentence; and keyless or cookieless callers keep today's
     at-most-once semantics by stated precondition.
+
+16. **Cancellation atomicity** - close R10d's W1 window, so a dying socket
+    can no longer abandon a taken sequence number (R10d, D21). **Done**
+    (`live_session`'s teardown restructured: the per-frame body extracted
+    into `handle_frame`, never an element of any `Lwt.pick`/`Lwt.choose`
+    list and never a `Lwt.cancel` target; the sender's promise bound as
+    `drained` - never raced, joined by teardown - and its death turned
+    into a `Lwt.wait`-based one-shot
+    `died` signal, raced against the next frame through `Lwt.choose`, which
+    never cancels the losing branch, so a hung `receive_frame` cannot block
+    death detection and death detection cannot cancel a receive; ONE
+    `Lwt.protected` body over `step_ws` and BOTH `persist_taken` arms, so
+    an external cancellation rejects only the wrapper while the span
+    completes as an orphan with no ack minted - a torn window lands in W2's
+    licensed visible-duplicate shape, never in W1 - and `protected` rather
+    than `no_cancel`, because `no_cancel` would let the pump recurse past
+    the death of its own socket; the fuel arm's once-ever bottom floor
+    preserved under cancellation; an `Lwt.catch` rejection barrier
+    mirroring the HTTP tier's R27, seated INSIDE the protected body
+    (round 3) - `protected` never rejects its body, so every exception
+    the catch sees is body-originated and it releases the taken seq
+    unconditionally before re-failing, the replay reading `Fresh` and
+    re-applying, while the wrapper's cancel never reaches the catch at
+    all; the `died` choose arm minted once above the recursion, so a
+    healthy session leaks no per-frame waiter; the pump
+    pre-checks `Lwt.state died`, so the between-frames death observation
+    is deterministic rather than a coin flip against a pipelining
+    client's already-resolved frame; teardown unconditional and ordered,
+    `unwatch` then `push None` under an inner `finalize`, with the
+    sender's drain promise BOUND so the final ack is on the wire before
+    the session promise settles;
+    `test/cancel_test` s1-s7, 41 checks, with the deterministic W1
+    reproduction arming the transport's kill gate before the session opens
+    so the sender parks mid-send on the Hello frame and `?interpose` wakes
+    the gate inside the take-to-ack window; seven mutations s16-a..g,
+    every one red against the 41-check baseline - the original pick race
+    restored, `protected` dropped to `Fun.id`, `protected` weakened to
+    `no_cancel`, the `died` signal never fired, the fuel arm's persist
+    dropped, the rejection barrier's release dropped (s16-f: s3's
+    reconnect ladder reads the Duplicate-acked-without-apply loss), the
+    round-2 `Canceled` arm reintroduced inside the inner catch (s16-g:
+    s7's rejected-orphan ladder, the released seq replaying as Fresh
+    and applying exactly once, with s6's parked-orphan ladder guarding
+    the converse release-too-early direction); suite baselines 1030
+    native checks across 43 executables and 89 browser checks).
+
+    Left open, deliberately: whether Dream's own WS-disconnect path cancels
+    the promise `live_session` returns is an explicitly unconfirmed
+    residual (neither ruled in nor out by the step-16 panel), on the same
+    footing as the HTTP tier, where the R27 barrier already converts a
+    cancellation into a release; a peer that ACKs TCP but never reads
+    parks the joined drain forever, so cancellation of such a session is
+    not prompt (transport liveness stays the socket layer's job - a
+    grace-bounded pick over the drain would reintroduce exactly the
+    send-cancellation s16-a forbids); a `Duplicate` ack issued while an
+    attempt is in flight rides on that attempt's success, so an attempt
+    that fails after such an ack is a recorded loss window whose closure
+    needs per-key in-flight parking of duplicate acks (a later step);
+    teardown's `push None` and the `unwatch`
+    line have no killing mutation by declaration - dropping `push None`
+    parks the ended session's sender forever on a
+    never-closed stream, and a dropped `unwatch` is swallowed by the
+    closed stream rejecting the orphan callback's push, each a defect
+    with no observable at the public seam; and the closure wording stays
+    narrower than "structurally unreachable" on purpose - W1 is closed
+    for the internal sender-vs-pump race by construction, for any other
+    cancellation source by the protected barrier, and for a rejection of
+    the span's own body by the release barrier, nothing more.

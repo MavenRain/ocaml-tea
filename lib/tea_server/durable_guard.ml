@@ -308,7 +308,10 @@ let take (t : t) ~(replica : Tea_core.Crdt.Replica.t)
 
 (* Cell-only, deliberately: release exists precisely because the failure
    arrived BEFORE [persist], so the mirror and the journal have nothing to
-   unwind. The conditionality lives in [Replay_guard.release]. *)
+   unwind - a premise [persist] now enforces rather than hopes for, by
+   catching a (contract-violating) rejecting sink so no rejection born
+   after its mirror advance can reach a release barrier. The
+   conditionality lives in [Replay_guard.release]. *)
 let release (t : t) ~(replica : Tea_core.Crdt.Replica.t)
     ~(tab : Tea_core.Prim.Tab_id.t) ~(seq : Msg_seq.t) : unit =
   Replay_guard.Cell.release t.cell ~replica ~tab ~seq
@@ -322,7 +325,19 @@ let persist (t : t) ~(replica : Tea_core.Crdt.Replica.t)
      water. The raise enforces the cap in the same step, so the mirror is
      bounded at its only growth point. *)
   t.floors <- Floors.cap ~bound:t.mirror (Floors.apply t.floors e);
-  t.sink.Guard_sink.append e
+  (* The sink contract is total-return: [append] resolves [Error], never
+     rejects. [Guard_sink.t] is a public record, so a caller-supplied sink
+     can break that anyway - and a rejection escaping [persist] would be
+     born AFTER the mirror line above advanced, cross the WS release
+     barrier, and roll the Cell back behind the mirror: a desync that
+     re-opens a seq the mirror already floors and, on the fuel arm, breaks
+     once-ever. Caught here, at the one seam both tiers share, a rejecting
+     sink degrades to the same audible [Error] the honest sinks already
+     return. *)
+  Lwt.catch
+    (fun () -> t.sink.Guard_sink.append e)
+    (fun (exn : exn) ->
+      Lwt.return (Error (Guard_sink.Io (Printexc.to_string exn))))
 
 let forget (t : t) ~(replica : Tea_core.Crdt.Replica.t) :
     (unit, Guard_sink.err) result Lwt.t =

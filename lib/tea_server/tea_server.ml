@@ -306,89 +306,248 @@ struct
             (fun seq -> (tab, Durable_guard.take guard ~replica ~tab ~seq))
             (Tea_core.Prim.Msg_seq.of_int seq))
     in
-    let rec pump () =
-      let* frame = t.receive_frame () in
-      match frame with
-      | None -> Lwt.return_unit
-      | Some json ->
-        Result.fold (Codec.up_of_json json)
-          ~ok:(fun (Tea_core.Wire.Apply { tab; seq; msg }) ->
-            (* [~none:] is eager, and deliberately a value with no effect here:
-               a resolved promise constant, so evaluating it always is free.
-               An unreadable delivery header ends the session, exactly as an
-               undecodable frame does — it is the same protocol break. *)
-            Option.fold ~none:Lwt.return_unit
-              ~some:(fun
-                  ((tab, v) : Tea_core.Prim.Tab_id.t * Replay_guard.verdict) ->
-                (* Record "taken" durably (D16). The write happens after the
-                   apply attempt and before the acknowledgement, so a crash
-                   between the two replays as a visible duplicate, never a
-                   loss. A failed append degrades the same direction: one
-                   audible line, then carry on under step-10 in-memory
-                   semantics — never end the session over durability. *)
-                let persist_taken ~(water : Prim.Store_water.t)
-                    (n : Tea_core.Prim.Msg_seq.t) : unit Lwt.t =
-                  let* persisted =
-                    Durable_guard.persist guard ~replica ~tab ~seq:n ~water
-                  in
-                  Result.fold persisted ~ok:Lwt.return
-                    ~error:(fun (e : Guard_sink.err) ->
-                      let reason =
-                        match e with
-                        | Guard_sink.Sink_closed -> "sink closed"
-                        | Guard_sink.Io io -> io
-                      in
-                      Printf.eprintf
-                        "tea_server: guard persist failed (%s); continuing at-least-once\n%!"
-                        reason;
-                      Lwt.return_unit)
-                in
-                match v with
-                (* Consume-before-apply is structural, not a convention:
-                   [Cell.take] is synchronous and there is no Lwt yield point
-                   between deciding a seq is fresh and recording it, so two live
-                   sockets for one tab cannot both see it as fresh. It also
-                   means the high water records "this seq was taken", not "this
-                   seq was applied", so a message whose update exhausts fuel is
-                   attempted exactly once instead of killing the session on
-                   every reconnect forever. *)
-                | Replay_guard.Fresh n ->
-                  let* stepped = step_ws s msg in
-                  Result.fold stepped
-                    (* The floor's witness is the water THIS step's commit
-                       returned, never a head read: a head read after the
-                       commit could belong to a later writer, and a floor
-                       claiming a state it did not de-duplicate against is a
-                       forged witness. *)
-                    ~ok:(fun (o : step_outcome) ->
-                      let* () = persist_taken ~water:o.water n in
-                      ack n;
-                      pump ())
-                    (* Fuel exhaustion still ends the session, but the taken
-                       record is persisted first: the high water means
-                       "attempted", so a fuel-poison msg is attempted once per
-                       guard lifetime — now once ever, not once per restart.
-                       Nothing was committed, so there is no store state this
-                       floor de-duplicates against: bottom, "no claim",
-                       explicitly. *)
-                    ~error:(fun (Loop.Fuel_exhausted : Loop.err) ->
-                      persist_taken ~water:Prim.Store_water.bottom n)
-                | Replay_guard.Duplicate n ->
-                  (* Acknowledge without applying. An unacknowledged duplicate
-                     is a replay loop that never terminates. *)
-                  ack n;
-                  pump ()
-                | Replay_guard.Gapped ->
-                  (* Ignore it, and do NOT end the session: ending it would hand
-                     a same-session tab a socket-kill primitive against its
-                     sibling. An honest client cannot produce a gap. *)
-                  pump ())
-              (admit ~tab ~seq))
-          ~error:(fun (Codec.Decode_failed (_ : string)) -> Lwt.return_unit)
+    (* Cancellation atomicity (R10d, D21). Two distinct cancellation sources
+       could once land inside the take-to-ack span (admit, [step_ws],
+       [persist_taken], [ack]), and each is closed by its own mechanism. The
+       internal one was the teardown's own [Lwt.pick], which raced the WHOLE
+       pump against the send loop: a send failure cancelled the pump mid
+       [step_ws], leaving the seq consumed, the effect unapplied and no floor
+       persisted, so the reconnect replay read [Duplicate] and the message was
+       acked without ever applying (window W1: silent loss). That source is
+       closed by construction: the per-frame body now lives in [handle_frame],
+       which is never an element of any [Lwt.pick]/[Lwt.choose] list and never
+       a [Lwt.cancel] target, and the sender's death is observed only between
+       frames. The external source, a caller cancelling the promise
+       [live_session] returned, is stopped by the [Lwt.protected] barrier
+       inside the [Fresh] arm. The span therefore keeps the three-case family
+       form: exactly-once (applied, floored, acked), a licensed visible
+       convergent duplicate, or the fuel arm's once-ever
+       attempted-with-no-claim floor, never a silently consumed-but-unapplied
+       sequence number. *)
+    (* The sender runs beside the pump - bound as [drained], joined by
+       teardown, never raced. [died] is the one-shot signal
+       that the send side failed. A [wait] promise is not cancelable, so no
+       cancellation search can ever reject it; and [mark_died] fires at most
+       once, because [iter_s]'s promise rejects at most once and the
+       [Lwt.catch] handler below therefore runs at most once, which is what
+       keeps [wakeup_later] away from its double-resolve failure mode. *)
+    let died, mark_died = Lwt.wait () in
+    let sender () =
+      Lwt.catch
+        (fun () -> Lwt_stream.iter_s t.send_frame frames)
+        (fun (exn : exn) ->
+          Printf.eprintf
+            "tea_server: live_session send failed (%s); ending the pump\n%!"
+            (Printexc.to_string exn);
+          Lwt.wakeup_later mark_died ();
+          Lwt.return_unit)
     in
+    (* [died_arm] is minted ONCE, above the recursion: a per-iteration
+       [Lwt.map] would register one more permanent waiter on the pending
+       [died] every frame - a leak that grows for the whole life of a healthy
+       session. [choose]'s own waiters are removable and are cleaned up when
+       each choose settles; a [map]'s waiter is not. *)
+    let died_arm = Lwt.map (fun () -> `Died) died in
+    let rec pump () =
+      (* The only race left in the session: wait-for-next-frame against
+         observe-the-sender's-death. [Lwt.choose], unlike [Lwt.pick], never
+         cancels the losing branch, so a hung [receive_frame] cannot block
+         death detection, and death detection cannot cancel a receive. The
+         [Lwt.state] check first makes the between-frames death observation
+         deterministic: [choose] picks uniformly at random among candidates
+         that are ALREADY resolved, so a death that fired during the previous
+         span, raced against a pipelining client's already-available frame,
+         would otherwise be a coin flip. With the pre-check, [choose] only
+         ever starts on two pending promises, and a frame that loses to
+         [died] there is abandoned unread; the client retransmits it on
+         reconnect and the guard adjudicates the replay as usual. *)
+      match Lwt.state died with
+      | Lwt.Return () -> Lwt.return_unit
+      | Lwt.Fail (_ : exn) -> Lwt.return_unit
+      | Lwt.Sleep ->
+        let* arrival =
+          Lwt.choose
+            [ died_arm
+            ; Lwt.map (fun frame -> `Frame frame) (t.receive_frame ())
+            ]
+        in
+        (match arrival with
+         | `Died -> Lwt.return_unit
+         | `Frame frame ->
+           Option.fold ~none:Lwt.return_unit ~some:handle_frame frame)
+    and handle_frame (json : string) : unit Lwt.t =
+      Result.fold (Codec.up_of_json json)
+        ~ok:(fun (Tea_core.Wire.Apply { tab; seq; msg }) ->
+          (* [~none:] is eager, and deliberately a value with no effect here:
+             a resolved promise constant, so evaluating it always is free.
+             An unreadable delivery header ends the session, exactly as an
+             undecodable frame does — it is the same protocol break. *)
+          Option.fold ~none:Lwt.return_unit
+            ~some:(fun
+                ((tab, v) : Tea_core.Prim.Tab_id.t * Replay_guard.verdict) ->
+              (* Record "taken" durably (D16). The write happens after the
+                 apply attempt and before the acknowledgement, so a crash
+                 between the two replays as a visible duplicate, never a
+                 loss. A failed append degrades the same direction: one
+                 audible line, then carry on under step-10 in-memory
+                 semantics — never end the session over durability. *)
+              let persist_taken ~(water : Prim.Store_water.t)
+                  (n : Tea_core.Prim.Msg_seq.t) : unit Lwt.t =
+                let* persisted =
+                  Durable_guard.persist guard ~replica ~tab ~seq:n ~water
+                in
+                Result.fold persisted ~ok:Lwt.return
+                  ~error:(fun (e : Guard_sink.err) ->
+                    let reason =
+                      match e with
+                      | Guard_sink.Sink_closed -> "sink closed"
+                      | Guard_sink.Io io -> io
+                    in
+                    Printf.eprintf
+                      "tea_server: guard persist failed (%s); continuing at-least-once\n%!"
+                      reason;
+                    Lwt.return_unit)
+              in
+              match v with
+              (* Consume-before-apply is structural, not a convention:
+                 [Cell.take] is synchronous and there is no Lwt yield point
+                 between deciding a seq is fresh and recording it, so two live
+                 sockets for one tab cannot both see it as fresh. It also
+                 means the high water records "this seq was taken", not "this
+                 seq was applied", so a message whose update exhausts fuel is
+                 attempted exactly once instead of killing the session on
+                 every reconnect forever. *)
+              | Replay_guard.Fresh n ->
+                (* The protected span (R10d, D21): ONE [Lwt.protected] body
+                   covers [step_ws] and BOTH [persist_taken] arms, the
+                   success floor and the fuel-exhaustion bottom floor. If a
+                   cancellation from outside this module reaches the pump's
+                   chain, the backwards search stops at this wrapper: the
+                   wrapper rejects, but the body is not cancelled and runs to
+                   natural completion as an orphan, so a torn window lands at
+                   worst in W2's already-licensed visible-duplicate shape,
+                   and the fuel arm still persists its once-ever bottom
+                   floor. The continuation, [ack] and the recursion, is
+                   deliberately NOT under the barrier: [protected], unlike
+                   [no_cancel], lets the outer chain reject immediately, so
+                   the pump can never recurse past the death of its
+                   socket. Two Lwt truths bound that claim rather than
+                   break it: a cancel landing in the callback-deferral
+                   window after the body already resolved is a no-op - Lwt
+                   cancellation is advisory, and the session then lives on
+                   exactly as if the cancel had arrived a frame later - and
+                   [Lwt.catch]'s default filter passes runtime exceptions
+                   (Out_of_memory, Stack_overflow) through without the
+                   release, out of scope with the rest of the
+                   no-exceptions discipline.
+
+                   The [Lwt.catch] is the REJECTION barrier (R10d round 3),
+                   and it sits INSIDE the [protected] body: the position IS
+                   the discrimination. [protected] never rejects its body -
+                   a wrapper cancellation rejects only the outer promise
+                   while the body runs on as the orphan, untouched - so
+                   every exception this catch sees originated inside the
+                   body itself. A body that rejected is dead with no floor
+                   coming, and [release] is unconditionally its
+                   compensation: no match on the exception value at all.
+                   That closes both round-2 holes. A body that rejects AFTER
+                   the wrapper was cancelled releases from inside the orphan
+                   (the re-fail is then dropped by [protected]'s
+                   already-settled outer promise, which is fine - the
+                   release has already happened). A body-internal [Canceled]
+                   (a third party cancelling something inside [step_ws]; no
+                   orphan exists) is a dead body like any other, and
+                   releases. The round-2 shape - catch OUTSIDE [protected],
+                   discriminating on the exception VALUE - got both of those
+                   wrong: the orphan's late rejection was dropped before any
+                   release, and a body-internal [Canceled] was misread as
+                   orphan-alive. Mirror of the keyed HTTP tier's R27:
+                   [release] re-opens exactly [seq], so the replay reads
+                   Fresh and re-applies; if the body half-landed before
+                   rejecting, that is a visible convergent duplicate, the
+                   licensed direction. *)
+                let* (landed : (unit, unit) result) =
+                  Lwt.protected
+                    (Lwt.catch
+                       (fun () ->
+                         let* stepped = step_ws s msg in
+                         Result.fold stepped
+                           (* The floor's witness is the water THIS step's
+                              commit returned, never a head read: a head read
+                              after the commit could belong to a later
+                              writer, and a floor claiming a state it did not
+                              de-duplicate against is a forged witness. *)
+                           ~ok:(fun (o : step_outcome) ->
+                             let* () = persist_taken ~water:o.water n in
+                             Lwt.return (Ok ()))
+                           (* Fuel exhaustion still ends the session, but the
+                              taken record is persisted first: the high water
+                              means "attempted", so a fuel-poison msg is
+                              attempted once per guard lifetime — now once
+                              ever, not once per restart. Nothing was
+                              committed, so there is no store state this
+                              floor de-duplicates against: bottom, "no
+                              claim", explicitly. *)
+                           ~error:(fun (Loop.Fuel_exhausted : Loop.err) ->
+                             let* () =
+                               persist_taken ~water:Prim.Store_water.bottom n
+                             in
+                             Lwt.return (Error ())))
+                       (fun (exn : exn) ->
+                         Durable_guard.release guard ~replica ~tab ~seq:n;
+                         Printf.eprintf
+                           "tea_server: ws apply failed before persist (%s); seq released for retry\n%!"
+                           (Printexc.to_string exn);
+                         Lwt.fail exn))
+                in
+                Result.fold landed
+                  ~ok:(fun () ->
+                    ack n;
+                    pump ())
+                  ~error:(fun () -> Lwt.return_unit)
+              | Replay_guard.Duplicate n ->
+                (* Acknowledge without applying. An unacknowledged duplicate
+                   is a replay loop that never terminates. *)
+                ack n;
+                pump ()
+              | Replay_guard.Gapped ->
+                (* Ignore it, and do NOT end the session: ending it would hand
+                   a same-session tab a socket-kill primitive against its
+                   sibling. An honest client cannot produce a gap. *)
+                pump ())
+            (admit ~tab ~seq))
+        ~error:(fun (Codec.Decode_failed (_ : string)) -> Lwt.return_unit)
+    in
+    let drained = sender () in
     Lwt.finalize
-      (fun () -> Lwt.pick [ Lwt_stream.iter_s t.send_frame frames; pump () ])
-      (fun () -> St.unwatch w)
+      (fun () -> pump ())
+      (fun () ->
+        (* Teardown is unconditional on WHY the pump's promise settled:
+           [finalize]'s cleanup runs after fulfilment and after rejection
+           alike, so a [handle_frame] failure cannot skip it. Order matters
+           and is load-bearing: [unwatch] first, so no NEW watch callback can
+           be dispatched after the stream closes. An already-in-flight
+           delivery is NOT joined: one that read the registration before
+           [unwatch] removed it can still push against the closed stream,
+           where the push rejects and irmin's own protect logs it - the
+           frame had nowhere to go either way, so the guarantee is "no frame
+           is silently minted after teardown", not "no callback runs". Then
+           [push None], and the cleanup BINDS [drained]: closing the stream
+           is what lets the backgrounded sender's [iter_s] finish the queue
+           and terminate, and awaiting it here is what makes "the sender
+           drains" true rather than hoped - the last ack of a
+           promptly-closed session is on the wire before the session promise
+           settles and the socket can be closed over it. A sender that
+           already died resolved [drained] in its own catch arm, so this
+           bind never parks on a dead peer. The inner [finalize] keeps the
+           close unconditional even when [unwatch] itself rejects, while
+           still letting that rejection propagate, exactly as it did
+           before. *)
+        Lwt.finalize
+          (fun () -> St.unwatch w)
+          (fun () ->
+            push None;
+            drained))
 
   (* Cross-site WebSocket hijacking gate. The full CSWSH rationale now lives on
      [Tea_safe.Origin_gate]'s doc in tea_safe.mli; [accept_ws] is the only
