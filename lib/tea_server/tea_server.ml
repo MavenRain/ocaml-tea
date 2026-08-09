@@ -30,6 +30,12 @@ module Durable_guard = Durable_guard
     instead of racing for it. *)
 module Reply_cache = Reply_cache
 
+(** The duplicate-ack parking registry (roadmap step 17, D22), re-exported for
+    the same reason as {!Replay_guard}: a test hands [live_session] an isolated
+    table beside its isolated guard, and reads [parked_count] as the positive
+    witness that a replay parked rather than raced. *)
+module Ack_park = Ack_park
+
 (** Where a browser's identity lives and for how long (roadmap step 12, D17),
     re-exported for the same reason: the session id names the Irmin branch and
     {i is} the CRDT replica id, so choosing a back end is choosing how long a
@@ -261,7 +267,17 @@ struct
       ~tabs:Replay_guard.default_tabs ~sink:Guard_sink.null
       ~floors:Durable_guard.Floors.empty ()
 
+  (* One parking registry per functor application, process-lifetime, for the
+     same reason as [guard]: the duplicate that parks arrives on a DIFFERENT
+     socket from the attempt it parks on, so a per-session registry could
+     never pair them. In-process only, deliberately (D22): a process death
+     loses the registry and every in-flight attempt together, and the durable
+     floor then adjudicates the replay on its own. [?park] is for tests,
+     which want an isolated table beside their isolated [?guard]. *)
+  let park : Ack_park.t = Ack_park.create ()
+
   let live_session ?(coalesce = Tea_core.Coalesce_spec.Keep_all) ?(guard = guard)
+      ?(park = park)
       ?(interpose : unit -> unit Lwt.t = fun () -> Lwt.return_unit) (s : St.session)
       (t : live_transport) : unit Lwt.t =
     (* One coalescer per socket (R1): a chatty client folds its own run of
@@ -348,6 +364,11 @@ struct
        session. [choose]'s own waiters are removable and are cleaned up when
        each choose settles; a [map]'s waiter is not. *)
     let died_arm = Lwt.map (fun () -> `Died) died in
+    (* The park's own death arm (step 17, D22), minted ONCE for the same
+       leak reason as [died_arm] and separately from it: the two [choose]
+       sites close the arm over different variant rows, so one shared arm
+       cannot type at both. *)
+    let died_park_arm = Lwt.map (fun () -> `Died) died in
     let rec pump () =
       (* The only race left in the session: wait-for-next-frame against
          observe-the-sender's-death. [Lwt.choose], unlike [Lwt.pick], never
@@ -466,6 +487,18 @@ struct
                    Fresh and re-applies; if the body half-landed before
                    rejecting, that is a visible convergent duplicate, the
                    licensed direction. *)
+                (* Open the parking row in the same continuation as the
+                   [Fresh] verdict (step 17, D22): no Lwt yield separates
+                   [Cell.take]'s consume from this registration, so a
+                   duplicate that arrives after the take can never miss the
+                   row. Every exit from the protected span below settles it -
+                   persist success, the fuel-exhaustion bottom floor, or the
+                   rejection catch (D21's three-case closure) - so a row
+                   lives exactly as long as its attempt. The returned handle
+                   keys those settles: a row minted by a LATER attempt, over
+                   a seq the guard's tab-LRU eviction re-opened, is never
+                   settled by this one (D22). *)
+                let attempt = Ack_park.register park ~replica ~tab ~seq:n in
                 let* (landed : (unit, unit) result) =
                   Lwt.protected
                     (Lwt.catch
@@ -479,6 +512,14 @@ struct
                               de-duplicate against is a forged witness. *)
                            ~ok:(fun (o : step_outcome) ->
                              let* () = persist_taken ~water:o.water n in
+                             (* Settle INSIDE the protected body, after the
+                                floor landed: the outer ack site below is
+                                dead code for the orphan (its wrapper already
+                                rejected), so a settle placed there would
+                                strand every parked waiter on exactly the
+                                F5' path. *)
+                             Ack_park.settle park ~replica ~tab ~seq:n
+                               ~handle:attempt ~outcome:Ack_park.Landed;
                              Lwt.return (Ok ()))
                            (* Fuel exhaustion still ends the session, but the
                               taken record is persisted first: the high water
@@ -492,9 +533,24 @@ struct
                              let* () =
                                persist_taken ~water:Prim.Store_water.bottom n
                              in
+                             (* [Released], not [Landed]: nothing was
+                                committed, so a parked duplicate must not be
+                                acked on this attempt's account. This path
+                                never minted an ack before either - the
+                                once-ever poison contract is unchanged. *)
+                             Ack_park.settle park ~replica ~tab ~seq:n
+                               ~handle:attempt ~outcome:Ack_park.Released;
                              Lwt.return (Error ())))
                        (fun (exn : exn) ->
                          Durable_guard.release guard ~replica ~tab ~seq:n;
+                         (* Settle AFTER the release, so a parked waiter that
+                            wakes with [Released] and provokes a client retry
+                            finds the seq already reopened: the retry reads
+                            [Fresh] and re-applies. Both calls are
+                            synchronous; [wakeup_later] defers the waiters
+                            past this whole handler regardless. *)
+                         Ack_park.settle park ~replica ~tab ~seq:n
+                           ~handle:attempt ~outcome:Ack_park.Released;
                          Printf.eprintf
                            "tea_server: ws apply failed before persist (%s); seq released for retry\n%!"
                            (Printexc.to_string exn);
@@ -506,10 +562,61 @@ struct
                     pump ())
                   ~error:(fun () -> Lwt.return_unit)
               | Replay_guard.Duplicate n ->
-                (* Acknowledge without applying. An unacknowledged duplicate
-                   is a replay loop that never terminates. *)
-                ack n;
-                pump ()
+                (* Acknowledge without applying - unless the seq's own
+                   take-to-ack attempt is still in flight (step 17, D22;
+                   F5'). The unconditional ack asserted "consumed" on the
+                   orphan's behalf: if the orphan then rejected, [release]
+                   reopened the seq, but the client had already dropped the
+                   message on this ack and no retransmission was coming -
+                   silent loss. Parking makes the ack wait for the attempt's
+                   own verdict: [Landed] lets it flow; [Released] drops it,
+                   and the client's retry reads [Fresh] after the release
+                   and re-applies. [None] - no in-flight row - is the
+                   ordinary stale replay and keeps the immediate-ack path,
+                   because an unacknowledged duplicate is a replay loop that
+                   never terminates. Both branches are [unit -> _] closures
+                   applied exactly once ([~none:] is eager). The parked wait
+                   rides its own [Lwt.protected], so THIS socket's teardown
+                   stays prompt while the shared settlement (a [wait]
+                   promise, non-cancelable) is untouched for its sibling
+                   waiters. *)
+                Ack_park.find park ~replica ~tab ~seq:n
+                |> Option.fold
+                     ~none:(fun () ->
+                       ack n;
+                       pump ())
+                     ~some:(fun (settlement : Ack_park.outcome Lwt.t) () ->
+                       (* The park is a blocking point like any other in the
+                          pump, so it keeps the pump's death-race
+                          discipline: raced against [died] through the
+                          once-minted [died_park_arm], behind the same
+                          deterministic state pre-check. A settlement that
+                          never arrives - a stalled persist, or a row
+                          superseded out from under its attempt - can then
+                          no longer wedge this socket past its sender's
+                          death and hold [finalize]'s teardown (the watch,
+                          the stream close, [drained]) hostage. [choose]
+                          never cancels the loser: the shared settlement
+                          stays untouched for its sibling waiters. *)
+                       match Lwt.state died with
+                       | Lwt.Return () -> Lwt.return_unit
+                       | Lwt.Fail (_ : exn) -> Lwt.return_unit
+                       | Lwt.Sleep ->
+                         let* arrival =
+                           Lwt.choose
+                             [ died_park_arm
+                             ; Lwt.map
+                                 (fun (o : Ack_park.outcome) -> `Settled o)
+                                 (Lwt.protected settlement)
+                             ]
+                         in
+                         (match arrival with
+                          | `Died -> Lwt.return_unit
+                          | `Settled Ack_park.Landed ->
+                            ack n;
+                            pump ()
+                          | `Settled Ack_park.Released -> pump ()))
+                |> fun step -> step ()
               | Replay_guard.Gapped ->
                 (* Ignore it, and do NOT end the session: ending it would hand
                    a same-session tab a socket-kill primitive against its
@@ -556,22 +663,23 @@ struct
      check cannot be expressed here. *)
   let accept_ws (_ : Tea_safe.Origin_gate.same_origin Tea_safe.Proof.t)
       ~(coalesce : A.msg Tea_core.Coalesce_spec.t) ~(guard : Durable_guard.t)
-      (repo : St.t) (request : Dream.request) : Dream.response Lwt.t =
+      ~(park : Ack_park.t) (repo : St.t) (request : Dream.request) :
+      Dream.response Lwt.t =
     with_session repo request (fun s ->
         Dream.websocket (fun ws ->
-            live_session ~coalesce ~guard s
+            live_session ~coalesce ~guard ~park s
               { send_frame = Dream.send ws
               ; receive_frame = (fun () -> Dream.receive ws)
               }))
 
   let handle_ws ~(coalesce : A.msg Tea_core.Coalesce_spec.t)
-      ~(guard : Durable_guard.t) (repo : St.t) (request : Dream.request) :
-      Dream.response Lwt.t =
+      ~(guard : Durable_guard.t) ~(park : Ack_park.t) (repo : St.t)
+      (request : Dream.request) : Dream.response Lwt.t =
     Tea_safe.Origin_gate.check
       ~origin:(Dream.header request "Origin")
       ~host:(Dream.header request "Host")
     |> Result.fold
-         ~ok:(fun proof -> accept_ws proof ~coalesce ~guard repo request)
+         ~ok:(fun proof -> accept_ws proof ~coalesce ~guard ~park repo request)
          ~error:(fun (d : Tea_safe.Origin_gate.denial) ->
            match d with
            | Origin_missing | Host_missing | Both_missing | Origin_mismatch ->
@@ -680,7 +788,7 @@ struct
      session cookie require. *)
   let router ?(client_dir : string option) ?(rpc : Dream.route list = [])
       ?(coalesce = Tea_core.Coalesce_spec.Keep_all) ?(guard = guard)
-      (repo : St.t) : Dream.handler =
+      ?(park = park) (repo : St.t) : Dream.handler =
     let client_routes =
       Option.fold client_dir ~none:[]
         ~some:(fun dir ->
@@ -692,7 +800,7 @@ struct
       ([ Dream.get "/" (handle_root repo)
        ; Dream.post msg_path (handle_msg repo)
        ; Dream.post undo_path (handle_undo repo)
-       ; Dream.get ws_path (handle_ws ~coalesce ~guard repo)
+       ; Dream.get ws_path (handle_ws ~coalesce ~guard ~park repo)
        ]
       @ rpc @ client_routes)
 
@@ -719,13 +827,13 @@ struct
       that this is a {i per-application} default, not a per-request one: the
       middleware is built once, when the handler is, so a caller cannot change
       back ends mid-flight and strand the branches already minted. *)
-  let handler ?client_dir ?rpc ?coalesce ?guard ?(sessions = Session_secret.memory)
-      (repo : St.t) : Dream.handler =
+  let handler ?client_dir ?rpc ?coalesce ?guard ?park
+      ?(sessions = Session_secret.memory) (repo : St.t) : Dream.handler =
     (* Sessions OUTSIDE the security headers, exactly as before: the header
        middleware decorates whatever response comes back, including the
        redirects and 403s the session layer itself can produce. *)
     Session_secret.middleware sessions
-      (secure_headers (router ?client_dir ?rpc ?coalesce ?guard repo))
+      (secure_headers (router ?client_dir ?rpc ?coalesce ?guard ?park repo))
 
   (** Blocking entry point for a native server binary. [?coalesce] is the
       app's commit-coalescing policy for live (WS) sessions; the default

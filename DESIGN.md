@@ -1046,12 +1046,13 @@ nothing is lost.
 > is closed for the internal race by construction, for any other
 > cancellation source by the protected barrier, and for a rejection of the
 > span's own body by the release barrier. Whether Dream's own
-> WS-disconnect path cancels the promise `live_session` returns is an
-> **explicitly unconfirmed residual** - neither ruled in nor out - on the
+> WS-disconnect path cancels the promise `live_session` returns was
+> source-inspected by the step-17 panel and is **provisionally ruled
+> out, not empirically confirmed** - on the
 > same footing as the HTTP tier, where the R27 barrier already converts a
 > cancellation into a release.
 >
-> Two more residuals are DECLARED rather than closed. **The wedged-peer
+> Two more residuals were DECLARED here; step 17 closes the second (D22). **The wedged-peer
 > drain**: teardown joins `drained` unconditionally, so a peer that ACKs
 > TCP but never reads - a held-open zero window - parks `send_frame`
 > forever and the session promise with it; cancellation is not prompt.
@@ -1068,9 +1069,8 @@ nothing is lost.
 > applying), and the orphan then REJECTS - releases n only after the
 > client has dropped it from its outbox on that ack, so the effect never
 > lands and no retransmission is coming. The late release itself is safe
-> (conditional on the water still being exactly n); closing the window
-> needs Duplicate acks to PARK on the in-flight attempt - per-key
-> in-flight tracking in the guard, a different step.
+> (conditional on the water still being exactly n); the window is CLOSED
+> in step 17: Duplicate acks now PARK on the in-flight attempt (D22).
 >
 > `test/cancel_test` pins all of it (s1-s7, 41 checks). The deterministic W1
 > reproduction arms the transport's kill gate BEFORE the session opens, so
@@ -1096,6 +1096,75 @@ nothing is lost.
 > seam, because the closed stream rejects the orphan callback's push and
 > irmin logs it - each a defect with no observable at the public seam,
 > named in cancel_test s3 so its check is not mistaken for coverage.
+
+> **D22 - duplicate-ack parking: a replay never acks over an in-flight
+> attempt (roadmap step 17; closes D21's declared F5' window).** The
+> `Ack_park` registry holds one open row per (replica, tab, seq) -
+> nested total maps, each row a settlement promise minted by
+> `Lwt.wait`. The Fresh arm registers the row synchronously at the
+> verdict, in the same pre-yield head that consumes the seq, so no
+> replay can observe a consumed seq without a row. A second `register`
+> over a standing row is reachable - the replay guard's tab-LRU
+> eviction can re-open a consumed seq while its first attempt is still
+> in flight (an eviction is licensed to duplicate, never to lose) - and
+> SUPERSEDES it: the new row is installed first, the old row's waiters
+> then wake `Released`, drop their ack, and their clients'
+> retransmissions park on the new attempt's row. `settle` is
+> handle-gated - `register` returns the row it opened, and a settle
+> reaches only that row - so a superseded attempt's late settle never
+> cross-wires its verdict onto the successor's waiters. Both mutators
+> write the map strictly before they wake: `wakeup_later` runs its
+> waiters inline at callback depth zero, a woken continuation may
+> re-enter the registry, and a write staged from a pre-wake snapshot
+> would clobber what it did. The span settles the
+> row at its three exits, and only there: `Landed` strictly AFTER
+> `persist_taken` resolves - step_ws succeeding locally is not enough
+> (mutant s17-g) - `Released` at the fuel arm's bottom, and `Released`
+> in the catch after the release barrier reopens the seq. The Duplicate
+> arm asks `find` for an open row under the acked number and either
+> acks immediately (no row: the attempt already settled) or parks on
+> the row's settlement through `Lwt.protected`: `Landed` fires the ack
+> on the duplicate's own socket; `Released` sends NOTHING - the client
+> still holds the message, its retransmission reads `Fresh` and is the
+> retry the release licensed. The park blocks the pump exactly as the
+> Fresh span blocks it, is raced against the sender's death exactly as
+> the pump's own frame-wait is (through a once-minted death arm behind
+> the same deterministic state pre-check: a settlement that never
+> arrives cannot hold `finalize`'s teardown hostage), and a stream end
+> is observed between frames - the parked session's teardown is bounded
+> by the attempt and by the socket's own death, whichever comes first.
+>
+> Acks are CUMULATIVE: `Duplicate` carries the high water, not the
+> replayed seq, so a below-water replay parks on the WATER's open row -
+> the ack it withholds is the water's own claim. `Lwt.wait` (not
+> `Lwt.task`) keeps the shared settlement uncancelable through any
+> single waiter: a cancelled parked socket dies alone and its sibling
+> still resolves (s13.2). The step-17 sweep pinned the wiring with 20
+> mutants, 19 killed each on its predicted checks - four pin the
+> adversarial-pass fixes: supersession's `Released` wake, the handle
+> gate, write-before-wake, and the park's death arm; s17-e
+> (`Lwt.wait` -> `Lwt.task`) is the declared survivor - masked by the
+> `Lwt.protected` wrap, and proven load-bearing by the joint s17-ef
+> mutant, which drops the wrap too and dies on s13.2. The RPC tier
+> needs no parking: the reply cache serializes the window, and T22
+> pins the duplicate-inside-a-failing-window case (503, no commit,
+> Fresh retry, exactly once). The spec's s17-i (clear the
+> `Reply_cache` `Pending` marker in the RPC exn arm) is adjudicated
+> INERT: the common-path release unconditionally re-opens the seq, so
+> the standing marker has no reachable observable; the distinguishing
+> interleave belongs to the pending_grace family the step scoped out.
+>
+> One residual is DECLARED in the window's place (R10f): cross-socket
+> out-of-order landing under cumulative acks. Socket A holds seq 1 in
+> a gated persist; socket B lands seq 2 and raises the water; a replay
+> now acks water 2 immediately - the water's own row is closed - while
+> seq 1 is still unlanded, and the water-keyed `find` never consults
+> older open rows. Pinned by `test/cancel_test` s6 (re-cut with a
+> positive parked witness) and s8-s14 (s14: a dead sender releases a
+> parked socket while the settlement stays open), `test/ack_park_test`
+> (pure registry: rows, prune, multi-waiter wake, supersession, the
+> stale-handle no-op, depth-zero reentrancy), and `rpc_window_test`
+> T22; suite baseline 1069 native checks across 44 executables.
 
 ## 8. Shared RPC contract - built (roadmap step 7; hardened step 8, D11/D12)
 
@@ -1378,12 +1447,15 @@ Each lean-tea private-constructor primitive → an OCaml `.mli` boundary:
   is unconditionally correct - the still-running orphan is protected by
   position (the wrapper's cancel never reaches the catch), not by a match on
   `Canceled`. What remains
-  open, explicitly unconfirmed rather than ruled out: whether Dream's own
-  WS-disconnect path cancels the promise `live_session` returns, on the same
-  footing as the HTTP-tier residual, where the R27 barrier already converts a
-  cancellation into a release; plus two declared residuals, the wedged-peer
-  drain and the Duplicate-ack-riding-a-failing-attempt window (§7 D21).
-  Pinned by `test/cancel_test` s1-s7 and seven s16 mutations (§7 D21).
+  open: whether Dream's own WS-disconnect path cancels the promise
+  `live_session` returns - source-inspected by the step-17 panel,
+  provisionally ruled out, not empirically confirmed - on the same footing
+  as the HTTP-tier residual, where the R27 barrier already converts a
+  cancellation into a release; plus the wedged-peer drain (§7 D21). The
+  Duplicate-ack-riding-a-failing-attempt window is CLOSED in step 17 by
+  per-key parking (§7 D22), and R10f is declared in its place.
+  Pinned by `test/cancel_test` s1-s14, seven s16 mutations, and the
+  step-17 roster (§7 D21/D22).
 - **R10e (low) - per-socket liveness under sustained fan-in.** A denied round
   certifies that the *system* progressed, not that this socket will. The
   reconcile loop is unbounded on purpose (every loss-free exhaustion arm is
@@ -1392,6 +1464,16 @@ Each lean-tea private-constructor primitive → an OCaml `.mli` boundary:
   eight rounds. A lost round also leaves an unreferenced commit and tree, and
   this repo has no GC wired; `commit_coalesced` already orphans commits, and D19
   makes the rate proportional to contention.
+- **R10f (low, declared in step 17, D22) - cross-socket out-of-order landing
+  under cumulative acks.** `Duplicate` carries the high water, so a replay
+  arriving after a younger socket lands seq n+1 is acked with water n+1 even
+  while an older socket still holds seq n un-landed in a gated persist: the
+  water-keyed `find` sees the water's row settled and never consults older
+  open rows. The ack claims the water, and the D16 contract reads per-seq.
+  Closing it needs the Duplicate arm to park on the OLDEST open row at or
+  below the water - a scan the current per-key `find` deliberately does not
+  do. Declared, not closed; the single-socket window D22 closes is the one
+  step 17 targeted.
 - **R8 (low) - a `Read_only` RPC endpoint whose handler writes the store.** The
   `Tea_rpc.endpoint_kind` witness is what the server gates on, and it is a
   *declaration*: the type system forces every endpoint to carry one (no
@@ -2045,8 +2127,8 @@ Each lean-tea private-constructor primitive → an OCaml `.mli` boundary:
     native checks across 43 executables and 89 browser checks).
 
     Left open, deliberately: whether Dream's own WS-disconnect path cancels
-    the promise `live_session` returns is an explicitly unconfirmed
-    residual (neither ruled in nor out by the step-16 panel), on the same
+    the promise `live_session` returns was source-inspected by the step-17
+    panel and is provisionally ruled out (not empirically confirmed), on the same
     footing as the HTTP tier, where the R27 barrier already converts a
     cancellation into a release; a peer that ACKs TCP but never reads
     parks the joined drain forever, so cancellation of such a session is
@@ -2055,7 +2137,7 @@ Each lean-tea private-constructor primitive → an OCaml `.mli` boundary:
     send-cancellation s16-a forbids); a `Duplicate` ack issued while an
     attempt is in flight rides on that attempt's success, so an attempt
     that fails after such an ack is a recorded loss window whose closure
-    needs per-key in-flight parking of duplicate acks (a later step);
+    needs per-key in-flight parking of duplicate acks (closed in step 17);
     teardown's `push None` and the `unwatch`
     line have no killing mutation by declaration - dropping `push None`
     parks the ended session's sender forever on a
@@ -2066,3 +2148,35 @@ Each lean-tea private-constructor primitive → an OCaml `.mli` boundary:
     for the internal sender-vs-pump race by construction, for any other
     cancellation source by the protected barrier, and for a rejection of
     the span's own body by the release barrier, nothing more.
+
+17. **Duplicate-ack parking** - close D21's declared
+    Duplicate-ack-riding-a-failing-attempt window, so a replayed seq is
+    never acked on the strength of an attempt that can still fail (D22;
+    R10f declared in its place). **Done** (`Ack_park` registry: one row
+    per (replica, tab, seq), minted by `Lwt.wait`; the Fresh arm
+    registers synchronously at the verdict, the span settles at its three
+    exits - `Landed` only after `persist_taken` resolves, `Released` at
+    the fuel bottom and in the catch after the release barrier; the
+    Duplicate arm parks through `Lwt.protected` on the open row under the
+    acked WATER - acks are cumulative, so a below-water replay parks on
+    the water's attempt - acking on `Landed`, silent on `Released`, the
+    client's retransmission licensing the Fresh retry; `Lwt.wait` keeps
+    the shared settlement uncancelable through any single waiter, so a
+    cancelled parked socket dies alone (s13.2), and the park is raced
+    against the sender's death, so a settlement that never arrives
+    cannot wedge the teardown past a dead sender (s14). A second
+    register over a standing row - the replay guard's tab-LRU eviction
+    can re-open a consumed seq mid-flight - supersedes it (old waiters
+    wake Released), the handle-gated settle keeps a superseded
+    attempt's late verdict off the successor's waiters, and both
+    mutators write the map before they wake (depth-zero reentrancy).
+    The RPC tier needs no
+    parking - the reply cache serializes the window - and T22 pins the
+    duplicate-inside-a-failing-window case. The spec's s17-i
+    (`Reply_cache` `Pending` clearing) adjudicated INERT: the common-path
+    release unconditionally re-opens the seq. Pinned by cancel_test's s6
+    re-cut + s8-s14, pure ack_park_test (12 checks), T22, and a
+    20-mutant sweep: 19 killed on their predicted checks, s17-e
+    (`Lwt.wait` -> `Lwt.task`) the declared survivor, masked by
+    `Lwt.protected` and proven load-bearing by the joint s17-ef mutant;
+    suite baseline 1069 native checks across 44 executables.)

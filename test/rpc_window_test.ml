@@ -264,6 +264,38 @@ let () =
   check "the released seq's effect landed exactly once, on the retry"
     (after - before = 1 && occurrences "t21" = 1)
 
+(* --- T22: a duplicate inside a FAILING window is refused, never told 200 --- *)
+
+(* The WS tier's F5' parity control (step 17, D22): while an attempt whose fate
+   is "will reject" is still in flight, the keyed duplicate must be refused
+   [Busy] - a 200 here, [Reply] or [Replayed], would assert an effect the
+   release is about to disown, the exact overclaim [Ack_park] closes on the
+   push channel. T14 pins the Busy window for a delivery that will land; this
+   arm pins it for one that will not, so the HTTP tier cannot regress to a
+   premature answer while the WS tier is being changed. *)
+let () =
+  let interposed : answered option ref = ref None in
+  arm (fun () ->
+      let* a = append ~key:(key 5) ~cookie "t22" in
+      interposed := Some a;
+      Lwt.fail (Failure "parity-test injected rejection"));
+  let before = commits () in
+  let failed = Lwt_main.run (append ~key:(key 5) ~cookie "t22") in
+  let mid = commits () in
+  let retry = Lwt_main.run (append ~key:(key 5) ~cookie "t22") in
+  let after = commits () in
+  let inside (f : answered -> bool) : bool =
+    Option.fold ~none:false ~some:f !interposed
+  in
+  check "a duplicate inside a FAILING window is refused 503, never told 200"
+    (inside (fun (a : answered) -> a.status = 503));
+  check "the doomed delivery answers 500 and commits nothing"
+    (failed.status = 500 && mid - before = 0);
+  check "the retry reads Fresh after the release and answers its own reply"
+    (retry.status = 200 && is_reply (answer_of retry.body));
+  check "the effect landed exactly once, on the retry"
+    (after - before = 1 && occurrences "t22" = 1)
+
 let () =
   if !failures > 0 then (
     Printf.printf "rpc_window_test: %d check(s) FAILED\n%!" !failures;

@@ -56,6 +56,7 @@ module App = Counter_app.App
 module Guard = Tea_server.Replay_guard
 module Dguard = Tea_server.Durable_guard
 module Sink = Tea_server.Guard_sink
+module Park = Tea_server.Ack_park
 module Msg_seq = Tea_core.Prim.Msg_seq
 module Tab_id = Tea_core.Prim.Tab_id
 module Replica = Tea_core.Crdt.Replica
@@ -495,13 +496,24 @@ let () =
      let l6b = link () in
      let session6b = Server.live_session ~guard:guard6 s6 l6b.transport in
      l6b.push (Some (frame ~tab:tab6 ~seq:1 App.Increment));
-     let* re6 = await (fun () -> acks l6b = [ 1 ]) in
+     (* Step 17 re-cut: the replay must PARK, not ack (F5'). The positive
+        witness comes first - the row is open on the default [Server.park]
+        (neither socket passed [?park]) - so the negative window after it
+        cannot pass vacuously on a frame that never reached the Duplicate
+        arm. A positive await on the ack here would burn its whole budget
+        post-fix. *)
+     let* parked6 =
+       await (fun () ->
+           Park.parked_count Server.park ~replica:replica6 ~tab:tab6 = 1)
+     in
+     let* () = Lwt_unix.sleep 0.05 in
      let* mid6 = Server.Store.load s6 in
      let* hist6mid = Server.Store.history s6 in
      check
-       "s6: the canceled seq replays as Duplicate while the orphan is still \
-        parked (acked, no second take)"
-       (re6
+       "s6: the canceled seq replays as Duplicate and PARKS on the in-flight \
+        orphan (no ack yet, no second take, orphan still owns the seq)"
+       (parked6
+       && acks l6b = []
        && App.value mid6 = 0
        && List.length hist6mid = List.length hist6
        && recorded6 () = []);
@@ -513,12 +525,15 @@ let () =
              (recorded6 ()))
      in
      let* () = Lwt_unix.sleep 0.3 in
+     (* The conjunct the old check1 owned, moved here: the parked ack fires
+        once the orphan LANDS, on the duplicate's own socket. *)
+     let* ackd6 = await (fun () -> acks l6b = [ 1 ]) in
      let* fin6 = Server.Store.load s6 in
      let* hist6b = Server.Store.history s6 in
      check
-       "s6: after the orphan unparks the effect applied exactly once (one \
-        increment, one new commit)"
-       (landed6
+       "s6: after the orphan unparks the effect applied exactly once and the \
+        parked ack fires on the duplicate's own socket"
+       (landed6 && ackd6
        && App.value fin6 = 1
        && List.length hist6b = List.length hist6 + 1);
      check
@@ -696,6 +711,485 @@ let () =
         | Guard.Duplicate n -> Msg_seq.to_int n = 1
         | Guard.Fresh (_ : Msg_seq.t) -> false
         | Guard.Gapped -> false);
+     (* --- 8. F5' closed, rejection side: the parked ack is DROPPED -------- *)
+     (* The one loss window step 16 declared open (step 17, D22): a cancel
+        orphans the attempt, the replay parks on it, the orphan rejects and
+        releases - the old unconditional Duplicate ack asserted "consumed"
+        for an effect that never landed, and the client dropped the message
+        for good. The ladder proves the ack is dropped, the registry row is
+        cleared, and the seq's fate belongs to the retry, which reads Fresh
+        and applies exactly once. *)
+     let* s8 = Server.Store.session repo (sid "fivereject") in
+     let replica8 = Tea_core.Crdt.Ctx.replica (Server.Store.ctx_of_session s8) in
+     let sink8, recorded8 = Sink.memory () in
+     let guard8 =
+       Dguard.v ~sessions:Guard.default_sessions ~tabs:Guard.default_tabs
+         ~sink:sink8 ~floors:Dguard.Floors.empty ()
+     in
+     let park8 = Park.create () in
+     let l8 = link () in
+     let gate8, (_ : unit Lwt.u) = Lwt.task () in
+     let calls8 = ref 0 in
+     let interpose8 () =
+       incr calls8;
+       if !calls8 = 1 then gate8 else Lwt.return_unit
+     in
+     let session8 =
+       Server.live_session ~guard:guard8 ~park:park8 ~interpose:interpose8 s8
+         l8.transport
+     in
+     let outcome8 =
+       Lwt.catch (fun () -> session8) (fun (_ : exn) -> Lwt.return_unit)
+     in
+     let tab8 = tab_of 67 in
+     l8.push (Some (frame ~tab:tab8 ~seq:1 App.Increment));
+     let* (_ : bool) = await (fun () -> !calls8 = 1) in
+     let* hist8 = Server.Store.history s8 in
+     Lwt.cancel session8;
+     let* (_ : bool) = await (fun () -> not (Lwt.is_sleeping outcome8)) in
+     let l8b = link () in
+     let session8b =
+       Server.live_session ~guard:guard8 ~park:park8 s8 l8b.transport
+     in
+     l8b.push (Some (frame ~tab:tab8 ~seq:1 App.Increment));
+     let* parked8 =
+       await (fun () -> Park.parked_count park8 ~replica:replica8 ~tab:tab8 = 1)
+     in
+     let* () = Lwt_unix.sleep 0.05 in
+     let* mid8 = Server.Store.load s8 in
+     check
+       "s8: the duplicate replay parks on the in-flight orphan (row open, no \
+        ack, no apply, no floor)"
+       (parked8 && acks l8b = [] && App.value mid8 = 0 && recorded8 () = []);
+     Lwt.cancel gate8;
+     let* () = Lwt.pause () in
+     let* v8 = Server.Store.load s8 in
+     let* hist8mid = Server.Store.history s8 in
+     check
+       "s8: the rejected orphan released the seq without applying or forging \
+        a floor"
+       (App.value v8 = 0
+       && List.length hist8mid = List.length hist8
+       && recorded8 () = []);
+     let* () = Lwt_unix.sleep 0.05 in
+     check
+       "s8: the parked ack is DROPPED on the release and the row is cleared \
+        (F5' closed: no consumed claim for an effect that never landed)"
+       (acks l8b = []
+       && Park.parked_count park8 ~replica:replica8 ~tab:tab8 = 0);
+     let l8c = link () in
+     let session8c =
+       Server.live_session ~guard:guard8 ~park:park8 s8 l8c.transport
+     in
+     l8c.push (Some (frame ~tab:tab8 ~seq:1 App.Increment));
+     let* re8 = await (fun () -> acks l8c = [ 1 ]) in
+     check "s8: the retry reads Fresh after the release and is acked" re8;
+     let* fin8 = Server.Store.load s8 in
+     let* hist8b = Server.Store.history s8 in
+     check
+       "s8: the effect applied exactly once, via the retry (one increment, \
+        one new commit)"
+       (App.value fin8 = 1 && List.length hist8b = List.length hist8 + 1);
+     check "s8: the floor landed via the retry the release licensed"
+       (match recorded8 () with
+        | [ e ] -> is_advance_for ~replica:replica8 ~tab:tab8 ~seq:1 e
+        | [] -> false
+        | _ :: _ :: _ -> false);
+     l8b.push None;
+     l8c.push None;
+     let* (_ : bool) = await (fun () -> not (Lwt.is_sleeping session8b)) in
+     let* (_ : bool) = await (fun () -> not (Lwt.is_sleeping session8c)) in
+     (* --- 9. F5' success side: the parked ack FIRES, on the parking socket - *)
+     let* s9 = Server.Store.session repo (sid "fivesuccess") in
+     let replica9 = Tea_core.Crdt.Ctx.replica (Server.Store.ctx_of_session s9) in
+     let sink9, recorded9 = Sink.memory () in
+     let guard9 =
+       Dguard.v ~sessions:Guard.default_sessions ~tabs:Guard.default_tabs
+         ~sink:sink9 ~floors:Dguard.Floors.empty ()
+     in
+     let park9 = Park.create () in
+     let l9 = link () in
+     let gate9, wake9 = Lwt.task () in
+     let calls9 = ref 0 in
+     let interpose9 () =
+       incr calls9;
+       if !calls9 = 1 then gate9 else Lwt.return_unit
+     in
+     let session9 =
+       Server.live_session ~guard:guard9 ~park:park9 ~interpose:interpose9 s9
+         l9.transport
+     in
+     let outcome9 =
+       Lwt.catch (fun () -> session9) (fun (_ : exn) -> Lwt.return_unit)
+     in
+     let tab9 = tab_of 68 in
+     l9.push (Some (frame ~tab:tab9 ~seq:1 App.Increment));
+     let* (_ : bool) = await (fun () -> !calls9 = 1) in
+     let* hist9 = Server.Store.history s9 in
+     Lwt.cancel session9;
+     let* (_ : bool) = await (fun () -> not (Lwt.is_sleeping outcome9)) in
+     let l9b = link () in
+     let session9b =
+       Server.live_session ~guard:guard9 ~park:park9 s9 l9b.transport
+     in
+     l9b.push (Some (frame ~tab:tab9 ~seq:1 App.Increment));
+     let* parked9 =
+       await (fun () -> Park.parked_count park9 ~replica:replica9 ~tab:tab9 = 1)
+     in
+     let* () = Lwt_unix.sleep 0.05 in
+     check "s9: the duplicate replay parks on the in-flight orphan (no early ack)"
+       (parked9 && acks l9b = []);
+     Lwt.wakeup_later wake9 ();
+     let* ackd9 = await (fun () -> acks l9b = [ 1 ]) in
+     check
+       "s9: the parked ack fires on the duplicate's own socket once the \
+        orphan lands"
+       ackd9;
+     let* fin9 = Server.Store.load s9 in
+     let* hist9b = Server.Store.history s9 in
+     check
+       "s9: the effect applied exactly once, by the orphan's own commit \
+        (never re-applied by the parked duplicate)"
+       (App.value fin9 = 1
+       && List.length hist9b = List.length hist9 + 1
+       && (match recorded9 () with
+           | [ e ] -> is_advance_for ~replica:replica9 ~tab:tab9 ~seq:1 e
+           | [] -> false
+           | _ :: _ :: _ -> false));
+     check "s9: the settled row is removed (registry cleared, not leaked)"
+       (Park.parked_count park9 ~replica:replica9 ~tab:tab9 = 0);
+     l9b.push None;
+     let* (_ : bool) = await (fun () -> not (Lwt.is_sleeping session9b)) in
+     (* --- 10. Teardown while parked: the park is bounded by the attempt --- *)
+     (* The parked socket's client goes away (stream end) while the wait is
+        open. A stream end is only ever observed BETWEEN frames - the Fresh
+        arm's own span semantics, unchanged by step 17 - so the session does
+        not settle while the attempt is in flight; it settles promptly at
+        the attempt's own exit, and the parked socket's death never perturbs
+        the attempt. *)
+     let* s10 = Server.Store.session repo (sid "parkteardown") in
+     let replica10 =
+       Tea_core.Crdt.Ctx.replica (Server.Store.ctx_of_session s10)
+     in
+     let sink10, recorded10 = Sink.memory () in
+     let guard10 =
+       Dguard.v ~sessions:Guard.default_sessions ~tabs:Guard.default_tabs
+         ~sink:sink10 ~floors:Dguard.Floors.empty ()
+     in
+     let park10 = Park.create () in
+     let l10 = link () in
+     let gate10, wake10 = Lwt.task () in
+     let calls10 = ref 0 in
+     let interpose10 () =
+       incr calls10;
+       if !calls10 = 1 then gate10 else Lwt.return_unit
+     in
+     let session10 =
+       Server.live_session ~guard:guard10 ~park:park10 ~interpose:interpose10
+         s10 l10.transport
+     in
+     let outcome10 =
+       Lwt.catch (fun () -> session10) (fun (_ : exn) -> Lwt.return_unit)
+     in
+     let tab10 = tab_of 69 in
+     l10.push (Some (frame ~tab:tab10 ~seq:1 App.Increment));
+     let* (_ : bool) = await (fun () -> !calls10 = 1) in
+     let* hist10 = Server.Store.history s10 in
+     Lwt.cancel session10;
+     let* (_ : bool) = await (fun () -> not (Lwt.is_sleeping outcome10)) in
+     let l10b = link () in
+     let session10b =
+       Server.live_session ~guard:guard10 ~park:park10 s10 l10b.transport
+     in
+     l10b.push (Some (frame ~tab:tab10 ~seq:1 App.Increment));
+     let* parked10 =
+       await (fun () ->
+           Park.parked_count park10 ~replica:replica10 ~tab:tab10 = 1)
+     in
+     check "s10: the duplicate is parked before its client goes away (row open)"
+       parked10;
+     l10b.push None;
+     let* () = Lwt_unix.sleep 0.05 in
+     check
+       "s10: a stream end is observed between frames, so the parked session \
+        does not settle while the attempt is in flight (the park is bounded \
+        by the attempt, as the Fresh arm's own span bounds the pump)"
+       (Lwt.is_sleeping session10b);
+     Lwt.wakeup_later wake10 ();
+     let* settled10 = await (fun () -> not (Lwt.is_sleeping session10b)) in
+     let* fin10 = Server.Store.load s10 in
+     let* hist10b = Server.Store.history s10 in
+     check
+       "s10: the attempt lands unperturbed and the parked socket's teardown \
+        completes at the attempt's own exit (effect once, floor present)"
+       (settled10
+       && App.value fin10 = 1
+       && List.length hist10b = List.length hist10 + 1
+       && (match recorded10 () with
+           | [ e ] -> is_advance_for ~replica:replica10 ~tab:tab10 ~seq:1 e
+           | [] -> false
+           | _ :: _ :: _ -> false));
+     (* --- 11. The parked ack waits for the PERSIST, not local success ----- *)
+     (* The settle sits after [persist_taken], and this ladder pins that
+        ordering with a gated sink (the s5 idiom) on the ok arm: step_ws
+        succeeding locally must not fire the parked ack. *)
+     let* s11 = Server.Store.session repo (sid "gatedpersist") in
+     let replica11 =
+       Tea_core.Crdt.Ctx.replica (Server.Store.ctx_of_session s11)
+     in
+     let sink11, recorded11 = Sink.memory () in
+     let gate11, wake11 = Lwt.task () in
+     let attempted11 = ref false in
+     let gated11 : Sink.t =
+       { Sink.append =
+           (fun (ev : Sink.event) ->
+             attempted11 := true;
+             let* () = gate11 in
+             sink11.Sink.append ev)
+       }
+     in
+     let guard11 =
+       Dguard.v ~sessions:Guard.default_sessions ~tabs:Guard.default_tabs
+         ~sink:gated11 ~floors:Dguard.Floors.empty ()
+     in
+     let park11 = Park.create () in
+     let l11 = link () in
+     let session11 =
+       Server.live_session ~guard:guard11 ~park:park11 s11 l11.transport
+     in
+     let tab11 = tab_of 70 in
+     l11.push (Some (frame ~tab:tab11 ~seq:1 App.Increment));
+     let* (_ : bool) = await (fun () -> !attempted11) in
+     let l11b = link () in
+     let session11b =
+       Server.live_session ~guard:guard11 ~park:park11 s11 l11b.transport
+     in
+     l11b.push (Some (frame ~tab:tab11 ~seq:1 App.Increment));
+     let* parked11 =
+       await (fun () ->
+           Park.parked_count park11 ~replica:replica11 ~tab:tab11 = 1)
+     in
+     let* () = Lwt_unix.sleep 0.05 in
+     check
+       "s11: no parked ack while the floor's append is still gated - step_ws \
+        succeeding locally is not enough"
+       (parked11 && acks l11b = []);
+     Lwt.wakeup_later wake11 ();
+     let* ackd11 = await (fun () -> acks l11b = [ 1 ]) in
+     check
+       "s11: the parked ack fires only once the persist actually lands \
+        (floor present)"
+       (ackd11
+       && (match recorded11 () with
+           | [ e ] -> is_advance_for ~replica:replica11 ~tab:tab11 ~seq:1 e
+           | [] -> false
+           | _ :: _ :: _ -> false));
+     let* fin11 = Server.Store.load s11 in
+     check "s11: the effect applied exactly once" (App.value fin11 = 1);
+     l11.push None;
+     l11b.push None;
+     let* (_ : bool) = await (fun () -> not (Lwt.is_sleeping session11)) in
+     let* (_ : bool) = await (fun () -> not (Lwt.is_sleeping session11b)) in
+     (* --- 12. Below-water replays park on the WATER's row ----------------- *)
+     (* [Duplicate] carries the high water ([Duplicate e.high] in
+        replay_guard.ml), an ack that asserts "everything at or below the
+        water is consumed". A below-water replay arriving while the water's
+        own attempt is still in flight must therefore park on the WATER's
+        row - acking 2 for a replayed 1 while 2 is unlanded is exactly the
+        F5' overclaim - and fire, with the water's number, only once that
+        attempt lands. *)
+     let* s12 = Server.Store.session repo (sid "seqkeyed") in
+     let replica12 =
+       Tea_core.Crdt.Ctx.replica (Server.Store.ctx_of_session s12)
+     in
+     let guard12 =
+       Dguard.v ~sessions:Guard.default_sessions ~tabs:Guard.default_tabs
+         ~sink:Sink.null ~floors:Dguard.Floors.empty ()
+     in
+     let park12 = Park.create () in
+     let gate12, wake12 = Lwt.task () in
+     let calls12 = ref 0 in
+     let interpose12 () =
+       incr calls12;
+       if !calls12 = 2 then gate12 else Lwt.return_unit
+     in
+     let l12 = link () in
+     let session12 =
+       Server.live_session ~guard:guard12 ~park:park12 ~interpose:interpose12
+         s12 l12.transport
+     in
+     let tab12 = tab_of 71 in
+     l12.push (Some (frame ~tab:tab12 ~seq:1 App.Increment));
+     let* (_ : bool) = await (fun () -> acks l12 = [ 1 ]) in
+     l12.push (Some (frame ~tab:tab12 ~seq:2 App.Increment));
+     let* (_ : bool) = await (fun () -> !calls12 = 2) in
+     let l12b = link () in
+     let session12b =
+       Server.live_session ~guard:guard12 ~park:park12 s12 l12b.transport
+     in
+     l12b.push (Some (frame ~tab:tab12 ~seq:1 App.Increment));
+     let* parked12 =
+       await (fun () ->
+           Park.parked_count park12 ~replica:replica12 ~tab:tab12 = 1)
+     in
+     let* () = Lwt_unix.sleep 0.05 in
+     check
+       "s12: a below-water replay parks on the WATER's open row (the \
+        cumulative ack is withheld while the water's attempt is in flight)"
+       (parked12 && acks l12b = []);
+     Lwt.wakeup_later wake12 ();
+     let* ack12 = await (fun () -> acks l12 = [ 1; 2 ]) in
+     let* ackb12 = await (fun () -> acks l12b = [ 2 ]) in
+     let* fin12 = Server.Store.load s12 in
+     check
+       "s12: the gated seq resolves and the parked ack fires with the WATER's \
+        number (both acks on the live socket, the water ack on the parked \
+        one, two applies, registry empty)"
+       (ack12 && ackb12
+       && App.value fin12 = 2
+       && Park.parked_count park12 ~replica:replica12 ~tab:tab12 = 0);
+     l12.push None;
+     l12b.push None;
+     let* (_ : bool) = await (fun () -> not (Lwt.is_sleeping session12)) in
+     let* (_ : bool) = await (fun () -> not (Lwt.is_sleeping session12b)) in
+     (* --- 13. Multi-waiter isolation on one shared settlement ------------- *)
+     (* Two sockets park on the identical key and share ONE settlement
+        promise. Cancelling one parked socket rejects only ITS [protected]
+        wrapper: with the row minted by [Lwt.wait] the settlement itself is
+        not cancelable, so the sibling still resolves - and the cancelled
+        socket's own teardown completes promptly, before the attempt
+        settles. *)
+     let* s13 = Server.Store.session repo (sid "multiwaiter") in
+     let replica13 =
+       Tea_core.Crdt.Ctx.replica (Server.Store.ctx_of_session s13)
+     in
+     let sink13, recorded13 = Sink.memory () in
+     let guard13 =
+       Dguard.v ~sessions:Guard.default_sessions ~tabs:Guard.default_tabs
+         ~sink:sink13 ~floors:Dguard.Floors.empty ()
+     in
+     let park13 = Park.create () in
+     let l13 = link () in
+     let gate13, wake13 = Lwt.task () in
+     let calls13 = ref 0 in
+     let interpose13 () =
+       incr calls13;
+       if !calls13 = 1 then gate13 else Lwt.return_unit
+     in
+     let session13 =
+       Server.live_session ~guard:guard13 ~park:park13 ~interpose:interpose13
+         s13 l13.transport
+     in
+     let outcome13 =
+       Lwt.catch (fun () -> session13) (fun (_ : exn) -> Lwt.return_unit)
+     in
+     let tab13 = tab_of 72 in
+     l13.push (Some (frame ~tab:tab13 ~seq:1 App.Increment));
+     let* (_ : bool) = await (fun () -> !calls13 = 1) in
+     Lwt.cancel session13;
+     let* (_ : bool) = await (fun () -> not (Lwt.is_sleeping outcome13)) in
+     let l13b = link () in
+     let session13b =
+       Server.live_session ~guard:guard13 ~park:park13 s13 l13b.transport
+     in
+     let outcome13b =
+       Lwt.catch (fun () -> session13b) (fun (_ : exn) -> Lwt.return_unit)
+     in
+     let l13c = link () in
+     let session13c =
+       Server.live_session ~guard:guard13 ~park:park13 s13 l13c.transport
+     in
+     l13b.push (Some (frame ~tab:tab13 ~seq:1 App.Increment));
+     l13c.push (Some (frame ~tab:tab13 ~seq:1 App.Increment));
+     let* parked13 =
+       await (fun () ->
+           Park.parked_count park13 ~replica:replica13 ~tab:tab13 = 1)
+     in
+     let* () = Lwt_unix.sleep 0.05 in
+     check
+       "s13: the row stays open while two duplicates park on it (no ack on \
+        either while the orphan is in flight)"
+       (parked13 && acks l13b = [] && acks l13c = []);
+     Lwt.cancel session13b;
+     let* settled13b = await (fun () -> not (Lwt.is_sleeping outcome13b)) in
+     Lwt.wakeup_later wake13 ();
+     let* ackd13 = await (fun () -> acks l13c = [ 1 ]) in
+     let* fin13 = Server.Store.load s13 in
+     check
+       "s13: the surviving waiter still resolves from the shared settlement \
+        (its ack fires; the cancelled sibling never acked)"
+       (ackd13
+       && acks l13b = []
+       && App.value fin13 = 1
+       && (match recorded13 () with
+           | [ e ] -> is_advance_for ~replica:replica13 ~tab:tab13 ~seq:1 e
+           | [] -> false
+           | _ :: _ :: _ -> false));
+     check
+       "s13: the cancelled parked socket's own teardown completed promptly, \
+        before the attempt settled"
+       settled13b;
+     l13c.push None;
+     let* (_ : bool) = await (fun () -> not (Lwt.is_sleeping session13c)) in
+     (* --- 14. A dead sender releases a parked socket ---------------------- *)
+     (* The park is raced against [died] exactly as the pump's frame-wait is
+        (D22): a settlement that never arrives must not hold the parked
+        socket's teardown hostage once its send side is gone. The attempt
+        stays gated past the death, so nothing but the race can settle the
+        parked session - and the row itself survives, untouched, for any
+        sibling waiter. *)
+     let* s14 = Server.Store.session repo (sid "deadparked") in
+     let replica14 =
+       Tea_core.Crdt.Ctx.replica (Server.Store.ctx_of_session s14)
+     in
+     let sink14, _recorded14 = Sink.memory () in
+     let guard14 =
+       Dguard.v ~sessions:Guard.default_sessions ~tabs:Guard.default_tabs
+         ~sink:sink14 ~floors:Dguard.Floors.empty ()
+     in
+     let park14 = Park.create () in
+     let l14 = link () in
+     let gate14, wake14 = Lwt.task () in
+     let calls14 = ref 0 in
+     let interpose14 () =
+       incr calls14;
+       if !calls14 = 1 then gate14 else Lwt.return_unit
+     in
+     let session14 =
+       Server.live_session ~guard:guard14 ~park:park14 ~interpose:interpose14
+         s14 l14.transport
+     in
+     let tab14 = tab_of 91 in
+     l14.push (Some (frame ~tab:tab14 ~seq:1 App.Increment));
+     let* (_ : bool) = await (fun () -> !calls14 = 1) in
+     let l14b = link () in
+     let sgate14, swake14 = Lwt.task () in
+     l14b.arm sgate14;
+     let session14b =
+       Server.live_session ~guard:guard14 ~park:park14 s14 l14b.transport
+     in
+     let outcome14b =
+       Lwt.catch (fun () -> session14b) (fun (_ : exn) -> Lwt.return_unit)
+     in
+     l14b.push (Some (frame ~tab:tab14 ~seq:1 App.Increment));
+     let* () = Lwt_unix.sleep 0.05 in
+     check
+       "s14: the socket is parked, not dead, while its sender is merely \
+        armed (the session promise still sleeps on the open settlement)"
+       (Lwt.is_sleeping outcome14b
+       && Park.parked_count park14 ~replica:replica14 ~tab:tab14 = 1);
+     Lwt.wakeup_later swake14 ();
+     let* settled14b = await (fun () -> not (Lwt.is_sleeping outcome14b)) in
+     check
+       "s14: the dead sender releases the parked socket - teardown completes \
+        through the death race while the settlement is still open"
+       (settled14b
+       && l14b.refused () >= 1
+       && Park.parked_count park14 ~replica:replica14 ~tab:tab14 = 1);
+     Lwt.wakeup_later wake14 ();
+     let* (_ : bool) = await (fun () -> acks l14 = [ 1 ]) in
+     l14.push None;
+     let* (_ : bool) = await (fun () -> not (Lwt.is_sleeping session14)) in
      Lwt.return_unit)
 
 let () =
