@@ -2361,3 +2361,59 @@ Each lean-tea private-constructor primitive → an OCaml `.mli` boundary:
     failure on a clean build - and five kill-checked review-fix mutants
     from the adversarial round; suite baseline 1178 native checks
     across 47 executables.)
+19. **Guarded head moves** - close R10b (§10): `undo`, `redo` and
+    `fork` still move the head with an unconditional `S.Head.set`, so a
+    commit the pump has already floored and acked can be erased by a
+    racing head move. The step owns the semantic ruling the register
+    defers - what a racing undo *means*: refuse, merge, or win
+    positionally - and turns C15 from a labelled characterization pin
+    into a behaviour check that fails on erasure. **Planned.**
+20. **Kill-tolerant floor/commit ordering** - narrow R11 (§10): a
+    `kill -9` can still drop the unacknowledged in-flight tail, because
+    the journal reaches the page cache per record while irmin-pack
+    buffers commits in user space, violating D16's inequality (a floor
+    must not be more durable than the commit whose effect it records).
+    Step 13's water check already narrows the loss side to records
+    that never minted a witness and to divergence past the boot
+    check, bounded by the pack's auto-flush lag; this step restores
+    the inequality under a hard kill, or pins exactly that remainder
+    by test. **Planned.**
+21. **Boot epoch** - close R20b (§10) with the successor the register
+    names: a counter bumped in the root at each open and echoed into
+    each journal, which MOVES on divergence and so sees the copy that
+    a constant create-time token cannot. The register's caution
+    governs the design: a journal whose stamp lagged a boot must
+    degrade accept-side (a noisy floor clear), never refuse.
+    **Planned.**
+22. **Reaper wiring** - wire the bounded session reaper
+    (`Store_core.reap`, D3) into the serve entry points, so a
+    long-running deployment stops accumulating abandoned session
+    branches. The mechanism and its tests exist (`reaper_test`); no
+    serve path calls it. The step-11 caution governs the wiring: a
+    reap past a live durable guard goes through `Durable_guard.forget`
+    or it is itself a loss path. **Planned.**
+23. **Compiler-enforced boundary** - close R7's residual (§10): the
+    direct-sink discipline (never call raw Dream/Irmin/Unix past a
+    `tea_safe` boundary; keep `Rpc.route`'s two arms distinct - R8)
+    stays a review convention today. Move it to a gate the build
+    enforces - a bypass must fail to compile or fail a mechanical
+    check, not wait on a reviewer. **Planned.**
+24. **Cookie rollback guard** - close R16 (§10) before first use: the
+    cookie session payload is rollback-able, and today's safety is an
+    accident of non-use (`session_field` and its writers have zero
+    callers), backed only by the register's warning. This step puts a
+    code-level guard between `Dream.set_session_field` and monotone
+    state, so no future feature can arm the trap. **Planned.**
+25. **Browser-local backend** - the client's missing tier: a
+    browser-local IndexedDB store, so a tab keeps working from
+    previously loaded data and its offline edits survive the tab
+    (today `Delivery`'s queue unifies in-flight and offline-born
+    edits in memory only, and the client only mirrors the server
+    live). The commit clock is already hoisted (`Tea_core.Clock`,
+    step 8, D7), so the store itself is the missing piece.
+    **Planned.**
+
+**Completion (declared 2026-08-09).** Steps 19-25 are the completion
+set: the framework is complete when all seven read **Done**, each
+under the standing discipline (mutation-confirmed tests, the §10
+register entry closed or amended in the same change).
