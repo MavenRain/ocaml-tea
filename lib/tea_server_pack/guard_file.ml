@@ -1,5 +1,6 @@
 module Guard_sink = Tea_server.Guard_sink
 module Durable_guard = Tea_server.Durable_guard
+module Store_identity = Tea_core.Prim.Store_identity
 
 module Key = struct
   type t = Tea_core.Crdt.Replica.t * Tea_core.Prim.Tab_id.t
@@ -33,8 +34,60 @@ type t =
   ; mutable floors : Durable_guard.Floors.t (* what compaction rewrites *)
   ; mutable touch : int Key_map.t (* last-append tick per live key *)
   ; mutable tick : int
+  ; mutable header : Store_identity.t option (* stamped as frame 0 *)
+  ; held : bool (* the strict hold: no write path may touch the file *)
   ; mutable closed : bool
   }
+
+(* The store-identity header (roadmap step 18, D23): tag 4, the file's first
+   frame or absent. It is framed by {!Guard_sink.Codec} but decoded HERE, so
+   it is never a [Guard_sink.event] and cannot reach the floors fold, the
+   [Key_map] or cap eviction. *)
+let tag_identity = '\004'
+
+type identity_outcome =
+  | Matched
+  | Freshly_bound
+  | Adopted_unbound of int
+  | Rebound of int
+  | Unresolved_cleared of int
+
+type header_status =
+  | No_header of { empty : bool }
+      (* [empty=true]: the file holds ZERO bytes, the only shape that carries
+         no claim at all. [empty=false]: the file holds bytes but no header
+         frame - a genuine event frame at byte 0, or bytes that would not
+         unframe there at all. *)
+  | Foreign_header of { consumed : int }
+      (* A header frame that unframed cleanly and carries a payload that is
+         not a token. [consumed] is the offset of the first frame after it. *)
+  | Header of
+      { at : Store_identity.t
+      ; consumed : int (* offset of the first frame after the header *)
+      }
+
+(* Three answers, and what separates them is what the caller may then do. A
+   header payload that will not decode is DECIDABLE: it is not 32 lowercase
+   hex, so it equals no store's token and it names a different store just as
+   surely as a readable stranger does, which is why it keeps its frame
+   boundary and reaches the mismatch arm. Bytes that will not unframe at byte
+   0 say nothing about whose store they are, so they stay [No_header] and are
+   adopted on trust - but they are still BYTES, so they are not [empty], and
+   the silent brand-new-store verdict stays unique to a zero-byte file. *)
+let decode_header (s : string) : header_status =
+  if Int.equal (String.length s) 0 then No_header { empty = true }
+  else
+    Result.fold
+      (Guard_sink.Codec.unframe s ~pos:0)
+      ~error:(fun (_ : Guard_sink.Codec.decode_err) -> No_header { empty = false })
+      ~ok:(fun ((tag, payload, next) : char * string * int) ->
+        if Char.equal tag tag_identity then
+          Store_identity.of_string payload
+          |> Result.fold
+               ~ok:(fun (at : Store_identity.t) -> Header { at; consumed = next })
+               ~error:(fun (_ : Store_identity.err) ->
+                 Foreign_header { consumed = next })
+        else No_header { empty = false })
 
 (* Decode the valid prefix: every [decode_err] — torn, corrupt, unknown —
    stops the fold and discards the remainder. Frames before the break
@@ -112,14 +165,24 @@ let enforce_cap ~(cap : int) (floors : Durable_guard.Floors.t)
 
 let append_flags : Unix.open_flag list = [ Unix.O_WRONLY; Unix.O_APPEND; Unix.O_CREAT ]
 
-let compact (t : t) : unit Lwt.t =
+let compact_now (t : t) : unit Lwt.t =
   let kept = events_of_kept t.floors t.touch in
+  (* Stamped by the rewrite, so header and floors are always the same
+     generation and the header can no more be torn on the live file than the
+     first kept floor can. [None] emits nothing at all, which is the
+     pre-step-18 file byte for byte. *)
+  let header =
+    Option.fold t.header ~none:"" ~some:(fun (id : Store_identity.t) ->
+        Guard_sink.Codec.frame ~tag:tag_identity
+          ~payload:(Store_identity.to_string id))
+  in
   let tmp = t.path ^ ".tmp" in
   let* () =
     Lwt_io.with_file ~mode:Lwt_io.Output
       ~flags:[ Unix.O_WRONLY; Unix.O_CREAT; Unix.O_TRUNC ]
       tmp
       (fun out ->
+        let* () = Lwt_io.write out header in
         Lwt_list.iter_s
           (fun (ev : Guard_sink.event) ->
             Lwt_io.write out (Guard_sink.Codec.to_bytes ev))
@@ -140,29 +203,48 @@ let compact (t : t) : unit Lwt.t =
   t.tick <- tick;
   Lwt.return_unit
 
+(* EVERY rewrite goes through here, so the strict hold cannot be forgotten at
+   a call site: a held journal answers the trigger and writes nothing. *)
+let compact (t : t) : unit Lwt.t =
+  if t.held then Lwt.return_unit else compact_now t
+
+(* The in-memory half of an append: the floors, the touch clock, and cap
+   eviction. It touches no byte on disk, so a held journal runs exactly this
+   and nothing more, and this boot's own dedup keeps working. *)
+let remember (t : t) (e : Guard_sink.event) : unit =
+  t.floors <- Durable_guard.Floors.apply t.floors e;
+  (match e with
+   | Guard_sink.Advance
+       { replica
+       ; tab
+       ; seq = (_ : Tea_core.Prim.Msg_seq.t)
+       ; water = (_ : Tea_core.Prim.Store_water.t)
+       } ->
+     t.touch <- Key_map.add (replica, tab) t.tick t.touch
+   | Guard_sink.Forget { replica } -> t.touch <- scrub_replica replica t.touch);
+  t.tick <- t.tick + 1;
+  if Key_map.cardinal t.touch > t.cap then (
+    let floors, touch = enforce_cap ~cap:t.cap t.floors t.touch in
+    t.floors <- floors;
+    t.touch <- touch)
+
 let append (t : t) (e : Guard_sink.event) : (unit, Guard_sink.err) result Lwt.t =
   if t.closed then Lwt.return (Error Guard_sink.Sink_closed)
+  else if t.held then (
+    (* The strict hold, the write half (see [open_]): the floors this boot
+       learns stay in memory and reach no byte of the file, so a later boot
+       that CAN read the token still finds the original header and its
+       floors. The appends that are not persisted replay as duplicates on
+       that boot, which is the accept direction. *)
+    remember t e;
+    Lwt.return (Ok ()))
   else
     Lwt.catch
       (fun () ->
         let* () = Lwt_io.write t.chan (Guard_sink.Codec.to_bytes e) in
         let* () = Lwt_io.flush t.chan in
         t.count <- t.count + 1;
-        t.floors <- Durable_guard.Floors.apply t.floors e;
-        (match e with
-         | Guard_sink.Advance
-             { replica
-             ; tab
-             ; seq = (_ : Tea_core.Prim.Msg_seq.t)
-             ; water = (_ : Tea_core.Prim.Store_water.t)
-             } ->
-           t.touch <- Key_map.add (replica, tab) t.tick t.touch
-         | Guard_sink.Forget { replica } -> t.touch <- scrub_replica replica t.touch);
-        t.tick <- t.tick + 1;
-        (if Key_map.cardinal t.touch > t.cap then (
-           let floors, touch = enforce_cap ~cap:t.cap t.floors t.touch in
-           t.floors <- floors;
-           t.touch <- touch));
+        remember t e;
         let* () = if t.count > 4 * t.cap then compact t else Lwt.return_unit in
         Lwt.return (Ok ()))
       (fun (exc : exn) ->
@@ -204,8 +286,11 @@ let head_water_of_list
 
 let open_ ~(dir : string) ~(cap : int)
     ~(head_water :
-       Tea_core.Crdt.Replica.t -> Tea_core.Prim.Store_water.t option) :
-    (Guard_sink.t * Durable_guard.Floors.t * verdict * t, open_err) result
+       Tea_core.Crdt.Replica.t -> Tea_core.Prim.Store_water.t option)
+    ~(identity : Store_identity.binding) :
+    ( Guard_sink.t * Durable_guard.Floors.t * verdict * identity_outcome * t
+    , open_err )
+    result
     Lwt.t =
   let* made = ensure_dir dir in
   Result.fold made
@@ -215,27 +300,114 @@ let open_ ~(dir : string) ~(cap : int)
         (fun () ->
           let path = Filename.concat dir "journal" in
           let* contents = read_if_exists path in
-          let events, count = decode_prefix contents in
-          let floors0 = Durable_guard.Floors.of_events events in
-          (* The boot filter (R20) runs on the FULL fold, before any cap
-             housekeeping: the verdict reports what the journal claimed
-             against what the store holds, not what happened to fit under
-             [cap]. *)
-          let admitted, verdict =
-            Durable_guard.Floors.filter ~head:head_water floors0
+          (* Peel before the prefix fold, so the header is structurally
+             incapable of becoming an event. The remainder is dropped through
+             a seq rather than a computed range: the peel is then total
+             whatever offset the header reports, and the header never counts
+             as a record, so the [4 * cap] trigger measures what it always
+             did. *)
+          let hdr = decode_header contents in
+          let rest =
+            match hdr with
+            | No_header { empty = (_ : bool) } -> contents
+            | Header { at = (_ : Store_identity.t); consumed }
+            | Foreign_header { consumed } ->
+              String.to_seq contents |> Seq.drop consumed |> String.of_seq
           in
-          (* Touch entries for refused floors go with them, or the cap would
-             count — and could evict a live key in favour of — keys that no
-             longer exist. *)
-          let touch0, tick = touch_of_events events in
-          let touch1 =
-            Key_map.filter
-              (fun ((replica, tab) : Key.t) (_ : int) ->
-                Durable_guard.Floors.find_stamped ~replica ~tab admitted
-                |> Option.is_some)
-              touch0
+          let events, count = decode_prefix rest in
+          (* Today's path, unchanged: the boot filter (R20) runs on the FULL
+             fold, before any cap housekeeping, so the verdict reports what
+             the journal claimed against what the store holds, not what
+             happened to fit under [cap]. Touch entries for refused floors go
+             with them, or the cap would count — and could evict a live key in
+             favour of — keys that no longer exist. *)
+          let adopt () :
+              Durable_guard.Floors.t * int Key_map.t * int * verdict =
+            let floors0 = Durable_guard.Floors.of_events events in
+            let admitted, verdict =
+              Durable_guard.Floors.filter ~head:head_water floors0
+            in
+            let touch0, tick = touch_of_events events in
+            let touch1 =
+              Key_map.filter
+                (fun ((replica, tab) : Key.t) (_ : int) ->
+                  Durable_guard.Floors.find_stamped ~replica ~tab admitted
+                  |> Option.is_some)
+                touch0
+            in
+            let floors, touch = enforce_cap ~cap admitted touch1 in
+            (floors, touch, tick, verdict)
           in
-          let floors, touch = enforce_cap ~cap admitted touch1 in
+          (* Decode far enough to COUNT what a stranger claimed, then discard
+             it outright. The cleared arms report the all-zero verdict rather
+             than synthetic [dropped_behind] counts: there is nothing
+             store-water-related to say, and forcing a number into those
+             fields is the mislabel the separate [identity_outcome] exists to
+             refuse. *)
+          let stranger_count () : int =
+            Durable_guard.Floors.of_events events
+            |> Durable_guard.Floors.cardinal
+          in
+          let cleared :
+              Durable_guard.Floors.t * int Key_map.t * int * verdict =
+            ( Durable_guard.Floors.empty
+            , Key_map.empty
+            , 0
+            , { kept = 0
+              ; dropped_behind = 0
+              ; dropped_no_branch = 0
+              ; unwitnessed = 0
+              } )
+          in
+          (* A total function of (header, binding). [Some id] is only ever a
+             value the caller bound or a header this open actually decoded,
+             never one this module invented. *)
+          let outcome, (floors, touch, tick, verdict), header =
+            match (hdr, identity) with
+            | No_header { empty = true }, Store_identity.Bound id ->
+              (Freshly_bound, adopt (), Some id)
+            | No_header { empty = true }, Store_identity.Unresolved ->
+              (Freshly_bound, adopt (), None)
+            | No_header { empty = false }, Store_identity.Bound id ->
+              let ((_ : Durable_guard.Floors.t), (_ : int Key_map.t), (_ : int), v) as
+                  adopted =
+                adopt ()
+              in
+              (Adopted_unbound v.kept, adopted, Some id)
+            | No_header { empty = false }, Store_identity.Unresolved ->
+              let ((_ : Durable_guard.Floors.t), (_ : int Key_map.t), (_ : int), v) as
+                  adopted =
+                adopt ()
+              in
+              (Adopted_unbound v.kept, adopted, None)
+            | Header { at; consumed = (_ : int) }, Store_identity.Bound id ->
+              if Store_identity.equal at id then (Matched, adopt (), Some id)
+              else (Rebound (stranger_count ()), cleared, Some id)
+            | Header { at; consumed = (_ : int) }, Store_identity.Unresolved ->
+              (Unresolved_cleared (stranger_count ()), cleared, Some at)
+            (* A header frame whose payload is not a token names a store this
+               one is not, exactly as a readable stranger token does, so the
+               two share their arms. It leaves no value to stand in for the
+               [Unresolved] hold's header, and it needs none: the hold rewrites
+               nothing, so nothing reads that field. *)
+            | Foreign_header { consumed = (_ : int) }, Store_identity.Bound id ->
+              (Rebound (stranger_count ()), cleared, Some id)
+            | Foreign_header { consumed = (_ : int) }, Store_identity.Unresolved ->
+              (Unresolved_cleared (stranger_count ()), cleared, None)
+          in
+          (* [held] is what makes an unresolvable identity a strict no-op on
+             disk, and it is a FIELD rather than a local because the hold has
+             to outlive [open_]: [compact] and [append] both consult it, so no
+             later write path can rewrite a file whose token this boot could
+             not confirm. A later boot that CAN read the token therefore finds
+             the original header intact and keeps its floors. *)
+          let held =
+            match outcome with
+            | Unresolved_cleared (_ : int) -> true
+            | Matched | Freshly_bound | Adopted_unbound (_ : int)
+            | Rebound (_ : int) ->
+              false
+          in
           let* fd = Lwt_unix.openfile path append_flags 0o644 in
           let t =
             { path
@@ -246,6 +418,8 @@ let open_ ~(dir : string) ~(cap : int)
             ; floors
             ; touch
             ; tick
+            ; header
+            ; held
             ; closed = false
             }
           in
@@ -260,11 +434,27 @@ let open_ ~(dir : string) ~(cap : int)
              loses floors, which replays as duplicates — the accept
              direction, same as a torn tail. *)
           let dropped = verdict.dropped_behind + verdict.dropped_no_branch in
+          (* [restamp] forces the write on every newly-bound arm rather than
+             waiting for a natural trigger, the same argument the filter-fired
+             compaction above makes: deferring buys nothing (one small frame
+             through plumbing that already exists) and every boot between
+             detection and the next natural compaction still reads as
+             unbound. The held arm needs no test of its own here: [compact]
+             answers a held journal with [unit] and writes nothing, which is
+             what a stranger journal carrying more than [4 * cap] records
+             relies on. *)
+          let restamp =
+            match outcome with
+            | Matched | Unresolved_cleared (_ : int) -> false
+            | Freshly_bound | Adopted_unbound (_ : int) | Rebound (_ : int) ->
+              Option.is_some t.header
+          in
           let* () =
-            if dropped > 0 || count > 4 * cap then compact t
+            if dropped > 0 || count > 4 * cap || restamp then compact t
             else Lwt.return_unit
           in
-          Lwt.return (Ok ({ Guard_sink.append = append t }, t.floors, verdict, t)))
+          Lwt.return
+            (Ok ({ Guard_sink.append = append t }, t.floors, verdict, outcome, t)))
         (fun (exc : exn) -> Lwt.return (Error (Io (Printexc.to_string exc)))))
 
 let close (t : t) : unit Lwt.t =

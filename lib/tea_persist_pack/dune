@@ -1,4 +1,7 @@
 (library
  (name tea_persist_pack)
+ ; [unix] is explicit, not transitive: [store_pack.ml]'s identity resolver
+ ; calls [Unix.lstat]/[openfile]/[read]/[write]/[fsync]/[link]/[unlink]
+ ; directly, and [lib/tea_persist/dune] already lists it the same way.
  (libraries tea_core tea_safe tea_persist repr irmin irmin-pack irmin-pack.unix
-   lwt))
+   unix lwt))

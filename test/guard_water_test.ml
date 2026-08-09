@@ -56,6 +56,7 @@ module Floors = Tea_server.Durable_guard.Floors
 module Msg_seq = Tea_core.Prim.Msg_seq
 module Tab_id = Tea_core.Prim.Tab_id
 module Water = Tea_core.Prim.Store_water
+module Store_identity = Tea_core.Prim.Store_identity
 module Replica = Tea_core.Crdt.Replica
 open Lwt.Syntax
 
@@ -210,13 +211,30 @@ let open_err_name (e : Guard_file.open_err) : string =
 
 let opened (what : string)
     (r :
-      ( Guard_sink.t * Floors.t * Guard_file.verdict * Guard_file.t
+      ( Guard_sink.t
+        * Floors.t
+        * Guard_file.verdict
+        * Guard_file.identity_outcome
+        * Guard_file.t
       , Guard_file.open_err )
-      result) : Guard_sink.t * Floors.t * Guard_file.verdict * Guard_file.t =
+      result) :
+    Guard_sink.t
+    * Floors.t
+    * Guard_file.verdict
+    * Guard_file.identity_outcome
+    * Guard_file.t =
   Result.fold r ~ok:Fun.id
     ~error:(fun (e : Guard_file.open_err) ->
       Printf.printf "FAIL - test setup: %s (%s)\n%!" what (open_err_name e);
       exit 1)
+
+(* One store for every G check: each open below names the SAME identity, so a
+   journal is stamped on the open that first adopts it and read back as
+   [Matched] afterwards. The G arithmetic is therefore unchanged by step 18,
+   and that invariance is itself the check that the header peel and the
+   [Matched] arm leave the step-13 water filter alone. *)
+let store_id : Store_identity.t = Store_identity.of_draws (fun () -> 0x5a)
+let identity : Store_identity.binding = Store_identity.Bound store_id
 
 let sink_err_name (e : Guard_sink.err) : string =
   match e with
@@ -390,8 +408,10 @@ let () =
       let* r1 =
         Guard_file.open_ ~dir ~cap:8
           ~head_water:(heads [ (ra, water 100); (rb, water 90) ])
+          ~identity
       in
-      let (_ : Guard_sink.t), fl1, v1, h1 = opened "G1" r1 in
+      let (_ : Guard_sink.t), fl1, v1, (_ : Guard_file.identity_outcome), h1 =
+        opened "G1" r1 in
       (* Equality passes and is load-bearing: ra's head EQUALS its floor's
          water, the exact state of every floor after an orderly restart. *)
       check "G1 floors are adopted under covering waters (equality included)"
@@ -402,8 +422,10 @@ let () =
       let* r2 =
         Guard_file.open_ ~dir ~cap:8
           ~head_water:(heads [ (ra, water 60); (rb, water 90) ])
+          ~identity
       in
-      let (_ : Guard_sink.t), fl2, v2, h2 = opened "G2" r2 in
+      let (_ : Guard_sink.t), fl2, v2, (_ : Guard_file.identity_outcome), h2 =
+        opened "G2" r2 in
       check
         "G2 the SAME journal bytes drop the rolled-back floor under the \
          restored store's waters, and count it"
@@ -463,8 +485,10 @@ let () =
       let* r1 =
         Guard_file.open_ ~dir ~cap:8
           ~head_water:(heads [ (rl, water 10); (rq, water 150) ])
+          ~identity
       in
-      let (_ : Guard_sink.t), fl1, v1, h1 = opened "G3 upgrade arm" r1 in
+      let (_ : Guard_sink.t), fl1, v1, (_ : Guard_file.identity_outcome), h1 =
+        opened "G3 upgrade arm" r1 in
       check
         "G3 a legacy floor is adopted at a real head while an uncovered real \
          claim drops in the SAME open"
@@ -483,8 +507,9 @@ let () =
         write_file (journal_of dir)
           (legacy ^ Guard_sink.Codec.to_bytes (adv rq (tab 1) 9 (water 200)))
       in
-      let* r2 = Guard_file.open_ ~dir ~cap:8 ~head_water:no_heads in
-      let (_ : Guard_sink.t), fl2, v2, h2 = opened "G3 fresh arm" r2 in
+      let* r2 = Guard_file.open_ ~dir ~cap:8 ~head_water:no_heads ~identity in
+      let (_ : Guard_sink.t), fl2, v2, (_ : Guard_file.identity_outcome), h2 =
+        opened "G3 fresh arm" r2 in
       check
         "G3 a fresh store still adopts the legacy floor; the real claim reads \
          no-branch, not rollback"
@@ -503,9 +528,12 @@ let () =
           [ adv live (tab 1) 3 (water 40); adv ghost (tab 1) 5 (water 40) ]
       in
       let* r0 =
-        Guard_file.open_ ~dir ~cap:8 ~head_water:(heads [ (live, water 80) ])
+        Guard_file.open_ ~dir ~cap:8
+          ~head_water:(heads [ (live, water 80) ])
+          ~identity
       in
-      let (_ : Guard_sink.t), fl, v, h = opened "G4" r0 in
+      let (_ : Guard_sink.t), fl, v, (_ : Guard_file.identity_outcome), h =
+        opened "G4" r0 in
       check
         "G4 a floor whose replica names NO branch drops in the same open \
          where a covered floor is kept"
@@ -524,8 +552,14 @@ let () =
 let () =
   in_scratch (fun dir ->
       let ra = replica "g-compact-a" and rb = replica "g-compact-b" in
-      let* r0 = Guard_file.open_ ~dir ~cap:2 ~head_water:no_heads in
-      let sink, (_ : Floors.t), (_ : Guard_file.verdict), h = opened "G5" r0 in
+      let* r0 = Guard_file.open_ ~dir ~cap:2 ~head_water:no_heads ~identity in
+      let ( sink
+          , (_ : Floors.t)
+          , (_ : Guard_file.verdict)
+          , (_ : Guard_file.identity_outcome)
+          , h ) =
+        opened "G5" r0
+      in
       let* () =
         Lwt_list.iter_s
           (put "pre-compaction fill" sink)
@@ -551,8 +585,10 @@ let () =
       let* r1 =
         Guard_file.open_ ~dir ~cap:2
           ~head_water:(heads [ (ra, water 50); (rb, water 90) ])
+          ~identity
       in
-      let (_ : Guard_sink.t), fl, v, h2 = opened "G5 reopen" r1 in
+      let (_ : Guard_sink.t), fl, v, (_ : Guard_file.identity_outcome), h2 =
+        opened "G5 reopen" r1 in
       check
         "G5 compaction re-emitted each floor's water: the rolled-back key \
          still drops, the covered key keeps its exact seq"
@@ -589,8 +625,9 @@ let () =
       in
       let* size0 = size_of (journal_of dir) in
       let under = heads [ (rb, water 60) ] in
-      let* r1 = Guard_file.open_ ~dir ~cap:2 ~head_water:under in
-      let (_ : Guard_sink.t), fl1, v1, h1 = opened "G6 first open" r1 in
+      let* r1 = Guard_file.open_ ~dir ~cap:2 ~head_water:under ~identity in
+      let (_ : Guard_sink.t), fl1, v1, (_ : Guard_file.identity_outcome), h1 =
+        opened "G6 first open" r1 in
       let* size1 = size_of (journal_of dir) in
       check
         "G6 a filtering open compacts the refused records away in the open \
@@ -603,8 +640,10 @@ let () =
       let* r2 =
         Guard_file.open_ ~dir ~cap:2
           ~head_water:(heads [ (ra, water 500); (rb, water 60) ])
+          ~identity
       in
-      let (_ : Guard_sink.t), fl2, v2, h2 = opened "G6 second open" r2 in
+      let (_ : Guard_sink.t), fl2, v2, (_ : Guard_file.identity_outcome), h2 =
+        opened "G6 second open" r2 in
       check
         "G6 the drop is durable: a head risen past the stale water cannot \
          un-drop the floor"
@@ -641,9 +680,17 @@ let () =
         plant dir [ adv rd (tab 1) 6 (water 100); adv rk (tab 1) 4 (water 30) ]
       in
       let* r0 =
-        Guard_file.open_ ~dir ~cap:8 ~head_water:(heads [ (rk, water 80) ])
+        Guard_file.open_ ~dir ~cap:8
+          ~head_water:(heads [ (rk, water 80) ])
+          ~identity
       in
-      let sink, fl, (_ : Guard_file.verdict), h = opened "G7" r0 in
+      let ( sink
+          , fl
+          , (_ : Guard_file.verdict)
+          , (_ : Guard_file.identity_outcome)
+          , h ) =
+        opened "G7" r0
+      in
       let guard =
         Dguard.v ~sessions:Guard.default_sessions ~tabs:Guard.default_tabs
           ~sink ~floors:fl ()
@@ -666,19 +713,21 @@ let () =
       let r1 = replica "g-cap-one"
       and r2 = replica "g-cap-two"
       and r3 = replica "g-cap-three" in
-      let* () =
-        plant dir
-          [ adv r1 (tab 1) 2 (water 10)
-          ; adv r2 (tab 1) 3 (water 20)
-          ; adv r3 (tab 1) 4 (water 30)
-          ]
+      let three =
+        [ adv r1 (tab 1) 2 (water 10)
+        ; adv r2 (tab 1) 3 (water 20)
+        ; adv r3 (tab 1) 4 (water 30)
+        ]
       in
+      let* () = plant dir three in
       let* ra =
         Guard_file.open_ ~dir ~cap:1
           ~head_water:
             (heads [ (r1, water 50); (r2, water 50); (r3, water 50) ])
+          ~identity
       in
-      let (_ : Guard_sink.t), fla, va, ha = opened "G8 covered arm" ra in
+      let (_ : Guard_sink.t), fla, va, (_ : Guard_file.identity_outcome), ha =
+        opened "G8 covered arm" ra in
       check
         "G8 the verdict counts water drops only: three kept in the verdict, \
          one survives the cap"
@@ -686,6 +735,15 @@ let () =
         && Int.equal (Floors.cardinal fla) 1
         && floor_at fla r3 (tab 1) ~is:4);
       let* () = Guard_file.close ha in
+      (* Arm one met a headerless journal and STAMPED it, and a stamping open
+         rewrites the file to the floors that survived the cap (step 18). So
+         the journal is REPLANTED with the same three records, the G3 arm-two
+         recipe: this arm is about a fresh store's verdict over those bytes,
+         not about what survived arm one. *)
+      let* () =
+        write_file (journal_of dir)
+          (String.concat "" (List.map Guard_sink.Codec.to_bytes three))
+      in
       (* The companion arm: one REAL drop beside the same cap eviction. The
          survivor also pins that the cap ranks only ADMITTED keys — a cap
          that still counted the dropped r3's touch would evict r2 and leave
@@ -693,8 +751,10 @@ let () =
       let* rb =
         Guard_file.open_ ~dir ~cap:1
           ~head_water:(heads [ (r1, water 50); (r2, water 50); (r3, water 5) ])
+          ~identity
       in
-      let (_ : Guard_sink.t), flb, vb, hb = opened "G8 companion arm" rb in
+      let (_ : Guard_sink.t), flb, vb, (_ : Guard_file.identity_outcome), hb =
+        opened "G8 companion arm" rb in
       check
         "G8 companion: the water drop is counted, the cap eviction still is \
          not, and the cap ranks only admitted keys"

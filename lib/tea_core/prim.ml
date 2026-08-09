@@ -289,3 +289,47 @@ module Store_water = struct
   let to_int64 (t : t) : int64 = t
   let t = Repr.int64
 end
+
+module Store_identity = struct
+  type t = string
+
+  type err =
+    | Wrong_length
+    | Invalid_char of char
+
+  (* The [Tab_id] shape, one layer up: 16 bytes as lowercase hex, and no
+     trusted [v] mint, so every inhabitant arrives validated. Uppercase is a
+     refusal rather than a normalisation, because a second spelling of one
+     store's token reads as a foreign store. *)
+  let hex_length = 32
+  let byte_count = 16
+  let is_hex c = is_digit c || (c >= 'a' && c <= 'f')
+
+  let of_string s =
+    if Int.equal (String.length s) hex_length then
+      first_where (fun c -> not (is_hex c)) s
+      |> Option.fold ~none:(Ok s) ~some:(fun c -> Error (Invalid_char c))
+    else Error Wrong_length
+
+  let of_bytes bs =
+    if
+      Int.equal (List.length bs) byte_count
+      && List.for_all (fun b -> b >= 0 && b <= 255) bs
+    then Some (String.concat "" (List.map (fun b -> Printf.sprintf "%02x" b) bs))
+    else None
+
+  (* Total by construction, the [Tab_id.of_draws] reason: a refusal here would
+     invite a constant token, which is the store-collision bug wearing a
+     fallback's clothes. *)
+  let of_draws draw =
+    String.concat ""
+      (List.init byte_count (fun (_ : int) -> Printf.sprintf "%02x" (draw () land 0xff)))
+
+  let to_string t = t
+  let equal = String.equal
+  let compare = String.compare
+
+  type binding =
+    | Bound of t
+    | Unresolved
+end

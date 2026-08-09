@@ -409,3 +409,88 @@ let () =
   in
   check "of_bytes is total on 200 lcg garbage strings"
     (List.for_all survives (List.init 200 Fun.id))
+
+(* --- 10. The framing under the tag dispatch --------------------------------
+
+   [frame]/[unframe] are the framing [to_bytes]/[of_bytes] are recomposed
+   over, so a frame kind this module does not own ([Guard_file]'s tag 4
+   store-identity header) reuses one framing and one CRC instead of growing a
+   second checksum scheme. Tag dispatch stays with the caller, which is why
+   [unframe] must classify torn and lying frames exactly as [of_bytes] does
+   yet never answer [Bad_tag]. The last check pins the recomposition itself:
+   the wire [to_bytes] writes has to stay byte-identical to [frame] at tag 3
+   over the same body, or this refactor moved the format. *)
+
+let unframed_is (r : (char * string * int, Codec.decode_err) result)
+    ~(tag : char) ~(payload : string) ~(next : int) : bool =
+  Result.fold r
+    ~ok:(fun ((t, p, n) : char * string * int) ->
+      Char.equal t tag && String.equal p payload && Int.equal n next)
+    ~error:(fun (_ : Codec.decode_err) -> false)
+
+let unframe_errs (r : (char * string * int, Codec.decode_err) result)
+    ~(want : Codec.decode_err -> bool) : bool =
+  Result.fold r ~ok:(fun (_ : char * string * int) -> false) ~error:want
+
+let err_torn (e : Codec.decode_err) : bool =
+  match e with
+  | Codec.Torn -> true
+  | Codec.Bad_crc -> false
+  | Codec.Bad_tag (_ : int) -> false
+  | Codec.Bad_field (_ : string) -> false
+
+let err_bad_crc (e : Codec.decode_err) : bool =
+  match e with
+  | Codec.Bad_crc -> true
+  | Codec.Torn -> false
+  | Codec.Bad_tag (_ : int) -> false
+  | Codec.Bad_field (_ : string) -> false
+
+(** Every byte but the last, without computing a range. *)
+let drop_last (s : string) : string =
+  String.of_seq (Seq.take (String.length s - 1) (String.to_seq s))
+
+(** Replace one body byte with a byte it cannot already be, so the frame stays
+    its declared length and only its CRC is falsified. *)
+let falsify_at (j : int) (s : string) : string =
+  String.mapi
+    (fun (i : int) (c : char) ->
+      if Int.equal i j then if Char.equal c 'x' then 'y' else 'x' else c)
+    s
+
+let () =
+  let payload = "the tag four store identity blob" in
+  let framed = Codec.frame ~tag:'\004' ~payload in
+  check "a tag 4 frame unframes to its tag, its payload and the frame end"
+    (unframed_is
+       (Codec.unframe framed ~pos:0)
+       ~tag:'\004' ~payload ~next:(String.length framed));
+  check "a tag 4 frame short by one byte is Torn"
+    (unframe_errs (Codec.unframe (drop_last framed) ~pos:0) ~want:err_torn);
+  (* Offset 6 sits inside the payload: the body starts at 4 and its tag is
+     that first byte. *)
+  check "one falsified body byte in a tag 4 frame is Bad_crc"
+    (unframe_errs
+       (Codec.unframe (falsify_at 6 framed) ~pos:0)
+       ~want:err_bad_crc);
+  let stranger = Codec.frame ~tag:'\009' ~payload:"x" in
+  check "unframe hands back a tag no event uses, never Bad_tag"
+    (unframed_is
+       (Codec.unframe stranger ~pos:0)
+       ~tag:'\009' ~payload:"x" ~next:(String.length stranger))
+
+(** The tag 3 payload spelled independently of the codec, so [to_bytes] cannot
+    change what it frames without this check noticing. *)
+let advance_quad_t : (Replica.t * string * int * Water.t) Repr.t =
+  Repr.(quad Replica.t string int Water.t)
+
+let encode_advance_quad = Repr.unstage (Repr.to_bin_string advance_quad_t)
+
+let () =
+  let r = replica "inert" in
+  let tb = tab 5 in
+  let w = water 130 in
+  let ev = Sink.Advance { replica = r; tab = tb; seq = seq 13; water = w } in
+  let body = encode_advance_quad (r, Tab_id.to_string tb, 13, w) in
+  check "to_bytes is exactly frame at tag 3 over the advance body"
+    (String.equal (Codec.to_bytes ev) (Codec.frame ~tag:'\003' ~payload:body))

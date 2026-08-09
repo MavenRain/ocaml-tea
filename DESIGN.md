@@ -52,6 +52,8 @@ toolchain removes an entire tier lean-tea had to hand-write.
 | `test/rpc_once_test` (incl. T1's ordering arm: the keyed 200 waits for the floor's append), `test/rpc_pack_once_test` (the native B10: two lives over one pack root), `test/rpc_window_test` (the `?on_taken` two-writer checks), `test/reply_cache_test`, `test/rpc_delivery_test`, `test/rpc_journal_test`, `test/pack_guards_test` + browser B9/B10 lost-response scenarios | **passes** (confirmed by mutation: 19 ids, full dual-suite sweep) |
 | `live_session` teardown restructured (`handle_frame` never a cancellation target, sender death a `Lwt.wait`-based `died` signal raced through `Lwt.choose`) + ONE `Lwt.protected` span over `step_ws` and both `persist_taken` arms - cancellation atomicity for the take-to-ack span | **built, green** (roadmap step 16, D21) |
 | `test/cancel_test` s1-s7 - a deterministic mid-span sender death, the session promise waiting on the in-flight span, a `handle_frame` rejection releasing the taken seq for a Fresh replay that applies exactly once, an external cancel leaving a completed orphan with no ack minted, a replay raced against the still-parked orphan reading Duplicate, the fuel arm's once-ever bottom floor under cancellation, and a cancelled wrapper whose orphan then rejects still releasing for a Fresh replay | **passes** (confirmed by mutation: 7 s16 ids) |
+| `Tea_core.Prim.Store_identity` + `Store_pack.resolve_identity` minting `<root>/tea.identity` + the tag-`'\004'` identity header on both guard journals + `Guard_file.open_ ~identity` with the five-way `identity_outcome` + `Guard_sink.Codec.frame`/`unframe` - a create-once store lineage token cross-binding the pack root to its guard journals, so a journal restored beside a DIFFERENT store drops its floors as visible duplicates instead of losing the replays silently | **built, green** (roadmap step 18, D23) |
+| `test/store_identity_test`, `test/guard_identity_test` (I1-I13: both channels, the bottom-water stranger, the legacy adopt, the compaction round-trip, the Unresolved hold, its recovery and its held-file byte identity, the foreign header, the corrupt head) + `test/identity_explain_test` boot-log truthfulness + `pack_guards_test` header independence + `archive_gc_test` post-GC survival + `rpc_pack_once_test`'s end-to-end mismatch control | **passes** (confirmed by mutation: 12 s18 ids 12/12 killed + 5 review-fix ids) |
 
 Toolchain: OCaml 5.3.0, dune 3.24, a dedicated opam switch (`irmin-tea` locally) with
 `irmin 3.11`, `dream 1.0.0~alpha8`, `repr 0.8`, `vdom 0.3`, `js_of_ocaml 6.4`.
@@ -1166,6 +1168,90 @@ nothing is lost.
 > stale-handle no-op, depth-zero reentrancy), and `rpc_window_test`
 > T22; suite baseline 1069 native checks across 44 executables.
 
+> **D23 - store-identity binding: a guard journal knows which store earned
+> its floors (roadmap step 18; closes R20a for independent stores, declares
+> R20b in its place).** The shape: a create-once 128-bit token, 32
+> lowercase hex characters (`Prim.Store_identity`), minted once into
+> `<root>/tea.identity` by `Store_pack.resolve_identity` and stamped as
+> each guard journal's own first frame, tag `'\004'`. Inside the root and
+> not a fourth `<root>.identity` sibling by `prim.mli:322-326`'s own rule:
+> a witness that must be written is a fourth thing that can be restored
+> out of step, R20 recursed one level, and only a file inside the tree
+> travels with the `cp -r`/tar/rsync/snapshot that creates R20 in the
+> first place. That placement is now evidence rather than the bet
+> `tea_server_pack.ml:283-287` declined in step 12:
+> `Layout.Classification.Upper.v` is a closed match on the `store.*`
+> scheme whose fallthrough is `` `Unknown``, `file_manager.ml`'s post-GC
+> cleanup never removes an `` `Unknown`` entry, and `open_rw`/`open_ro` do
+> not scan the directory at all, so the `tea.` prefix defends against the
+> SCHEME, not against today's filename list. The journal side is an
+> in-band header and not a fifth file because the claim and the floors it
+> authorises are the same bytes and the same `compact` tmp-then-rename
+> generation: no single deletion, no partial write and no failed stamp can
+> leave floors standing without their binding, which a
+> `<root>.guard/identity` file could. It also makes the two channels
+> identical by construction - each journal reads and writes only its own
+> header, so the websocket stamp is physically incapable of satisfying the
+> rpc check, and the rpc floors are the dangerous ones.
+> `Guard_file.open_ ~identity` reports one of five outcomes, and the two
+> absences are asymmetric - the structural twin of `Store_water.bottom`:
+> an absent journal claim is no claim, adopted on trust and counted
+> (`Adopted_unbound`), because treating it as a mismatch would wipe every
+> floor on every upgrade; a decoded DIFFERENT claim is `Rebound`, floors
+> cleared outright and the journal re-bound in the same open (step 13's
+> own immediate-compaction argument, one layer up); a store whose own
+> token cannot be established is `Unresolved_cleared`, floors cleared but
+> the journal HELD byte-for-byte - no compaction, no re-stamp, no append
+> persisted - so a boot that can read the token again keeps what it
+> earned. The drop-everything arm is reserved for a DECIDED difference,
+> and the review round below sharpened where that line runs: a header
+> frame that unframes cleanly but whose payload is not a valid token
+> cannot be this store's token, so it is a decided mismatch and lands
+> `Rebound`; head bytes that fail unframing on a NON-empty journal are
+> undecidable and land `Adopted_unbound 0`, audible; `Freshly_bound` is
+> reserved for the exactly zero-byte file, the only silent arm. The
+> one-line implementation that would be a NEW silent loss and is therefore
+> forbidden: a mismatch must clear the decoded events BEFORE
+> `Floors.of_events`, never `filter ~head:(fun _ -> None)`, because that
+> filter keeps a `Store_water.bottom` floor unconditionally before it
+> consults any head (`durable_guard.ml:125-130`), so a stranger's legacy,
+> no-op and fuel-exhausted records would survive and go on judging replays
+> Duplicate; pinned by s18-a, the most important mutant of the sweep.
+> Declared non-goals, each with its reason: no binding artifact and no MAC
+> for `<root>.secret` - a wrong secret already fails AEAD authentication
+> and yields a FRESH session, strictly safer than a duplicate, and the
+> secret is a restorable sibling whose rotation would become a
+> mass-duplicate event; no strict refuse-boot flag - its failure mode is a
+> refuse-loop on the routine restore, clearable only by deleting the
+> artifact the operator is trying to protect, against
+> `tea_server_pack.ml:286-287`'s standing line; no lock, and no part of
+> this argument leans on one (R18). The sweep, from the measurement: 12
+> mutants, s18-a through s18-l, 12 of 12 killed on their predicted checks,
+> zero survivors, every kill a genuine test failure on a clean build - no
+> build-error and no timeout pseudo-kills. One prediction missed sideways:
+> s18-f's expected I7 collateral never fired, because `link`'s EEXIST arm
+> makes an unconditional mint converge to adoption; S3's origin assertion
+> killed it outright, so no gap. The adversarial review round (seven shard
+> finders plus one adversarial correctness pass, every finding
+> independently re-verified against the live code) confirmed five
+> findings, all fixed and each pinned by its own kill-checked test: the
+> strict hold held only the open path - an append past `4 * cap` could
+> compact a HELD journal and restamp this store's floors under the
+> stranger's token, silent loss on the return restore - fixed by a `held`
+> field that disarms every write path, pinned by I11's byte-for-byte
+> journal identity across thirty appends; a CRC-valid header whose payload
+> decodes to no token discarded its frame boundary and erased intact
+> floors as a silent `Freshly_bound` - fixed by the `Foreign_header` state
+> keeping the consumed offset, pinned by I12; a corrupt first frame on a
+> non-empty journal bucketed as "empty" - fixed as above, pinned by I13;
+> boot-log lines that promised a binding an Unresolved boot never
+> performed - fixed by the pure `explain_outcome` and the conditional
+> `explain_identity` wording, pinned by `identity_explain_test`; and an
+> adopt-race readback failure mislabelled `Absent_unmintable` where the
+> honest origin is `Unreadable` - fixed by forwarding the readback's own
+> origin, the arm a two-process race window, declared untested. Suite
+> after the round: 1178 native checks across 47 executables.
+
 ## 8. Shared RPC contract - built (roadmap step 7; hardened step 8, D11/D12)
 
 lean-tea kept its tiers aligned by convention: route strings and encode/decode
@@ -1636,7 +1722,14 @@ Each lean-tea private-constructor primitive → an OCaml `.mli` boundary:
   intelligible to the same client, which is exactly what lets a load balancer,
   or a systemd restart overlapping a still-draining process, route one client
   into both. A load-balanced pair over one root is a data-loss configuration,
-  not a scaling one. A lock file is out of scope for this step.
+  not a scaling one. A lock file is out of scope for this step. Step 18's
+  store-identity token does not change this and must not be read as
+  touching it: two processes over one root resolve the SAME
+  `<root>/tea.identity`, so both match, both serve, and the token sees
+  neither the second writer nor a root swapped under a running server - it
+  is read once, at boot. No part of the step-18 design leans on a lock,
+  and `test/pack_root_test.ml`'s stale comment claiming one was fixed in
+  that step.
 - **R19 (med) - a durable session cookie behind a TLS-terminating proxy is
   emitted without `Secure` and without the `__Host-` prefix.**
   `Dream.cookie_sessions` marks the cookie `Secure` only when Dream itself
@@ -1678,13 +1771,57 @@ Each lean-tea private-constructor primitive → an OCaml `.mli` boundary:
   have closed this - it is constant over the store's whole life, so an older
   snapshot of the SAME store carries it and it matches; only a monotone,
   per-floor witness can see a branch that went backwards. **R20a, the
-  surviving identity residue:** a journal restored beside a DIFFERENT store
-  whose same-named branch happens to carry a newer head date passes the
-  check - order, not identity, is what a water can answer - and catching it
-  is the one job left for a store-identity token, kept as the named future
-  fix rather than shipped. Until then the exposure also includes the first
-  boot after a step-12 upgrade, whose floors decode at `bottom` and are
-  adopted on trust (counted `unwitnessed`, one warning line).
+  identity residue - CLOSED for independent stores in step 18 (D23),
+  narrowed to R20b.** A journal restored beside a DIFFERENT store whose
+  same-named branch happens to carry a newer head date passed the check,
+  because order, not identity, is what a water can answer. The blast
+  radius was larger than this entry first stated and it was concentrated
+  on the RPC channel, not the websocket one: ws floors are keyed by
+  session replica, so an unrelated store has no `session-<hex>` branch and
+  the floors already fell out as `dropped_no_branch`; but every RPC floor
+  is keyed on `main` (`floor_replica:Store.main_replica`), every pack
+  store has a `main`, and `Store_water` is an approximate wall-clock date,
+  so an RPC journal restored beside ANY store written to more recently
+  kept ALL its floors and judged every replayed keyed call Duplicate -
+  silent loss with no lineage coincidence and no 144-bit collision
+  required. Step 18 closes that: `<root>/tea.identity` is minted once
+  inside the pack root, each journal carries it as its first frame, and a
+  cleanly decoded mismatch drops every floor in that journal and re-binds
+  it, so the replays land Fresh as visible duplicates. What a create-time
+  token still cannot see is a divergent COPY of one lineage - the same
+  argument this entry already makes against the rollback case applies
+  here too: a clone, a restored-then-advanced backup, or a staging copy
+  carries the token unchanged, so the original's journal beside the copy
+  still reads as bound and the loss stands. That is **R20b**. Two smaller
+  exposures remain named rather than closed: a first boot after the
+  step-18 upgrade adopts a headerless journal's floors on trust (counted
+  `Adopted_unbound`, one warning line, and the journal is bound in that
+  same boot so the window is exactly one boot), and a downgrade to a
+  pre-step-18 binary meets tag `4` at byte 0, reads `Bad_tag`, and keeps
+  zero frames - the duplicate side, the same sanctioned downgrade
+  direction step 13's tag `3` already established, but wider.
+- **R20b (med) - a create-time token cannot distinguish a store from its
+  own copy.** A `cp -r`, a filesystem snapshot, a restored-then-advanced
+  backup, and a staging clone all carry `<root>/tea.identity` unchanged,
+  so a journal from the original placed beside the copy decodes a
+  MATCHING header and keeps every floor - and because the copy has
+  diverged, those floors can stand over effects the copy does not hold.
+  This is the same structural fact D23's own placement argument depends
+  on (the token travels with the bytes, which is what makes a partial
+  restore detectable) read in the other direction, and it is not a defect
+  in the token so much as the boundary of what a value constant over a
+  store's life can answer. Also unchanged: an operator who deliberately
+  copies the token between roots, or hand-mixes `store.*` from one root
+  with `tea.identity` from another, gets a matching read - the token is
+  exactly as reliable as the root being restored as a UNIT, and it is
+  deliberately not MAC'd against `<root>.secret`, which is itself a
+  restorable sibling whose rotation would then clear every floor. The
+  successor is a boot EPOCH: a counter bumped in the root at each open
+  and echoed into each journal, which MOVES on divergence and would see
+  the copy. Not shipped in step 18 - it is a larger change and its own
+  failure mode (a journal whose stamp lagged a boot false-positives into
+  a floor wipe) is accept-side but noisy, so it is named here rather than
+  half-built.
 - **R21 (low) - delivery dedup is not intent dedup.** Repeated user intents
   (a double-click) are distinct calls, distinct seqs, and apply twice,
   visibly. App-level intent coalescing is out of scope because it would
@@ -2180,3 +2317,47 @@ Each lean-tea private-constructor primitive → an OCaml `.mli` boundary:
     (`Lwt.wait` -> `Lwt.task`) the declared survivor, masked by
     `Lwt.protected` and proven load-bearing by the joint s17-ef mutant;
     suite baseline 1069 native checks across 44 executables.)
+18. **Store-identity token** - close DESIGN R20a for independent stores,
+    so a guard journal restored beside a DIFFERENT pack store drops its
+    floors instead of judging replays Duplicate against effects that
+    store never produced (D23; R20b declared in its place). **Done**
+    (`Tea_core.Prim.Store_identity`, a 16-byte / 32-lowercase-hex
+    de-duplication key over stores, minted once by
+    `Store_pack.resolve_identity` into `<root>/tea.identity` with the
+    `O_EXCL`-temp + fsync + `Unix.link` publish `Session_secret` already
+    uses, never rewritten on any failure and never re-minted; inside the
+    root because a fourth sibling is R20 recursed one level, and under
+    the `tea.` prefix because irmin-pack's `store.*` classifier leaves
+    `` `Unknown`` entries alone through open, GC cleanup and migration.
+    Each journal carries the binding as its own first frame, tag
+    `'\004'`, peeled before `decode_prefix` so no `Guard_sink.event`, no
+    `Floors` fold and no cap eviction ever sees it, and written only
+    inside `compact`'s existing tmp-then-rename cutover so the binding
+    and the floors are always one generation.
+    `Guard_file.open_ ~identity` takes one binding read once and handed
+    to both channels, exactly as `~head_water` is, and reports one of
+    five exhaustive outcomes: `Matched`; `Freshly_bound`, reserved for
+    the exactly zero-byte journal; `Adopted_unbound n` for a headerless
+    journal, including one whose head bytes cannot be unframed,
+    trust-on-first-use and counted, bound in that same open; `Rebound n`
+    for a decoded different token, or a header whose payload can be no
+    store's token, floors cleared BEFORE `Floors.of_events` - never by
+    starving the water filter, which keeps `bottom` floors
+    unconditionally - and the journal re-bound immediately on step 13's
+    own argument; and `Unresolved_cleared n` when the root's own token
+    cannot be read or minted, which clears the floors but HOLDS the
+    journal byte-for-byte - no compaction, no re-stamp, no append
+    persisted - so a later boot that can read the token keeps what it
+    earned. Degradation is duplicate in every arm and there is no
+    refusal anywhere on the path, by construction of the types rather
+    than by convention. Declared non-goals: no binding for
+    `<root>.secret`, no MAC against it, no strict fail-closed flag.
+    Pinned by `test/store_identity_test`, `test/guard_identity_test`
+    I1-I13, `test/identity_explain_test`'s boot-log truthfulness
+    checks, the two-channel checks in `pack_guards_test`, a post-GC
+    survival check in `archive_gc_test`, an end-to-end `Rpc_once`
+    positive control in `rpc_pack_once_test`, a 12-mutant sweep - 12/12
+    killed on their predicted checks, zero survivors, every kill a test
+    failure on a clean build - and five kill-checked review-fix mutants
+    from the adversarial round; suite baseline 1178 native checks
+    across 47 executables.)

@@ -94,6 +94,62 @@ module Make (A : Tea_core.App.APP) : sig
       opposite fixes. The sentence is a fragment, meant to be embedded (the
       caller supplies the subject and the consequence). *)
 
+  type identity_origin =
+    | Read  (** decoded from an existing [<root>/tea.identity] *)
+    | Minted  (** absent; this boot drew it and published it *)
+    | Adopted  (** lost the [O_EXCL]/[link] race; re-read the winner's bytes *)
+    | Absent_unmintable of string  (** absent, and the mint failed; the reason *)
+    | Unreadable of string  (** present, but lstat/open/read refused it; the reason *)
+    | Malformed  (** present and read, but not 32 lowercase hex *)
+
+  val identity_path : Root.t -> string
+  (** [<root>/tea.identity]. Exposed so a test can delete, corrupt, or stat it
+      without duplicating the filename literal, and so a check can assert it
+      survives a checkpoint GC. *)
+
+  val resolve_identity : Root.t -> Tea_core.Prim.Store_identity.binding * identity_origin
+  (** The store's create-once lineage token (step 18, D23, R20a). Total,
+      synchronous, and never raises: read [<root>/tea.identity] if it is there,
+      else draw 16 bytes and publish them with the same [O_EXCL]-temp + [fsync]
+      + [Unix.link] pattern {!Tea_server.Session_secret} mints its secret with -
+      [link] rather than [rename] precisely because it fails [EEXIST] instead of
+      overwriting, so a racing second boot re-reads the winner's bytes rather
+      than installing a second identity for one store.
+
+      Every failure yields [Unresolved] with the reason. There is no error
+      result and no refusal arm BY CONSTRUCTION OF THE TYPE, not by convention:
+      identity trouble must never be able to stop a boot, because the whole
+      guard family's degradation direction is duplicate, never loss, and a
+      server without durability beats no server.
+
+      An existing file is NEVER rewritten, truncated, or deleted - not on a
+      malformed read, not to heal it, not to migrate it. This is
+      {!Tea_server.Session_secret}'s rule for the same reason one level over
+      (R14): an unreadable token may be a transient mount problem, and
+      overwriting it would permanently unbind every journal that already names
+      it.
+
+      ORDERING, load-bearing: call this only AFTER {!open_root} or {!create} has
+      succeeded. The backend does exactly one [mkdir], and a [tea.identity]
+      minted into a directory this function created would leave a [<root>]
+      holding no [store.control] and no [store.pack] - which {!open_root}
+      classifies [Root_not_a_pack_store] on the next boot.
+
+      The token lives INSIDE [<root>], never as a fourth [<root>.identity]
+      sibling: a token that does not travel atomically with the store's own
+      bytes is R20 recursed one level, and only a file inside the tree is
+      carried by the [cp -r]/tar/rsync/snapshot that creates R20 in the first
+      place. The [tea.] prefix is chosen against irmin-pack's naming SCHEME, not
+      its current filenames - [Irmin_pack.Layout.Classification.Upper.v] splits
+      on ['.'] and every arm begins ["store"], so anything outside that
+      namespace classifies [`Unknown], which [file_manager.ml]'s post-GC cleanup
+      explicitly never removes. Never take a name under [store.] or
+      [volume.]. *)
+
+  val explain_identity : identity_origin -> string
+  (** One sentence per constructor, matched HERE so a new constructor is a
+      compile error in one place ({!explain}'s rule). *)
+
   val gc_behaviour : t -> [ `Archive | `Delete ]
   (** [`Archive] when a [lower_root] was configured (GC moves discarded data to
       the lower layer), [`Delete] otherwise. Observable without running a GC. *)

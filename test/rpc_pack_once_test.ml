@@ -48,6 +48,7 @@ module Floors = Durable_guard.Floors
 module Tab_id = Tea_core.Prim.Tab_id
 module Msg_seq = Tea_core.Prim.Msg_seq
 module Store_water = Tea_core.Prim.Store_water
+module Store_identity = Tea_core.Prim.Store_identity
 
 let failures = ref 0
 
@@ -79,6 +80,12 @@ let secret_file = Filename.concat parent "store.secret"
    composition. *)
 let journal_cap = 16384
 
+(* One store, one identity, every life: the binding [serve_pack] will read once
+   from the root and hand to both channels. Fixed here rather than re-minted per
+   life, so the restart below meets its OWN journals rather than a stranger's. *)
+let store_id : Store_identity.t = Store_identity.of_draws (fun () -> 0x7e)
+let identity : Store_identity.binding = Store_identity.Bound store_id
+
 type life =
   { driver : Dream.request -> Dream.response
   ; repo : Store.t
@@ -103,20 +110,36 @@ type life =
    directory is the rpc journal's PARENT, so opening the rpc channel first fails
    with ENOENT (rpc_journal_test pins exactly that). A test that reached for the
    inner journal alone would be composing a wiring [serve_pack] cannot produce -
-   and would have to mkdir behind the framework's back to run at all. *)
-let boot () : life =
+   and would have to mkdir behind the framework's back to run at all.
+
+   [?binding] is the store token this life hands to both journals. It defaults
+   to the one binding above, which is the shipped shape - [serve_pack] reads it
+   once from the root and every life over that root sees the same value. The
+   parameter exists for the last scenario only, where a life meets the journals
+   under a token that is NOT theirs (R20a), and it is a parameter rather than a
+   second boot function so that the mismatched life is otherwise the same
+   wiring, opened the same way, by the same code. *)
+let boot ?(binding : Store_identity.binding = identity) () : life =
   let repo = Lwt_main.run (Store.create root) in
   let head_water =
     Lwt_main.run (Lwt.map Guard_file.head_water_of_list (Store.branch_waters repo))
   in
   let open_journal ~(what : string) ~(dir : string) ~(cap : int) :
-      Guard_sink.t * Durable_guard.Floors.t * Guard_file.verdict * Guard_file.t =
-    Lwt_main.run (Guard_file.open_ ~dir ~cap ~head_water)
+      Guard_sink.t
+      * Durable_guard.Floors.t
+      * Guard_file.verdict
+      * Guard_file.identity_outcome
+      * Guard_file.t =
+    Lwt_main.run (Guard_file.open_ ~dir ~cap ~head_water ~identity:binding)
     |> Result.fold
          ~ok:(fun
-             ((s, f, v, j) :
-               Guard_sink.t * Durable_guard.Floors.t * Guard_file.verdict * Guard_file.t)
-           -> (s, f, v, j))
+             ((s, f, v, o, j) :
+               Guard_sink.t
+               * Durable_guard.Floors.t
+               * Guard_file.verdict
+               * Guard_file.identity_outcome
+               * Guard_file.t)
+           -> (s, f, v, o, j))
          ~error:(fun (e : Guard_file.open_err) ->
            die
              (match e with
@@ -125,11 +148,14 @@ let boot () : life =
              | Guard_file.Io (r : string) ->
                Printf.sprintf "the %s journal opens (io: %s)" what r))
   in
-  let (_ : Guard_sink.t), (_ : Durable_guard.Floors.t), (_ : Guard_file.verdict), ws_journal
-      =
+  let ( (_ : Guard_sink.t)
+      , (_ : Durable_guard.Floors.t)
+      , (_ : Guard_file.verdict)
+      , (_ : Guard_file.identity_outcome)
+      , ws_journal ) =
     open_journal ~what:"websocket" ~dir:guard_dir ~cap:32768
   in
-  let file_sink, floors, verdict, journal =
+  let file_sink, floors, verdict, (_ : Guard_file.identity_outcome), journal =
     open_journal ~what:"rpc" ~dir:rpc_dir ~cap:journal_cap
   in
   (* Every record the guard appends, in write order. A recorder rather than a
@@ -508,10 +534,113 @@ let () =
         life3)
     = commits_before_rollback + 1)
 
+(* --- R20a: a mismatched binding re-admits a REAL take --------------------- *)
+
+(* The seam itself, and the only check in the suite that watches a client
+   message cross it. Every other identity fixture drives journals whose header
+   and floors are bytes a test wrote, which proves the FILTER and says nothing
+   about whether the shipped channel is wired to it: a [serve_pack] that
+   resolved the token and then never handed it to [Guard_file.open_] passes all
+   of them. Here the floor is recorded by a real keyed [Rpc_once] take through
+   the real sink, the process goes away, the journals are reopened under a
+   token that is NOT theirs, and the SAME keyed call is delivered again.
+
+   The direction is R20a's, and it is the R20 direction read through the token
+   instead of the water. A journal whose header names another store is a
+   journal this store cannot vouch for, so honouring its floors would answer
+   [Duplicate] for writes this store may never have made: silent loss. Clearing
+   them re-admits the message as [Fresh], which is a visible duplicate, and a
+   visible duplicate is the sanctioned failure.
+
+   Three things make the re-admission attributable to the token and to nothing
+   else, and all three are asserted rather than assumed: the STORE is untouched
+   across the boot (same commit count, same tag), so the floor is gone and its
+   effect is not; the de-duplication NAMESPACE is unchanged (the re-take lands
+   under the very tab the first take derived), so this is not a keyed call that
+   simply missed its floor; and the channel is still de-duplicating afterwards,
+   so it is not answering [Fresh] to everything. *)
+
+let seam_tab = "1122334455667788990aabbccddeeff0"
+let seam_key = seam_tab ^ ":1"
+let commits_before_seam = commits life3
+let seam_take = answer_of (append life3 ~key:seam_key ~cookie "seam")
+let commits_after_seam = commits life3
+
+let () =
+  check "a real keyed take on a third tab applies before the mismatched boot"
+    (is_reply seam_take);
+  check "and it really committed (the take reached the branch)"
+    (commits_after_seam = commits_before_seam + 1)
+
+(* Read off the guard's own recorder: this is the floor the shipped writer put
+   in the shipped journal, not one the test composed. *)
+let seam_floor = last_record "the seam take" life3
+
+let () =
+  check "the take recorded its floor through the real sink, at the sequence it consumed"
+    (Msg_seq.to_int seam_floor.rseq = 1);
+  check "with a store witness, not the bottom claim of nothing"
+    (not (Store_water.equal seam_floor.rwater Store_water.bottom));
+  check "in its OWN tab namespace, distinct from the tabs already in the journal"
+    (Tab_id.compare seam_floor.rtab life1_floor.rtab <> 0
+    && Tab_id.compare seam_floor.rtab other_floor.rtab <> 0)
+
+(* The process goes away, and the journals come back under a token neither of
+   them was ever stamped with. A THIRD store, met by no life above: what a
+   journal restored beside a store it never belonged to looks like to this
+   boot. *)
+let () = shutdown life3
+let stranger_id : Store_identity.t = Store_identity.of_draws (fun () -> 0x3d)
+let life4 = boot ~binding:(Store_identity.Bound stranger_id) ()
+
+let () =
+  let { Guard_file.kept; dropped_behind; dropped_no_branch; unwitnessed } = life4.verdict in
+  check "the mismatched boot adopts NO floor from the journal"
+    (kept = 0 && Floors.cardinal life4.floors = 0);
+  (* Cleared by the token, before the water filter ever ran: a drop counted
+     here would be the R20 path, which is a different refusal with a different
+     cause. *)
+  check "and it cleared them on the TOKEN, not by dropping them on their witnesses"
+    (dropped_behind = 0 && dropped_no_branch = 0 && unwitnessed = 0);
+  check "the seam floor in particular is gone"
+    (Option.is_none
+       (Floors.find_stamped ~replica:Store.main_replica ~tab:seam_floor.rtab life4.floors));
+  (* The paired presence. The floor died, the WRITE it stood over did not, so
+     an honoured floor here would have answered [Duplicate] over a store that
+     still holds the effect and would still have been the wrong answer. *)
+  check "while the store came back whole: the take's commit is still on the branch"
+    (commits life4 = commits_after_seam);
+  check "and its tag with it" (List.mem "seam" (tags life4))
+
+let commits_before_retake = commits life4
+let retake = answer_of (append life4 ~key:seam_key ~cookie "seam")
+
+let () =
+  check "the SAME keyed call is TAKEN AGAIN across the mismatched binding, not answered from the stale floor"
+    (is_reply retake);
+  check "and it applied a second time: a visible duplicate, with a second commit"
+    (commits life4 = commits_before_retake + 1);
+  (* The namespace check, and the reason this is a positive control rather than
+     an accident. The de-duplication tab is derived from the session cookie
+     (D20.1), so a life that had failed to decrypt life 3's cookie would land
+     in a different namespace and read [Fresh] however well the guard worked.
+     The re-take lands under the very tab the first take derived, so the floor
+     that was cleared IS the floor this delivery would have been refused by. *)
+  check "the re-take landed in the SAME namespace the first take did, so it really met that floor's absence"
+    (Tab_id.compare (last_record "the re-take" life4).rtab seam_floor.rtab = 0);
+  (* Re-armed: the mismatch re-admitted the message once, it did not disarm the
+     channel. In-process this is the reply cache answering, so the count is the
+     witness. *)
+  check "a second delivery of the re-taken key does not apply AGAIN"
+    (commits
+       (let (_ : answer) = answer_of (append life4 ~key:seam_key ~cookie "seam") in
+        life4)
+    = commits_before_retake + 1)
+
 (* --- Teardown ------------------------------------------------------------- *)
 
 let () =
-  shutdown life3;
+  shutdown life4;
   let rec rm_rf (path : string) : unit =
     if Sys.is_directory path then (
       Array.iter (fun entry -> rm_rf (Filename.concat path entry)) (Sys.readdir path);
@@ -523,7 +652,9 @@ let () =
     Printf.printf
       "\n\
        The keyed RPC channel is exactly-once ACROSS a restart: the floor rides the \
-       journal, the retry is refused, and a fresh key still applies (D20).\n\
+       journal, the retry is refused, a fresh key still applies (D20), and a \
+       journal reopened under another store's token re-admits the take rather \
+       than answering it from a floor this store cannot vouch for (R20a, D23).\n\
        %!"
   else Printf.printf "\n%d check(s) failed.\n%!" !failures;
   exit (if !failures = 0 then 0 else 1)

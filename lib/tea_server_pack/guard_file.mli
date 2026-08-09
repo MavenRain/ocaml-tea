@@ -40,6 +40,16 @@ type open_err =
   | Io of string
   | Bad_dir of string  (** [dir] could not be created or entered. *)
 
+val tag_identity : char
+(** ['\004'], the store-identity header frame's tag, owned HERE rather than in
+    {!Tea_server.Guard_sink}: it is a Guard_file-level structural frame, never
+    a {!Tea_server.Guard_sink.event}, so {!Tea_server.Durable_guard.Floors}
+    and the codec's tag dispatch never see it. Reserved permanently, the way
+    tag [1] stays "decoded forever, written never" rather than being recycled.
+    Tag [0] stays unassigned on purpose: a zero byte is what a sparse or
+    not-yet-written region reads back as, and giving it meaning would invite a
+    torn file to parse as a valid frame. *)
+
 type verdict = Tea_server.Durable_guard.Floors.verdict =
   { kept : int
   ; dropped_behind : int
@@ -51,7 +61,65 @@ type verdict = Tea_server.Durable_guard.Floors.verdict =
     of the R20 rollback (pack root older than the floors); [dropped_no_branch]
     is routine after checkpoint GC or a reap; [unwitnessed > 0] means this
     boot adopted pre-step-13 floors on trust and is not protected against a
-    restored older pack root. *)
+    restored older pack root. Identity is reported BESIDE these four, never
+    inside them: a whole-journal identity fact folded into a per-floor water
+    count would read to an operator as ordinary rollback noise when it may be
+    a much bigger incident. *)
+
+type identity_outcome =
+  | Matched
+      (** Header present, decoded, equal to the caller's binding: today's
+          path, byte for byte. *)
+  | Freshly_bound
+      (** The journal file is ABSENT or holds ZERO bytes: there was no claim to
+          compare against, and nothing at all could be lost by binding it.
+          Kept distinct from [Adopted_unbound 0] so a brand-new store's first
+          boot is SILENT rather than printing an "adopted 0 floors on trust"
+          line that reads as an alarm on a deployment where nothing is wrong.
+          A file that holds bytes NEVER lands here, however little of it
+          decodes: bytes that were written are floors somebody meant to keep,
+          and reporting their loss as a fresh store's first boot is exactly
+          the silence this arm must stay unique to earn. *)
+  | Adopted_unbound of int
+      (** A real journal carrying no readable header: a pre-step-18 file, one
+          whose header was lost, or one whose first bytes will not unframe at
+          all. [int] is the floors adopted on trust, counted at the same point
+          [unwitnessed] is, post-{!Tea_server.Durable_guard.Floors.filter},
+          which still runs in full, because the step-13 water check is
+          completely orthogonal to the identity question.
+          Trust-on-first-use, never a wholesale refusal: an absent claim is no
+          claim, the exact structural twin of
+          {!Tea_core.Prim.Store_water.bottom}. Treating it as a mismatch
+          instead would wipe every floor on every upgrade boot. Under a
+          {!Tea_core.Prim.Store_identity.Bound} caller the journal is stamped
+          before {!open_} returns, so the next boot is protected; under
+          {!Tea_core.Prim.Store_identity.Unresolved} there is no token to
+          stamp WITH, so the journal stays unbound and the next boot adopts
+          again. *)
+  | Rebound of int
+      (** A header frame that names a DIFFERENT store: this journal belongs to
+          other bytes. [int] is the floors it held, all of them dropped. Two
+          shapes reach this arm and both are DECIDABLE: a payload that decoded
+          cleanly into some other store's token, and a payload that decodes
+          into no token at all, which therefore equals no store's token
+          either. What never reaches it is bytes that would not unframe: those
+          carry no frame to read a claim out of, so "cannot read it" proves
+          nothing about whose store they are and they fall into
+          [Adopted_unbound] instead. *)
+  | Unresolved_cleared of int
+      (** The CALLER could not establish this store's own identity
+          ({!Tea_core.Prim.Store_identity.Unresolved}), so the journal's claim
+          cannot be confirmed. [int] floors are dropped (when in doubt this
+          family pays a duplicate), and the file is HELD for as long as the
+          returned handle lives: no compaction, no re-stamp, and no APPEND
+          reaches it, not one byte rewritten. A boot that can read the token
+          again therefore finds the original header and keeps its floors,
+          instead of finding a stand-in this boot invented. The price is
+          stated on purpose: floors this boot records live in memory only, so
+          the next boot replays them as visible duplicates. That is the accept
+          direction, and it is the same one a torn tail pays. *)
+(** What {!open_} made of the journal's identity header, reported beside the
+    water {!verdict} rather than folded into it. *)
 
 val head_water_of_list :
   (Tea_core.Crdt.Replica.t * Tea_core.Prim.Store_water.t) list ->
@@ -67,9 +135,11 @@ val open_ :
   dir:string ->
   cap:int ->
   head_water:(Tea_core.Crdt.Replica.t -> Tea_core.Prim.Store_water.t option) ->
+  identity:Tea_core.Prim.Store_identity.binding ->
   ( Tea_server.Guard_sink.t
     * Tea_server.Durable_guard.Floors.t
     * verdict
+    * identity_outcome
     * t
   , open_err )
   result
@@ -86,7 +156,28 @@ val open_ :
     rewrites the journal when the filter dropped anything. All errors arrive
     as [open_err]; the caller keeps serving on
     {!Tea_server.Guard_sink.null} rather than aborting — a server without
-    durability beats no server. *)
+    durability beats no server.
+
+    [~identity] is REQUIRED and never optional: an omitted argument defaulting
+    to "no check" is a safety gate that can be disarmed by forgetting it. It
+    is read ONCE by the caller and handed to every channel, exactly as
+    [~head_water] is and for the same reason, and because each journal file
+    carries and checks its OWN header, no channel's stamp can satisfy another
+    channel's check, which makes the two channels identical by construction
+    rather than by a rule someone has to remember.
+
+    The identity header is the file's FIRST frame or it is absent; it is
+    written ONLY as part of the compacting rewrite, which stages the whole
+    file in [<path>.tmp] and cuts over with an atomic rename, so header and
+    floors are always the same generation and the header can no more be torn
+    on the live file than the first kept floor can. A mismatch clears the
+    decoded events OUTRIGHT, before
+    {!Tea_server.Durable_guard.Floors.of_events}; it must never be implemented
+    by starving the water filter of heads, because that filter keeps a
+    {!Tea_core.Prim.Store_water.bottom} floor UNCONDITIONALLY before it ever
+    consults a head, so a stranger journal's legacy, no-op and fuel-exhausted
+    records would survive and go on judging replays [Duplicate] against a
+    store that never produced them. *)
 
 val close : t -> unit Lwt.t
 (** Flush, [fsync], close. Wire into the same SIGINT/SIGTERM teardown as

@@ -78,11 +78,17 @@ val memory : unit -> t * (unit -> event list)
     and the CRC covers the same span.
 
     Tags: [3] is the water-stamped [Advance] this codec writes (roadmap
-    step 13); [2] is [Forget]; [1] is the pre-step-13 [Advance] — decoded
+    step 13); [2] is [Forget]; [1] is the pre-step-13 [Advance] - decoded
     forever at {!Tea_core.Prim.Store_water.bottom} so an upgrade keeps every
-    floor it already earned, written never. A step-12 binary meeting tag [3]
-    reads [Bad_tag] and keeps only the preceding frames: the duplicate side,
-    the sanctioned downgrade. *)
+    floor it already earned, written never. [4] is RESERVED for
+    {!Tea_server_pack.Guard_file}'s store-identity header (roadmap step 18,
+    D23) and is never an {!event}: this codec neither writes nor decodes it,
+    and {!unframe} is how that module reaches the framing without this one
+    learning about identity. Tags are never recycled, and a future encoding
+    change for any kind takes a NEW tag rather than an in-payload version
+    byte, so this format has exactly one evolution mechanism. A binary meeting
+    a tag it does not know reads [Bad_tag] and keeps only the preceding
+    frames: the duplicate side, the sanctioned downgrade. *)
 module Codec : sig
   type decode_err =
     | Torn
@@ -97,4 +103,19 @@ module Codec : sig
   val of_bytes : string -> pos:int -> (event * int, decode_err) result
   (** Decode one frame at [pos]; [Ok (event, next)] gives the offset of the
       following frame. Total: every corruption is a [decode_err]. *)
+
+  val frame : tag:char -> payload:string -> string
+  (** The shared encode side: [len:4][tag:1][payload][crc:4], [len] counting
+      tag plus payload and the CRC covering the same span. The ONLY place the
+      framing constants live; {!to_bytes} is this applied to an event body. *)
+
+  val unframe : string -> pos:int -> (char * string * int, decode_err) result
+  (** The shared decode side: [Ok (tag, payload, next)] where [next] is the
+      offset of the following frame. [Torn] and [Bad_crc] exactly as
+      {!of_bytes} raises them today; tag DISPATCH is left to the caller, so
+      this never returns [Bad_tag] or [Bad_field] - an unrecognised tag is the
+      caller's decision, not this codec's. That is what lets
+      {!Tea_server_pack.Guard_file} own tag [4] (its store-identity header)
+      without this module growing a second checksum scheme or a second
+      framing. *)
 end

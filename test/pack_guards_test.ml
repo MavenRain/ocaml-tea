@@ -29,6 +29,7 @@ module Session_id = Tea_core.Prim.Session_id
 module Tab_id = Tea_core.Prim.Tab_id
 module Msg_seq = Tea_core.Prim.Msg_seq
 module Store_water = Tea_core.Prim.Store_water
+module Store_identity = Tea_core.Prim.Store_identity
 
 (* This file reports every failure and exits at the END, where its siblings stop
    at the first. The properties here are INDEPENDENT (layout, open order, bound
@@ -79,6 +80,12 @@ let ws_water = Store_water.of_date 7L
 let head_water (r : Replica.t) : Store_water.t option =
   if Replica.equal r replica then Some head else None
 
+(* ONE binding for both channels and both boots, the shape the composition site
+   passes: the token names the STORE, so a per-channel value would make the two
+   ledgers differ for a reason this file is not asking about. *)
+let store_id : Store_identity.t = Store_identity.of_draws (fun () -> 0x1f)
+let identity : Store_identity.binding = Store_identity.Bound store_id
+
 let rpc_tab = tab_of "a1b2c3d4e5f60718293a4b5c6d7e8f90"
 let ws_tab = tab_of "0f9e8d7c6b5a4938271605f4e3d2c1b0"
 
@@ -102,7 +109,7 @@ let stamped (g : Durable_guard.t) (tab : Tab_id.t) :
 (* Nothing exists under [parent] yet: not the guard directory, not the rpc
    subdirectory. This is a first boot on a step-14 root, or a fresh install. *)
 let { Tea_server_pack.ws = ws1; ws_journal = ws_j1; rpc = rpc1; rpc_journal = rpc_j1 } =
-  Tea_server_pack.open_guards ~guard_dir ~head_water
+  Tea_server_pack.open_guards ~guard_dir ~head_water ~identity
 
 let () =
   check "the websocket channel opens a journal on a bare root"
@@ -156,7 +163,7 @@ let () =
 
 (* The restart. Everything from here is read off the FILES. *)
 let { Tea_server_pack.ws = ws2; ws_journal = ws_j2; rpc = rpc2; rpc_journal = rpc_j2 } =
-  Tea_server_pack.open_guards ~guard_dir ~head_water
+  Tea_server_pack.open_guards ~guard_dir ~head_water ~identity
 
 let stamped_is (g : Durable_guard.t) (tab : Tab_id.t) (seq : int)
     (water : Store_water.t) : bool =
@@ -184,6 +191,132 @@ let () =
   close_journal "the reopened websocket journal closes" ws_j2;
   close_journal "the reopened rpc journal closes" rpc_j2
 
+(* --- R20a: one journal's binding cannot speak for the other's ---------------
+   [open_guards] is handed ONE binding, and that shape invites a single verdict
+   at the composition site. It is not one verdict: each journal carries and
+   checks its OWN header frame, so a header that drifts under one channel must
+   clear THAT channel's ledger and leave the other whole. The drift is
+   manufactured on the websocket side alone - a third store's token over the
+   same floors - and both channels are then reopened under the SAME binding
+   that wrote them, so the only thing that differs between the two verdicts is
+   which file the header sits in.
+
+   Stated as the presence/absence pair this file demands everywhere else, for
+   the same reason: "the websocket ledger is empty" is satisfied just as well
+   by a boot that lost both ledgers, so the emptiness is asserted beside the
+   rpc floor that has to survive the very same boot. Point both channels at one
+   file and the presence fails while the absence stays green. *)
+
+let ws_journal_file = Filename.concat guard_dir "journal"
+let rpc_journal_file = Filename.concat rpc_dir "journal"
+
+(* The identity header is the journal's FIRST frame: [len:4][tag:1]
+   [payload:32][crc:4], 41 bytes. Built through the PUBLIC [Codec.frame] and
+   the public tag, so this fixture and the writer cannot drift apart without
+   one of them changing the shared seam. *)
+let header_len = 41
+
+let header_of (id : Store_identity.t) : string =
+  Guard_sink.Codec.frame ~tag:Guard_file.tag_identity
+    ~payload:(Store_identity.to_string id)
+
+let read_journal (path : string) : string =
+  Lwt_main.run
+    (Lwt.catch
+       (fun () -> Lwt_io.with_file ~mode:Lwt_io.Input path Lwt_io.read)
+       (fun (_ : exn) -> die (Printf.sprintf "the journal at %s reads" path)))
+
+let rewrite_journal (path : string) (bytes : string) : unit =
+  Lwt_main.run
+    (Lwt.catch
+       (fun () ->
+         Lwt_io.with_file ~mode:Lwt_io.Output
+           ~flags:[ Unix.O_WRONLY; Unix.O_CREAT; Unix.O_TRUNC ]
+           path
+           (fun (out : Lwt_io.output_channel) -> Lwt_io.write out bytes))
+       (fun (_ : exn) -> die (Printf.sprintf "the journal at %s rewrites" path)))
+
+(* Everything after the header frame: the floors, untouched. Declined on a file
+   too short to hold a header, so nothing here has to trust a length. *)
+let floors_after_header (s : string) : string option =
+  if String.length s >= header_len then
+    Some (String.sub s header_len (String.length s - header_len)) (* @total-accessor *)
+  else None
+
+(* The 32 token characters a stamped journal carries at offset 5, after
+   [len:4][tag:1]. *)
+let stamped_token (s : string) : string option =
+  if String.length s >= 37 then Some (String.sub s 5 32) (* @total-accessor *)
+  else None
+
+let token_is (path : string) (id : Store_identity.t) : bool =
+  Option.fold (stamped_token (read_journal path)) ~none:false
+    ~some:(String.equal (Store_identity.to_string id))
+
+(* A THIRD store, met by neither boot above: what a journal restored from
+   another deployment, or copied in beside a store it never belonged to, looks
+   like to this open. *)
+let other_id : Store_identity.t = Store_identity.of_draws (fun () -> 0x2c)
+
+let () =
+  check "both journals left the restart carrying the OWNING store's token"
+    (token_is ws_journal_file store_id && token_is rpc_journal_file store_id)
+
+(* The rpc journal's bytes as they stand before the drift. A [Matched] open
+   rewrites nothing, so this is what has to come back byte for byte. *)
+let rpc_raw_before = read_journal rpc_journal_file
+
+(* ONLY the websocket header moves. Its floor records are carried across byte
+   for byte, so what the boot below refuses is the BINDING and not a damaged
+   record - the two would be indistinguishable if the floors were disturbed. *)
+let () =
+  Option.fold
+    ~none:(fun () -> die "the websocket journal is long enough to hold a header")
+    ~some:(fun (floors : string) () ->
+      rewrite_journal ws_journal_file (header_of other_id ^ floors))
+    (floors_after_header (read_journal ws_journal_file))
+    ()
+
+let () =
+  check "the drift landed: the websocket header now names a store neither boot bound"
+    (token_is ws_journal_file other_id);
+  check "and the rpc journal was not touched by it"
+    (String.equal (read_journal rpc_journal_file) rpc_raw_before)
+
+(* The SAME binding both earlier boots used. *)
+let { Tea_server_pack.ws = ws3; ws_journal = ws_j3; rpc = rpc3; rpc_journal = rpc_j3 } =
+  Tea_server_pack.open_guards ~guard_dir ~head_water ~identity
+
+let () =
+  (* The presence. The rpc header still names this store, so that channel is
+     Matched and its floor is still adjudicating replays. *)
+  check "the rpc channel, whose header did not drift, KEEPS its floor, witness intact"
+    (stamped_is rpc3 rpc_tab 1 rpc_water);
+  check "and holds exactly that one, adopting nothing from next door"
+    (Floors.cardinal (Durable_guard.floors rpc3) = 1);
+  (* The absence, in the same breath. The websocket header names a stranger, so
+     that channel is Rebound and its ledger is empty - and empty for THAT
+     reason, because the rpc ledger beside it came through the same boot. *)
+  check "the websocket channel, whose header drifted to a THIRD store, comes up empty"
+    (Floors.cardinal (Durable_guard.floors ws3) = 0);
+  check "so the websocket channel lost its OWN floor, and never held the rpc channel's"
+    (Option.is_none (stamped ws3 ws_tab) && Option.is_none (stamped ws3 rpc_tab))
+
+let () =
+  close_journal "the rebound websocket journal closes" ws_j3;
+  close_journal "the matched rpc journal closes" rpc_j3
+
+(* Durable, not merely in-memory: Rebound restamps and compacts, Matched holds.
+   Without this pair a boot that had simply failed to read the websocket file
+   would look the same from the ledgers alone. *)
+let () =
+  check "the rebound websocket journal was restamped to the binding it opened under"
+    (token_is ws_journal_file store_id);
+  check "and nothing but that header survived the rebind"
+    (String.length (read_journal ws_journal_file) = header_len);
+  check "while the matched rpc journal was not rewritten by one byte"
+    (String.equal (read_journal rpc_journal_file) rpc_raw_before)
+
 let rec rm_rf (path : string) : unit =
   if Sys.is_directory path then (
     Array.iter (fun (entry : string) -> rm_rf (Filename.concat path entry)) (Sys.readdir path);
@@ -198,5 +331,7 @@ let () =
   Printf.printf
     "\n\
      The two delivery channels are composed into SEPARATE ledgers, in an order \
-     that works on a bare root (D20.3).\n\
+     that works on a bare root (D20.3), and the ONE binding they share is \
+     checked per journal: a header that drifts under one channel clears that \
+     channel alone (R20a, D23).\n\
      %!"

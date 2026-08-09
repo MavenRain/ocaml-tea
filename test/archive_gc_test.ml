@@ -46,6 +46,29 @@ let () =
      let h0 = Option.map Store.S.Commit.hash head0 in
      check "pre-checkpoint head captured" (Option.is_some h0);
 
+     (* Step 18 (D23): the lineage token is minted into the root BEFORE the
+        GC, so the post-GC checks below observe irmin-pack's residual sweep
+        leaving a [tea.]-prefixed file alone on live bytes, rather than on a
+        reading of layout.ml. *)
+     let origin_str (o : Store.identity_origin) : string =
+       match o with
+       | Store.Read -> "Read"
+       | Store.Minted -> "Minted"
+       | Store.Adopted -> "Adopted"
+       | Store.Absent_unmintable (_ : string) -> "Absent_unmintable"
+       | Store.Unreadable (_ : string) -> "Unreadable"
+       | Store.Malformed -> "Malformed"
+     in
+     let bound (b : Prim.Store_identity.binding) : Prim.Store_identity.t option =
+       match b with
+       | Prim.Store_identity.Bound (id : Prim.Store_identity.t) -> Some id
+       | Prim.Store_identity.Unresolved -> None
+     in
+     let id_before, origin_before = Store.resolve_identity root in
+     check "the identity token MINTS on the live root before the GC"
+       (String.equal (origin_str origin_before) "Minted"
+       && Option.is_some (bound id_before));
+
      (* Squash to a checkpoint (severing the old chain), then archive-GC to it. *)
      let* cp_r = Store.checkpoint main ~label:"checkpoint" in
      let cp =
@@ -62,6 +85,20 @@ let () =
        | Error (Gc_disallowed | Gc_already_running | Gc_failed _) -> false
      in
      check "archive gc ~retain:checkpoint succeeds" gc_ok;
+
+     (* The GC-survival pin (step 18): [tea.identity] sits outside irmin-pack's
+        [store.]/[volume.] naming scheme, so the post-GC cleanup classifies it
+        [`Unknown] and leaves it alone. Asserted on the file AND through the
+        resolver, so a survivor that no longer reads would still fail. *)
+     check "tea.identity survives the checkpoint GC's residual sweep"
+       (Sys.file_exists (Store.identity_path root));
+     let id_after, origin_after = Store.resolve_identity root in
+     check "the surviving token READS back equal to the minted one"
+       (String.equal (origin_str origin_after) "Read"
+       && Option.fold (bound id_before) ~none:false
+            ~some:(fun (a : Prim.Store_identity.t) ->
+              Option.fold (bound id_after) ~none:false
+                ~some:(Prim.Store_identity.equal a)));
 
      (* Head model is intact, history collapsed to the checkpoint. *)
      let* m_main = Store.load main in

@@ -326,7 +326,10 @@ module Store_water : sig
       the store restores its water atomically. And deliberately not a
       {i create-time} identity token: such a token is constant over the
       store's whole life, so every snapshot of one store carries it and it
-      provably cannot see the rollback R20 names. *)
+      provably cannot see the rollback R20 names. That is why
+      {!Store_identity} exists beside it rather than instead of it (step 18,
+      D23): the token answers identity, this answers order, and R20 needs
+      both. *)
   type t
 
   val bottom : t
@@ -365,4 +368,71 @@ module Store_water : sig
   val t : t Repr.t
   (** The journal payload witness ([Repr.int64]); the route back from bytes,
       so the newtype stays sealed. *)
+end
+
+module Store_identity : sig
+  (** A pack root's create-once lineage token: 16 random bytes as 32 lowercase
+      hex characters (roadmap step 18, D23, R20a).
+
+      The identity half of the pair {!Store_water} is the order half. A water
+      answers "did these bytes go backwards"; this answers "are these the same
+      store's bytes at all". Neither substitutes for the other and both are
+      needed: a water cannot see a DIFFERENT store whose same-named branch
+      stands at a newer head (R20a), and a create-time token provably cannot
+      see an older snapshot of the SAME store, which carries it unchanged.
+
+      It is a de-duplication key over STORES, {b not a credential} - the same
+      shape of thing {!Tab_id} is over tabs, one layer up. Its only job is
+      collision avoidance across every root an operator will ever create, so
+      128 bits is many orders of magnitude past the birthday bound that
+      matters. Nothing is authorised by holding it, and an attacker who can
+      write one into a root or a journal already owns the directory this whole
+      guard family trusts.
+
+      Encoding is hex, not {!Session_secret}'s base64url, because fixed-case
+      hex has no padding and no equivalent-spelling ambiguity to police: two
+      spellings of one value would compare unequal and manufacture a
+      mismatch. There is deliberately no [Repr.t] witness - the journal header
+      carries {!to_string} directly at fixed width, and an unused second route
+      back from bytes is a seam with no caller. *)
+  type t
+
+  type err =
+    | Wrong_length
+    | Invalid_char of char
+
+  val of_string : string -> (t, err) result
+  (** Exactly 32 characters, each in [0-9a-f]. Uppercase is REFUSED, not
+      normalised: a case-folding round-trip that silently produced a second
+      spelling would read as a foreign store and wipe every floor. *)
+
+  val of_bytes : int list -> t option
+  (** Exactly 16 integers, each in [0..255], hex-encoded. [None] otherwise -
+      a declined mint, never an exception. *)
+
+  val of_draws : (unit -> int) -> t
+  (** The mint path: draw 16 bytes from an entropy source. Total by
+      construction (the count is fixed here, each draw masked into range), so
+      there is no refusal a caller could answer with a constant token - which
+      would be the store-collision bug wearing a fallback's clothes. *)
+
+  val to_string : t -> string
+  val equal : t -> t -> bool
+
+  val compare : t -> t -> int
+  (** Total order, for maps and assertions. *)
+
+  type binding =
+    | Bound of t
+        (** This boot established the store's own identity, durably: read from
+            or minted into [<root>/tea.identity]. Only this arm may be
+            stamped into a journal. *)
+    | Unresolved
+        (** The store's identity could NOT be established this boot: the token
+            is absent and unmintable, unreadable, or malformed. It is
+            deliberately NOT an identity value and deliberately NOT a
+            freshly-drawn stand-in - a stand-in would be stamped into every
+            journal on every boot, so floors earned under one boot would be
+            wiped by the next, and a journal whose root token was only
+            transiently unreadable could never recover. *)
 end

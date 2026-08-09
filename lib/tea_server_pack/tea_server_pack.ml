@@ -29,6 +29,44 @@ type guards =
     never an absent channel: the caller serves at-least-once on that channel
     rather than not at all. *)
 
+(** The boot line an {!Guard_file.identity_outcome} earns, or [None] when it
+    earns none.
+
+    Pure, and a function of the BINDING as well as the outcome, because one
+    outcome means two different things depending on it.
+    [Adopted_unbound] under a bound caller ends with the journal stamped, so
+    the next boot is protected; under
+    {!Tea_core.Prim.Store_identity.Unresolved} there is no token to stamp
+    with, {!Guard_file.open_} writes nothing, and the journal is still unbound
+    when the process exits. One sentence promising protection would then be
+    false at exactly the boot an operator reads it. *)
+let explain_outcome ~(binding : Tea_core.Prim.Store_identity.binding)
+    ~(channel : string) (outcome : Guard_file.identity_outcome) : string option =
+  let adopted (n : int) : string =
+    match binding with
+    | Tea_core.Prim.Store_identity.Bound (_ : Tea_core.Prim.Store_identity.t) ->
+      Printf.sprintf
+        "tea_server_pack: %s channel: adopted %d delivery floor(s) from a journal carrying NO store-identity binding (a pre-step-18 journal, or one whose header was lost); this boot is NOT protected against a journal restored beside a DIFFERENT store, and the journal is bound to this store now, so the next boot IS protected\n"
+        channel n
+    | Tea_core.Prim.Store_identity.Unresolved ->
+      Printf.sprintf
+        "tea_server_pack: %s channel: adopted %d delivery floor(s) from a journal carrying NO store-identity binding, and this pack root's own identity token could not be read or minted, so there is nothing to stamp the journal WITH; the journal REMAINS UNBOUND and the next boot is NOT protected against a journal restored beside a DIFFERENT store\n"
+        channel n
+  in
+  match outcome with
+  | Guard_file.Matched | Guard_file.Freshly_bound -> None
+  | Guard_file.Adopted_unbound n -> if n > 0 then Some (adopted n) else None
+  | Guard_file.Rebound n ->
+    Some
+      (Printf.sprintf
+         "tea_server_pack: %s channel: dropped ALL %d delivery floor(s): this guard journal is bound to a DIFFERENT pack store than the one at this root (a journal restored beside the wrong store, or a store replaced under a surviving journal); the affected replays will re-apply as visible duplicates rather than be silently lost, and the journal is re-bound to this store now\n"
+         channel n)
+  | Guard_file.Unresolved_cleared n ->
+    Some
+      (Printf.sprintf
+         "tea_server_pack: %s channel: dropped %d delivery floor(s) because this pack root's own identity token could not be read or minted; the journal's binding is LEFT INTACT and nothing is re-stamped or appended, so a boot that can read the token again keeps its floors - until then every boot re-applies the affected replays as visible duplicates\n"
+         channel n)
+
 (** Open both channels' guard journals under [guard_dir].
 
     Since roadmap step 15 there are TWO journals, one per delivery channel:
@@ -59,17 +97,19 @@ type guards =
     observe it. *)
 let open_guards ~(guard_dir : string)
     ~(head_water :
-       Tea_core.Crdt.Replica.t -> Tea_core.Prim.Store_water.t option) : guards =
+       Tea_core.Crdt.Replica.t -> Tea_core.Prim.Store_water.t option)
+    ~(identity : Tea_core.Prim.Store_identity.binding) : guards =
   let open_journal ~(channel : string) ~(dir : string) ~(cap : int)
       ~(sessions : Replay_guard.Bound.t) ~(tabs : Replay_guard.Bound.t) :
       Durable_guard.t * Guard_file.t option =
-    Lwt_main.run (Guard_file.open_ ~dir ~cap ~head_water)
+    Lwt_main.run (Guard_file.open_ ~dir ~cap ~head_water ~identity)
     |> Result.fold
          ~ok:(fun
-             ((sink, floors, verdict, jf) :
+             ((sink, floors, verdict, identity_outcome, jf) :
                Guard_sink.t
                * Durable_guard.Floors.t
                * Guard_file.verdict
+               * Guard_file.identity_outcome
                * Guard_file.t)
            ->
            let { Guard_file.kept = (_ : int)
@@ -91,6 +131,12 @@ let open_guards ~(guard_dir : string)
               Printf.eprintf
                 "tea_server_pack: %s channel: adopted %d delivery floor(s) with no store witness (pre-step-13 journal); this boot is NOT protected against a restored-older pack root\n%!"
                 channel unwitnessed);
+           (* The wording is decided by a pure function of the outcome AND the
+              binding, so what an operator reads can be asserted by a test
+              rather than grepped out of a captured stderr. *)
+           Option.iter
+             (fun (line : string) -> Printf.eprintf "%s%!" line)
+             (explain_outcome ~binding:identity ~channel identity_outcome);
            (* The mirror bound is DERIVED at this composition site, never a
               constant (D20.4), and this is the only place that knows [cap]:
               the guard reaches its journal through an append-only sink and
@@ -233,7 +279,12 @@ module Make_pack (A : Tea_core.App.APP) = struct
        longer cover — an audible drop, after which the replays land Fresh
        (visible duplicates, never silent loss). What ordering cannot answer
        is IDENTITY: a DIFFERENT store whose same-named branch stands at a
-       newer head passes the filter (DESIGN R20a residual). *)
+       newer head passes the filter. Step 18 (D23) answers that with a
+       store-identity token minted once into [<root>/tea.identity] and stamped
+       into each journal's first frame, so a journal beside an INDEPENDENT
+       store drops its floors instead of trusting them. What the token still
+       cannot answer is a divergent COPY of one lineage - a clone carries the
+       token unchanged (DESIGN R20b residual). *)
     let guard_dir = sibling root ".guard" in
     if (not (Sys.file_exists (Root.to_string root))) && Sys.file_exists guard_dir then (
       Printf.eprintf
@@ -284,7 +335,17 @@ module Make_pack (A : Tea_core.App.APP) = struct
        inside it: whether irmin-pack 3.11 tolerates a foreign file in its root
        across GC and migration is not a bet worth making. A failed open is one
        audible line and a null-sink guard — a server without durability beats
-       no server, and the degradation direction is duplicate, never loss. *)
+       no server, and the degradation direction is duplicate, never loss.
+
+       The step-18 store-identity token IS inside the root, and that is not the
+       same bet: [Irmin_pack.Layout.Classification.Upper.v] is a closed match on
+       the [store.*] naming scheme whose fallthrough is [`Unknown], the post-GC
+       [cleanup] sweep never removes an [`Unknown] entry, and [open_rw]/[open_ro]
+       do not scan the directory at all - so a [tea.]-prefixed file is invisible
+       to open, to GC, and to migration. The token has to live there: a fourth
+       [<root>.identity] sibling would be R20 recursed one level, and only a
+       file inside the tree travels with the [cp -r] that creates R20 in the
+       first place. *)
     (* ONE branch_waters read, taken between the store open and the guard opens,
        feeds BOTH boot filters: each journal's floors are checked against the
        heads THIS boot will actually serve from, and reading twice could
@@ -293,12 +354,20 @@ module Make_pack (A : Tea_core.App.APP) = struct
       Lwt_main.run
         (Lwt.map Guard_file.head_water_of_list (Store.branch_waters repo))
     in
+    (* The store's own lineage token, resolved ONCE here. AFTER [open_root]
+       because the backend does exactly one [mkdir], and a [tea.identity]
+       minted into a directory nothing else had written would leave a root the
+       next boot classifies [Root_not_a_pack_store]. BEFORE [open_guards]
+       because one value has to reach both channels: two reads could disagree
+       across a mint race and bind the two journals to different tokens. *)
+    let identity, identity_origin = Store.resolve_identity root in
+    Printf.eprintf "tea_server_pack: %s\n%!" (Store.explain_identity identity_origin);
     (* Both channels' journals, opened together and against this one head
        snapshot (D20.3). The directory each channel lands in, and the order the
        two are opened in, live in {!open_guards} rather than here so a native
        test can drive the real composition without binding a port. *)
     let { ws = guard; ws_journal = journal; rpc = rpc_guard; rpc_journal } =
-      open_guards ~guard_dir ~head_water
+      open_guards ~guard_dir ~head_water ~identity
     in
     (* [?rpc_once] takes a route BUILDER for the reason {!Tea_server.Make.serve}
        gives, and here the reason is at its strongest: the guard it wraps is

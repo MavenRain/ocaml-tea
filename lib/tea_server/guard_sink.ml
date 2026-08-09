@@ -88,21 +88,26 @@ module Codec = struct
      downgrade direction the design permits. *)
   let tag_advance = '\003'
 
-  let body (e : event) : string =
-    match e with
-    | Advance { replica; tab; seq; water } ->
-      String.make 1 tag_advance
-      ^ encode_advance
-          (replica, Prim.Tab_id.to_string tab, Prim.Msg_seq.to_int seq, water)
-    | Forget { replica } -> String.make 1 tag_forget ^ encode_forget replica
-
-  let to_bytes (e : event) : string =
-    let b = body e in
+  (* The only place the framing constants live: every frame kind, this
+     codec's events and tag 4's store-identity header alike, gets its length
+     and its CRC from here. *)
+  let frame ~(tag : char) ~(payload : string) : string =
+    let b = String.make 1 tag ^ payload in
     let head = Bytes.create 4 in
     Bytes.set_int32_be head 0 (Int32.of_int (String.length b));
     let tail = Bytes.create 4 in
     Bytes.set_int32_be tail 0 (crc32 b);
     Bytes.to_string head ^ b ^ Bytes.to_string tail
+
+  let to_bytes (e : event) : string =
+    match e with
+    | Advance { replica; tab; seq; water } ->
+      frame ~tag:tag_advance
+        ~payload:
+          (encode_advance
+             (replica, Prim.Tab_id.to_string tab, Prim.Msg_seq.to_int seq, water))
+    | Forget { replica } ->
+      frame ~tag:tag_forget ~payload:(encode_forget replica)
 
   (* One validation spelling for both Advance arms, current and legacy: the
      two client-chosen fields go back through their wire mints. The water
@@ -147,7 +152,10 @@ module Codec = struct
       ~ok:(fun (replica : Tea_core.Crdt.Replica.t) ->
         Ok (Forget { replica }, next))
 
-  let of_bytes (s : string) ~(pos : int) : (event * int, decode_err) result =
+  (* Framing only, no tag knowledge: an unrecognised tag comes back as data,
+     which is what lets a caller own a frame kind this codec never writes. *)
+  let unframe (s : string) ~(pos : int) :
+      (char * string * int, decode_err) result =
     let total = String.length s in
     if pos < 0 || pos + 4 > total then Error Torn
     else
@@ -161,13 +169,15 @@ module Codec = struct
         let stored_crc = String.get_int32_be s (pos + 4 + len) in
         let computed_crc = crc32 b in
         if not (Int32.equal stored_crc computed_crc) then Error Bad_crc
-        else
-          let next = pos + 4 + len + 4 in
-          let payload = String.sub b 1 (len - 1) in
-          let tag = b.[0] in
-          if Char.equal tag tag_advance then decode_advance payload ~next
-          else if Char.equal tag tag_advance_legacy then
-            decode_advance_legacy payload ~next
-          else if Char.equal tag tag_forget then decode_forget payload ~next
-          else Error (Bad_tag (Char.code tag))
+        else Ok (b.[0], String.sub b 1 (len - 1), pos + 4 + len + 4)
+
+  let of_bytes (s : string) ~(pos : int) : (event * int, decode_err) result =
+    Result.fold (unframe s ~pos)
+      ~error:(fun (e : decode_err) -> Error e)
+      ~ok:(fun ((tag, payload, next) : char * string * int) ->
+        if Char.equal tag tag_advance then decode_advance payload ~next
+        else if Char.equal tag tag_advance_legacy then
+          decode_advance_legacy payload ~next
+        else if Char.equal tag tag_forget then decode_forget payload ~next
+        else Error (Bad_tag (Char.code tag)))
 end

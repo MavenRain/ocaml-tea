@@ -24,6 +24,7 @@ module Floors = Tea_server.Durable_guard.Floors
 module Bound = Tea_server.Replay_guard.Bound
 module Msg_seq = Tea_core.Prim.Msg_seq
 module Tab_id = Tea_core.Prim.Tab_id
+module Store_identity = Tea_core.Prim.Store_identity
 
 let ( let* ) = Lwt.bind
 
@@ -67,13 +68,28 @@ let no_heads : Tea_core.Crdt.Replica.t -> Tea_core.Prim.Store_water.t option =
 
 let opened (what : string)
     (r :
-      ( Guard_sink.t * Floors.t * Guard_file.verdict * Guard_file.t
+      ( Guard_sink.t
+        * Floors.t
+        * Guard_file.verdict
+        * Guard_file.identity_outcome
+        * Guard_file.t
       , Guard_file.open_err )
-      result) : Guard_sink.t * Floors.t * Guard_file.verdict * Guard_file.t =
+      result) :
+    Guard_sink.t
+    * Floors.t
+    * Guard_file.verdict
+    * Guard_file.identity_outcome
+    * Guard_file.t =
   Result.fold r ~ok:Fun.id
     ~error:(fun (_ : Guard_file.open_err) ->
       Printf.printf "FAIL - test setup: %s\n%!" what;
       exit 1)
+
+(* One store for both channels, the way the composition site reads it once and
+   hands it to each. Every floor here still carries [bottom], so the identity
+   arm changes nothing this file asserts. *)
+let store_id : Store_identity.t = Store_identity.of_draws (fun () -> 0x3c)
+let identity : Store_identity.binding = Store_identity.Bound store_id
 
 let put (what : string) (sink : Guard_sink.t) (e : Guard_sink.event) : unit Lwt.t =
   let* r = sink.Guard_sink.append e in
@@ -118,17 +134,25 @@ let is_bad_dir (r : ('a, Guard_file.open_err) result) : bool =
 let () =
   in_scratch (fun guard_dir ->
       let rpc_dir = Filename.concat guard_dir "rpc" in
-      let* early = Guard_file.open_ ~dir:rpc_dir ~cap:16 ~head_water:no_heads in
+      let* early = Guard_file.open_ ~dir:rpc_dir ~cap:16 ~head_water:no_heads ~identity in
       check "the rpc journal cannot be opened before .guard exists"
         (is_bad_dir early);
-      let* ws = Guard_file.open_ ~dir:guard_dir ~cap:16 ~head_water:no_heads in
-      let (_ : Guard_sink.t), (_ : Floors.t), (_ : Guard_file.verdict), wsh =
+      let* ws = Guard_file.open_ ~dir:guard_dir ~cap:16 ~head_water:no_heads ~identity in
+      let ( (_ : Guard_sink.t)
+          , (_ : Floors.t)
+          , (_ : Guard_file.verdict)
+          , (_ : Guard_file.identity_outcome)
+          , wsh ) =
         opened "websocket journal in a fresh parent" ws
       in
-      let* late = Guard_file.open_ ~dir:rpc_dir ~cap:16 ~head_water:no_heads in
+      let* late = Guard_file.open_ ~dir:rpc_dir ~cap:16 ~head_water:no_heads ~identity in
       check "the rpc journal opens once the websocket journal has made .guard"
         (Result.is_ok late);
-      let (_ : Guard_sink.t), (_ : Floors.t), (_ : Guard_file.verdict), rpch =
+      let ( (_ : Guard_sink.t)
+          , (_ : Floors.t)
+          , (_ : Guard_file.verdict)
+          , (_ : Guard_file.identity_outcome)
+          , rpch ) =
         opened "rpc journal under an existing .guard" late
       in
       check "the two journals are distinct files on disk"
@@ -149,24 +173,40 @@ let () =
       let rpc_dir = Filename.concat guard_dir "rpc" in
       let r = replica "canonical" in
       let t = tab 1 in
-      let* ws = Guard_file.open_ ~dir:guard_dir ~cap:16 ~head_water:no_heads in
-      let ws_sink, (_ : Floors.t), (_ : Guard_file.verdict), wsh =
+      let* ws = Guard_file.open_ ~dir:guard_dir ~cap:16 ~head_water:no_heads ~identity in
+      let ( ws_sink
+          , (_ : Floors.t)
+          , (_ : Guard_file.verdict)
+          , (_ : Guard_file.identity_outcome)
+          , wsh ) =
         opened "websocket journal" ws
       in
-      let* rpc = Guard_file.open_ ~dir:rpc_dir ~cap:16 ~head_water:no_heads in
-      let rpc_sink, (_ : Floors.t), (_ : Guard_file.verdict), rpch =
+      let* rpc = Guard_file.open_ ~dir:rpc_dir ~cap:16 ~head_water:no_heads ~identity in
+      let ( rpc_sink
+          , (_ : Floors.t)
+          , (_ : Guard_file.verdict)
+          , (_ : Guard_file.identity_outcome)
+          , rpch ) =
         opened "rpc journal" rpc
       in
       let* () = put "ws floor 3" ws_sink (advance r t 3) in
       let* () = put "rpc floor 9" rpc_sink (advance r t 9) in
       let* () = Guard_file.close wsh in
       let* () = Guard_file.close rpch in
-      let* ws2 = Guard_file.open_ ~dir:guard_dir ~cap:16 ~head_water:no_heads in
-      let (_ : Guard_sink.t), ws_floors, (_ : Guard_file.verdict), wsh2 =
+      let* ws2 = Guard_file.open_ ~dir:guard_dir ~cap:16 ~head_water:no_heads ~identity in
+      let ( (_ : Guard_sink.t)
+          , ws_floors
+          , (_ : Guard_file.verdict)
+          , (_ : Guard_file.identity_outcome)
+          , wsh2 ) =
         opened "websocket reopen" ws2
       in
-      let* rpc2 = Guard_file.open_ ~dir:rpc_dir ~cap:16 ~head_water:no_heads in
-      let (_ : Guard_sink.t), rpc_floors, (_ : Guard_file.verdict), rpch2 =
+      let* rpc2 = Guard_file.open_ ~dir:rpc_dir ~cap:16 ~head_water:no_heads ~identity in
+      let ( (_ : Guard_sink.t)
+          , rpc_floors
+          , (_ : Guard_file.verdict)
+          , (_ : Guard_file.identity_outcome)
+          , rpch2 ) =
         opened "rpc reopen" rpc2
       in
       check "the websocket journal reopens holding only its OWN floor"

@@ -23,9 +23,31 @@ type guards =
     caller must close whichever journals are [Some] and must not read [None]
     as "nothing to do". *)
 
+val explain_outcome :
+  binding:Tea_core.Prim.Store_identity.binding ->
+  channel:string ->
+  Guard_file.identity_outcome ->
+  string option
+(** The boot line {!open_guards} prints for one channel's
+    {!Guard_file.identity_outcome}, or [None] when that outcome earns no line
+    ([Matched], [Freshly_bound], and an [Adopted_unbound 0] that has nothing
+    to report). The returned string carries its own trailing newline.
+
+    Pure, and exposed, for one reason: it is a function of the BINDING as well
+    as of the outcome, and a test must be able to assert that. An
+    [Adopted_unbound] under a {!Tea_core.Prim.Store_identity.Bound} caller ends
+    with the journal stamped, so it may promise that the next boot is
+    protected. The SAME outcome under
+    {!Tea_core.Prim.Store_identity.Unresolved} has no token to stamp with,
+    {!Guard_file.open_} writes nothing, and the journal is still unbound at
+    exit, so that line must say the journal remains unbound and the next boot
+    is NOT protected. An explanation that does not track the binding is false
+    at exactly the boot an operator reads it. *)
+
 val open_guards :
   guard_dir:string ->
   head_water:(Tea_core.Crdt.Replica.t -> Tea_core.Prim.Store_water.t option) ->
+  identity:Tea_core.Prim.Store_identity.binding ->
   guards
 (** Open the websocket channel's journal at [<guard_dir>/journal] and the keyed
     RPC channel's at [<guard_dir>/rpc/journal], filtering both against
@@ -42,6 +64,14 @@ val open_guards :
     floors against different heads. None of that is observable from inside a
     blocking [serve_pack], which is why it is a named function with a return
     type rather than two call sites.
+
+    The IDENTITY is: one binding, read once by the caller between the store
+    open and this call, handed to both channels. The token is a property of
+    the STORE, not of a channel, exactly as the head snapshot is. Each journal
+    still carries and checks its OWN header frame, so the two are bound
+    independently and the websocket open's stamp is physically incapable of
+    satisfying the rpc open's check; the shared value is what makes the two
+    VERDICTS comparable, not what makes them pass.
 
     [head_water] comes from {!Guard_file.head_water_of_list} over one
     [Store_core.CORE.branch_waters] read. Caller closes every [Some] journal at

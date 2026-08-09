@@ -3,7 +3,9 @@
     pin that the working paths are bit-identical to [create]; P3-P7 drive
     every refusal arm, P7 being the only witness that the [Lwt.catch] seam
     exists (a garbage control file passes the preflight and dies inside
-    irmin-pack); P8 pins that a refusal is effect-free. The serve_pack-level
+    irmin-pack); P8 pins that a refusal is effect-free; P9 pins that the
+    step-18 [tea.identity] token, which lives inside the root, cannot make a
+    storeless directory look like one. The serve_pack-level
     sibling claim (a refused root gains no [.guard]/[.secret]) is asserted in
     browser scenario B6, where the code actually can mint those - at this
     layer [open_root] never touches them, so a check here would be vacuous. *)
@@ -49,7 +51,8 @@ let () =
      check "P1: parent-exists/leaf-missing root opens Ok" (String.equal (show r1) "ok");
      let* () = close_if_open r1 in
 
-     (* P2: reopen the root P1 created (the flock was released by close). *)
+     (* P2: reopen the root P1 created. Nothing holds an inter-process lock on
+        a pack root (R18); this checks reopen, not release. *)
      let* r2 = open_at fresh in
      check "P2: reopening a root it created opens Ok" (String.equal (show r2) "ok");
      let* () = close_if_open r2 in
@@ -102,4 +105,18 @@ let () =
        (Array.length (Sys.readdir empty_dir) = 0);
      check "P8: the missing-parent root was never created"
        (not (Sys.file_exists (Filename.concat parent "absent")));
+
+     (* P9: a directory holding ONLY [tea.identity] is still not a pack store.
+        The step-18 token lives INSIDE the root, so the preflight has to keep
+        keying on [store.control]/[store.pack] alone: a token that made a
+        storeless directory pass would open a root with no store bytes in it.
+        This is the mint-after-open_root ordering checked from the other
+        side. *)
+     let identity_only_dir = Filename.temp_dir "ocaml-tea-packroot-identity" "" in
+     write_file
+       (Store.identity_path (Root.v identity_only_dir))
+       "0123456789abcdef0123456789abcdef\n";
+     let* r9 = open_at identity_only_dir in
+     check "P9: dir with only tea.identity -> Root_not_a_pack_store"
+       (String.equal (show r9) "not-a-pack-store");
      Lwt.return_unit)
