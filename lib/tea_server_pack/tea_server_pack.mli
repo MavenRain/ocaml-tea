@@ -44,10 +44,20 @@ val explain_outcome :
     is NOT protected. An explanation that does not track the binding is false
     at exactly the boot an operator reads it. *)
 
+val explain_epoch_outcome :
+  channel:string -> Guard_file.epoch_outcome -> string option
+(** {!explain_outcome}'s twin for one channel's
+    {!Guard_file.epoch_outcome} (step 21, R20b), or [None] on
+    [Epoch_matched], the ordinary same-lineage reopen: the no-news arm
+    stays silent for [Freshly_bound]'s reason. Pure and exposed so a test
+    can assert the exact line an operator reads. The returned string
+    carries its own trailing newline. *)
+
 val open_guards :
   guard_dir:string ->
   head_water:(Tea_core.Crdt.Replica.t -> Tea_core.Prim.Store_water.t option) ->
   identity:Tea_core.Prim.Store_identity.binding ->
+  epoch:Tea_core.Prim.Store_epoch.binding * Tea_core.Prim.Store_epoch.binding ->
   ?fence:(unit -> unit Lwt.t) ->
   unit ->
   guards
@@ -89,6 +99,13 @@ val open_guards :
     independently and the websocket open's stamp is physically incapable of
     satisfying the rpc open's check; the shared value is what makes the two
     VERDICTS comparable, not what makes them pass.
+
+    The EPOCH is: one [(seen, now)] pair from one [Store.bump_epoch] call,
+    taken beside the identity read and handed to both channels - a stronger
+    one-read need than the token's, because the counter MUTATES at every
+    resolution, so two reads could not even agree with each other. Each
+    journal still carries and checks its OWN stamp, {!explain_outcome}'s
+    independence argument one family over.
 
     [head_water] comes from {!Guard_file.head_water_of_list} over one
     [Store_core.CORE.branch_waters] read. Caller closes every [Some] journal at

@@ -10,7 +10,8 @@
    session_secret_test session_identity_test pack_root_test pack_guards_test
    cancel_test ack_park_test store_identity_test guard_identity_test
    identity_explain_test commit_fence_test store_pack_flush_test
-   hot_copy_water_test unwitnessed_rollback_pin_test kill_durability_test)
+   hot_copy_water_test unwitnessed_rollback_pin_test kill_durability_test
+   boot_epoch_test)
  (libraries
   repr
   tea_core

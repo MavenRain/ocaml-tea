@@ -436,3 +436,73 @@ module Store_identity : sig
             wiped by the next, and a journal whose root token was only
             transiently unreadable could never recover. *)
 end
+
+module Store_epoch : sig
+  (** A pack root's boot counter: bumped in the root at each open and echoed
+      into each journal (roadmap step 21, R20b).
+
+      The third leg of the store-provenance family. {!Store_water} answers
+      "did this branch go backwards"; {!Store_identity} answers "are these
+      the same store's bytes at all"; this answers the question the other two
+      provably cannot: "is this journal from THIS copy of that store". A
+      create-time token is constant over a store's whole life, so a [cp -r],
+      a filesystem snapshot, and a restored-then-advanced backup all carry it
+      unchanged - only a value that MOVES at every boot can separate a store
+      from its own divergent copy.
+
+      The check is EQUALITY, never order: a journal ahead of the root (the
+      root is the restored copy) and a journal behind it (the journal is)
+      are the same verdict, so an ordering compare would reintroduce half of
+      R20b. Divergence degrades accept-side - floors clear, replays land as
+      visible duplicates - and never refuses service.
+
+      Encoding is 16 lowercase hex characters, the {!Store_identity} rule
+      one value down: fixed case and fixed width leave no second spelling of
+      one stamp to police. There is deliberately no [Repr.t] witness - the
+      journal header carries {!to_string} directly at fixed width. *)
+  type t
+
+  val bottom : t
+  (** The mint value for a root that has never carried a counter. *)
+
+  val succ : t -> t
+  (** The bump. SATURATES at the top rather than wrap ({!Clock}'s rule): a
+      wrap would re-mint an old stamp, and an old stamp is exactly what this
+      counter exists to expose. Unreachable in practice - one boot per
+      microsecond for two hundred millennia sits below the ceiling. At the
+      ceiling itself the counter stops moving, so every same-lineage boot
+      matches forever: divergence detection is OFF at saturation, a residue
+      the magnitude argument prices and the R20b register names. *)
+
+  val compare : t -> t -> int
+  (** Total order, for maps and assertions - NOT for the boot check, which
+      is {!equal} by design. *)
+
+  val equal : t -> t -> bool
+
+  val to_string : t -> string
+  (** Exactly 16 characters, each in [0-9a-f], zero-padded. *)
+
+  val of_string : string -> (t, [ `Malformed ]) result
+  (** Exactly 16 characters, each in [0-9a-f]. Uppercase is REFUSED, not
+      normalised, the {!Store_identity.of_string} reason: a second spelling
+      of one stamp would compare unequal and manufacture a divergence.
+      Values above {!succ}'s saturation point are REFUSED as malformed too:
+      the mint never emits one, and accepting one would hand {!succ} a
+      value it WRAPS through zero - a wrapped counter re-mints old stamps,
+      the false-match direction this type exists to close. *)
+
+  type binding =
+    | Bound of t
+        (** This boot established the root's counter durably: read from and
+            re-written into [<root>/tea.epoch], or minted at {!bottom} on a
+            root that never carried one. Only this arm may be stamped into a
+            journal. *)
+    | Unresolved
+        (** The counter could NOT be established this boot: the file exists
+            but is unreadable or malformed. Deliberately NOT a re-mint - a
+            fresh baseline written over a transient read failure would turn
+            every journal's next boot into a permanent false divergence. The
+            bytes stay as found, floors clear for this boot's view only, and
+            the next boot retries. *)
+end

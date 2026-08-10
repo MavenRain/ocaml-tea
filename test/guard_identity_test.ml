@@ -198,6 +198,7 @@ let opened (what : string)
         * Floors.t
         * Guard_file.verdict
         * Guard_file.identity_outcome
+        * Guard_file.epoch_outcome
         * Guard_file.t
       , Guard_file.open_err )
       result) :
@@ -205,6 +206,7 @@ let opened (what : string)
     * Floors.t
     * Guard_file.verdict
     * Guard_file.identity_outcome
+    * Guard_file.epoch_outcome
     * Guard_file.t =
   Result.fold r ~ok:Fun.id
     ~error:(fun (e : Guard_file.open_err) ->
@@ -277,6 +279,11 @@ let id_b : Id.t = Id.of_draws (fun () -> 0x22)
 let bound_a : Id.binding = Id.Bound id_a
 let bound_b : Id.binding = Id.Bound id_b
 
+let epoch0 :
+    Tea_core.Prim.Store_epoch.binding * Tea_core.Prim.Store_epoch.binding =
+  ( Tea_core.Prim.Store_epoch.Bound Tea_core.Prim.Store_epoch.bottom
+  , Tea_core.Prim.Store_epoch.Bound Tea_core.Prim.Store_epoch.bottom )
+
 (* --- I1: a bound journal met by a different store's binding ----------------- *)
 
 let () =
@@ -290,9 +297,11 @@ let () =
       let* r =
         Guard_file.open_ ~dir ~cap:8
           ~head_water:(heads [ (ra, water 100); (rb, water 90) ])
-          ~identity:bound_b
+          ~identity:bound_b ~epoch:epoch0
       in
-      let (_ : Guard_sink.t), fl, v, o, h = opened "I1" r in
+      let (_ : Guard_sink.t), fl, v, o, (_ : Guard_file.epoch_outcome), h =
+        opened "I1" r
+      in
       check "I1 a header naming A opened under Bound B is Rebound 2"
         (outcome_is o "Rebound 2");
       check "I1 the rebound journal admits no floors (cardinal 0)"
@@ -315,9 +324,14 @@ let () =
       let* r =
         Guard_file.open_ ~dir ~cap:8
           ~head_water:(heads [ (ra, water 100); (rb, water 90) ])
-          ~identity:bound_a
+          ~identity:bound_a ~epoch:epoch0
       in
-      let (_ : Guard_sink.t), fl, (_ : Guard_file.verdict), o, h =
+      let ( (_ : Guard_sink.t)
+          , fl
+          , (_ : Guard_file.verdict)
+          , o
+          , (_ : Guard_file.epoch_outcome)
+          , h ) =
         opened "I2" r
       in
       (* The exact count is load-bearing twice over: adopted-on-trust is 2
@@ -361,9 +375,14 @@ let () =
       let b_heads = Guard_file.head_water_of_list b_waters in
       (* Companion arm: same bytes, the OWNING binding. *)
       let* r_own =
-        Guard_file.open_ ~dir ~cap:8 ~head_water:b_heads ~identity:bound_a
+        Guard_file.open_ ~dir ~cap:8 ~head_water:b_heads ~identity:bound_a ~epoch:epoch0
       in
-      let (_ : Guard_sink.t), fl_own, (_ : Guard_file.verdict), o_own, h_own =
+      let ( (_ : Guard_sink.t)
+          , fl_own
+          , (_ : Guard_file.verdict)
+          , o_own
+          , (_ : Guard_file.epoch_outcome)
+          , h_own ) =
         opened "I3 companion" r_own
       in
       check
@@ -375,9 +394,14 @@ let () =
       let* () = Guard_file.close h_own in
       (* The kill: same bytes, the OTHER store's binding. *)
       let* r_other =
-        Guard_file.open_ ~dir ~cap:8 ~head_water:b_heads ~identity:bound_b
+        Guard_file.open_ ~dir ~cap:8 ~head_water:b_heads ~identity:bound_b ~epoch:epoch0
       in
-      let (_ : Guard_sink.t), fl_other, (_ : Guard_file.verdict), o_other, h_other
+      let ( (_ : Guard_sink.t)
+          , fl_other
+          , (_ : Guard_file.verdict)
+          , o_other
+          , (_ : Guard_file.epoch_outcome)
+          , h_other )
           =
         opened "I3 kill" r_other
       in
@@ -404,9 +428,11 @@ let () =
           ]
       in
       let* r =
-        Guard_file.open_ ~dir ~cap:8 ~head_water:no_heads ~identity:bound_b
+        Guard_file.open_ ~dir ~cap:8 ~head_water:no_heads ~identity:bound_b ~epoch:epoch0
       in
-      let (_ : Guard_sink.t), fl, v, o, h = opened "I4" r in
+      let (_ : Guard_sink.t), fl, v, o, (_ : Guard_file.epoch_outcome), h =
+        opened "I4" r
+      in
       check
         "I4 three bottom floors under a stranger binding are Rebound 3 with \
          cardinal 0, not survivors of a starved head lookup"
@@ -430,9 +456,11 @@ let () =
       let* r1 =
         Guard_file.open_ ~dir ~cap:8
           ~head_water:(heads [ (ra, water 100); (rb, water 10) ])
-          ~identity:bound_a
+          ~identity:bound_a ~epoch:epoch0
       in
-      let (_ : Guard_sink.t), fl1, v1, o1, h1 = opened "I5 boot 1" r1 in
+      let (_ : Guard_sink.t), fl1, v1, o1, (_ : Guard_file.epoch_outcome), h1 =
+        opened "I5 boot 1" r1
+      in
       check "I5 boot 1 matches its own header while the water filter drops"
         (outcome_is o1 "Matched"
         && verdict_is v1 ~kept:1 ~behind:1 ~no_branch:0 ~unwitnessed:0
@@ -453,9 +481,14 @@ let () =
       let* r2 =
         Guard_file.open_ ~dir ~cap:8
           ~head_water:(heads [ (ra, water 100); (rb, water 10) ])
-          ~identity:bound_a
+          ~identity:bound_a ~epoch:epoch0
       in
-      let (_ : Guard_sink.t), fl2, (_ : Guard_file.verdict), o2, h2 =
+      let ( (_ : Guard_sink.t)
+          , fl2
+          , (_ : Guard_file.verdict)
+          , o2
+          , (_ : Guard_file.epoch_outcome)
+          , h2 ) =
         opened "I5 boot 2" r2
       in
       check
@@ -478,9 +511,14 @@ let () =
       let* r1 =
         Guard_file.open_ ~dir ~cap:8
           ~head_water:(heads [ (ra, water 100) ])
-          ~identity:bound_a
+          ~identity:bound_a ~epoch:epoch0
       in
-      let (_ : Guard_sink.t), fl1, (_ : Guard_file.verdict), o1, h1 =
+      let ( (_ : Guard_sink.t)
+          , fl1
+          , (_ : Guard_file.verdict)
+          , o1
+          , (_ : Guard_file.epoch_outcome)
+          , h1 ) =
         opened "I6 boot 1" r1
       in
       check "I6 boot 1 adopts the headerless journal (Adopted_unbound 1)"
@@ -489,9 +527,14 @@ let () =
       let* r2 =
         Guard_file.open_ ~dir ~cap:8
           ~head_water:(heads [ (ra, water 100) ])
-          ~identity:bound_a
+          ~identity:bound_a ~epoch:epoch0
       in
-      let (_ : Guard_sink.t), fl2, (_ : Guard_file.verdict), o2, h2 =
+      let ( (_ : Guard_sink.t)
+          , fl2
+          , (_ : Guard_file.verdict)
+          , o2
+          , (_ : Guard_file.epoch_outcome)
+          , h2 ) =
         opened "I6 boot 2" r2
       in
       check
@@ -511,9 +554,11 @@ let () =
       let* r1 =
         Guard_file.open_ ~dir ~cap:8
           ~head_water:(heads [ (ra, water 42) ])
-          ~identity:bound_a
+          ~identity:bound_a ~epoch:epoch0
       in
-      let sink, fl1, (_ : Guard_file.verdict), o1, h1 = opened "I7 boot 1" r1 in
+      let sink, fl1, (_ : Guard_file.verdict), o1, (_ : Guard_file.epoch_outcome), h1 =
+        opened "I7 boot 1" r1
+      in
       check "I7 a brand-new journal is Freshly_bound and empty"
         (outcome_is o1 "Freshly_bound" && Int.equal (Floors.cardinal fl1) 0);
       let* () = put "I7 advance" sink (adv ra (tab 4) 9 (water 42)) in
@@ -521,9 +566,14 @@ let () =
       let* r2 =
         Guard_file.open_ ~dir ~cap:8
           ~head_water:(heads [ (ra, water 42) ])
-          ~identity:bound_a
+          ~identity:bound_a ~epoch:epoch0
       in
-      let (_ : Guard_sink.t), fl2, (_ : Guard_file.verdict), o2, h2 =
+      let ( (_ : Guard_sink.t)
+          , fl2
+          , (_ : Guard_file.verdict)
+          , o2
+          , (_ : Guard_file.epoch_outcome)
+          , h2 ) =
         opened "I7 boot 2" r2
       in
       check
@@ -547,9 +597,14 @@ let () =
       let* before = read_file (journal_of dir) in
       let* r1 =
         Guard_file.open_ ~dir ~cap:8 ~head_water:no_heads
-          ~identity:Id.Unresolved
+          ~identity:Id.Unresolved ~epoch:epoch0
       in
-      let (_ : Guard_sink.t), fl1, (_ : Guard_file.verdict), o1, h1 =
+      let ( (_ : Guard_sink.t)
+          , fl1
+          , (_ : Guard_file.verdict)
+          , o1
+          , (_ : Guard_file.epoch_outcome)
+          , h1 ) =
         opened "I8 unresolved" r1
       in
       check
@@ -565,9 +620,14 @@ let () =
       (* The recovery arm, the whole reason the hold exists: a boot that can
          read the token again finds the ORIGINAL header and its floors. *)
       let* r2 =
-        Guard_file.open_ ~dir ~cap:8 ~head_water:no_heads ~identity:bound_a
+        Guard_file.open_ ~dir ~cap:8 ~head_water:no_heads ~identity:bound_a ~epoch:epoch0
       in
-      let (_ : Guard_sink.t), fl2, (_ : Guard_file.verdict), o2, h2 =
+      let ( (_ : Guard_sink.t)
+          , fl2
+          , (_ : Guard_file.verdict)
+          , o2
+          , (_ : Guard_file.epoch_outcome)
+          , h2 ) =
         opened "I8 recovery" r2
       in
       check "I8 a later boot that reads the token recovers BOTH floors"
@@ -607,7 +667,7 @@ let () =
   in
   let { Tea_server_pack.ws; ws_journal; rpc; rpc_journal } =
     Tea_server_pack.open_guards ~guard_dir:dir_own ~head_water:no_heads
-      ~identity:bound_a ()
+      ~identity:bound_a ~epoch:epoch0 ()
   in
   let ws_fl = Dguard.floors ws and rpc_fl = Dguard.floors rpc in
   check
@@ -627,7 +687,7 @@ let () =
   let () = Lwt_main.run (plant_tree dir_other) in
   let { Tea_server_pack.ws = ws2; ws_journal = wsj2; rpc = rpc2; rpc_journal = rpcj2 } =
     Tea_server_pack.open_guards ~guard_dir:dir_other ~head_water:no_heads
-      ~identity:bound_b ()
+      ~identity:bound_b ~epoch:epoch0 ()
   in
   check "I10 under a stranger binding BOTH channels come up empty"
     (Int.equal (Floors.cardinal (Dguard.floors ws2)) 0
@@ -665,9 +725,14 @@ let () =
       in
       let* before = read_file (journal_of dir) in
       let* r1 =
-        Guard_file.open_ ~dir ~cap:2 ~head_water:no_heads ~identity:Id.Unresolved
+        Guard_file.open_ ~dir ~cap:2 ~head_water:no_heads ~identity:Id.Unresolved ~epoch:epoch0
       in
-      let sink, (_ : Floors.t), (_ : Guard_file.verdict), o1, h1 =
+      let ( sink
+          , (_ : Floors.t)
+          , (_ : Guard_file.verdict)
+          , o1
+          , (_ : Guard_file.epoch_outcome)
+          , h1 ) =
         opened "I11 unresolved" r1
       in
       check "I11 the unresolvable boot clears the claim it cannot confirm"
@@ -690,9 +755,14 @@ let () =
       (* The whole reason the hold is strict: the true store's boot still finds
          its own header and its own floors, not this boot's. *)
       let* r2 =
-        Guard_file.open_ ~dir ~cap:2 ~head_water:no_heads ~identity:bound_a
+        Guard_file.open_ ~dir ~cap:2 ~head_water:no_heads ~identity:bound_a ~epoch:epoch0
       in
-      let (_ : Guard_sink.t), fl2, (_ : Guard_file.verdict), o2, h2 =
+      let ( (_ : Guard_sink.t)
+          , fl2
+          , (_ : Guard_file.verdict)
+          , o2
+          , (_ : Guard_file.epoch_outcome)
+          , h2 ) =
         opened "I11 recovery" r2
       in
       check
@@ -734,9 +804,11 @@ let () =
       check "I12 the planted header really is the 41-byte frame shape"
         (Int.equal (String.length foreign_header) 41);
       let* r1 =
-        Guard_file.open_ ~dir ~cap:8 ~head_water:no_heads ~identity:bound_b
+        Guard_file.open_ ~dir ~cap:8 ~head_water:no_heads ~identity:bound_b ~epoch:epoch0
       in
-      let (_ : Guard_sink.t), fl1, v1, o1, h1 = opened "I12" r1 in
+      let (_ : Guard_sink.t), fl1, v1, o1, (_ : Guard_file.epoch_outcome), h1 =
+        opened "I12" r1
+      in
       check
         "I12 a header payload that decodes to no token is Rebound 2: the two \
          events behind it are counted, not lost to a Freshly_bound"
@@ -752,9 +824,14 @@ let () =
         (Option.fold (stamped_token raw) ~none:false
            ~some:(String.equal (Id.to_string id_b)));
       let* r2 =
-        Guard_file.open_ ~dir ~cap:8 ~head_water:no_heads ~identity:bound_b
+        Guard_file.open_ ~dir ~cap:8 ~head_water:no_heads ~identity:bound_b ~epoch:epoch0
       in
-      let (_ : Guard_sink.t), fl2, (_ : Guard_file.verdict), o2, h2 =
+      let ( (_ : Guard_sink.t)
+          , fl2
+          , (_ : Guard_file.verdict)
+          , o2
+          , (_ : Guard_file.epoch_outcome)
+          , h2 ) =
         opened "I12 boot 2" r2
       in
       check "I12 the next boot Matches the token the rebind wrote"
@@ -790,9 +867,14 @@ let () =
         (String.length planted > String.length f1
         && not (String.equal planted (f1 ^ f2)));
       let* r =
-        Guard_file.open_ ~dir ~cap:8 ~head_water:no_heads ~identity:bound_a
+        Guard_file.open_ ~dir ~cap:8 ~head_water:no_heads ~identity:bound_a ~epoch:epoch0
       in
-      let (_ : Guard_sink.t), fl, (_ : Guard_file.verdict), o, h =
+      let ( (_ : Guard_sink.t)
+          , fl
+          , (_ : Guard_file.verdict)
+          , o
+          , (_ : Guard_file.epoch_outcome)
+          , h ) =
         opened "I13" r
       in
       check

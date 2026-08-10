@@ -92,6 +92,7 @@ let opened (what : string)
         * Floors.t
         * Guard_file.verdict
         * Guard_file.identity_outcome
+        * Guard_file.epoch_outcome
         * Guard_file.t
       , Guard_file.open_err )
       result) :
@@ -99,6 +100,7 @@ let opened (what : string)
     * Floors.t
     * Guard_file.verdict
     * Guard_file.identity_outcome
+    * Guard_file.epoch_outcome
     * Guard_file.t =
   Result.fold r ~ok:Fun.id
     ~error:(fun (e : Guard_file.open_err) ->
@@ -112,6 +114,11 @@ let opened (what : string)
    guard_identity_test's subject, not this file's. *)
 let store_id : Store_identity.t = Store_identity.of_draws (fun () -> 0xa5)
 let identity : Store_identity.binding = Store_identity.Bound store_id
+
+let epoch0 :
+    Tea_core.Prim.Store_epoch.binding * Tea_core.Prim.Store_epoch.binding =
+  ( Tea_core.Prim.Store_epoch.Bound Tea_core.Prim.Store_epoch.bottom
+  , Tea_core.Prim.Store_epoch.Bound Tea_core.Prim.Store_epoch.bottom )
 
 (* The boot filter's null input: no branches at all. Every floor this file
    writes carries [bottom] (a claim of nothing cannot be failed), so under
@@ -184,11 +191,12 @@ let journal_of (dir : string) : string = Filename.concat dir "journal"
 
 let () =
   in_scratch (fun dir ->
-      let* r0 = Guard_file.open_ ~dir ~cap:8 ~head_water:no_heads ~identity in
+      let* r0 = Guard_file.open_ ~dir ~cap:8 ~head_water:no_heads ~identity ~epoch:epoch0 in
       let ( sink
           , floors0
           , (_ : Guard_file.verdict)
           , (_ : Guard_file.identity_outcome)
+          , (_ : Guard_file.epoch_outcome)
           , h ) =
         opened "fresh dir" r0 in
       check "a fresh dir opens with empty floors"
@@ -202,11 +210,12 @@ let () =
          (a replayed record re-opening a consumed seq is the loss path). *)
       let* () = put "alpha tab1 seq2 (stale)" sink (advance alpha (tab 1) 2) in
       let* () = Guard_file.close h in
-      let* r1 = Guard_file.open_ ~dir ~cap:8 ~head_water:no_heads ~identity in
+      let* r1 = Guard_file.open_ ~dir ~cap:8 ~head_water:no_heads ~identity ~epoch:epoch0 in
       let ( (_ : Guard_sink.t)
           , floors
           , (_ : Guard_file.verdict)
           , (_ : Guard_file.identity_outcome)
+          , (_ : Guard_file.epoch_outcome)
           , h2 ) =
         opened "reopen" r1 in
       check "reopen hands back exactly the floors written before close"
@@ -221,11 +230,12 @@ let () =
 let () =
   in_scratch (fun dir ->
       let r = replica "torn" in
-      let* r0 = Guard_file.open_ ~dir ~cap:8 ~head_water:no_heads ~identity in
+      let* r0 = Guard_file.open_ ~dir ~cap:8 ~head_water:no_heads ~identity ~epoch:epoch0 in
       let ( sink
           , (_ : Floors.t)
           , (_ : Guard_file.verdict)
           , (_ : Guard_file.identity_outcome)
+          , (_ : Guard_file.epoch_outcome)
           , h ) =
         opened "torn setup" r0 in
       let* () =
@@ -240,11 +250,12 @@ let () =
          bytes than remain, the exact shape a crash mid-append leaves. *)
       Unix.truncate path (whole - 3);
       let torn = size_of path in
-      let* r1 = Guard_file.open_ ~dir ~cap:8 ~head_water:no_heads ~identity in
+      let* r1 = Guard_file.open_ ~dir ~cap:8 ~head_water:no_heads ~identity ~epoch:epoch0 in
       let ( (_ : Guard_sink.t)
           , floors
           , (_ : Guard_file.verdict)
           , (_ : Guard_file.identity_outcome)
+          , (_ : Guard_file.epoch_outcome)
           , h2 ) =
         opened "reopen over a torn tail" r1 in
       check "a torn tail keeps the surviving prefix, drops only the torn record"
@@ -252,8 +263,15 @@ let () =
         && floor_at floors r (tab 1) ~is:1
         && floor_at floors r (tab 2) ~is:2
         && no_floor floors r (tab 3));
-      check "reopen never truncates or rewrites the journal it read"
-        (Int.equal (size_of path) torn);
+      (* Step 21: a Matched identity no longer skips every rewrite, because the
+         epoch stamp behind it still advances on every open, and this open's
+         rewrite is a compacting one (identity header + epoch header + only
+         the 2 surviving floors), so the file SHRINKS rather than staying
+         byte-identical to what was read. The bound that still holds is
+         one-directional: the rewrite can drop the torn tail's discarded
+         bytes, never grow past what was read. *)
+      check "reopen never grows the journal beyond what it read"
+        (size_of path <= torn);
       Guard_file.close h2)
 
 (* --- 3. A flipped byte mid-file: fold-until-broken ------------------------- *)
@@ -264,13 +282,19 @@ let () =
       let e1 = advance r (tab 1) 1
       and e2 = advance r (tab 2) 2
       and e3 = advance r (tab 3) 3 in
-      let* r0 = Guard_file.open_ ~dir ~cap:8 ~head_water:no_heads ~identity in
+      let* r0 = Guard_file.open_ ~dir ~cap:8 ~head_water:no_heads ~identity ~epoch:epoch0 in
       let ( sink
           , (_ : Floors.t)
           , (_ : Guard_file.verdict)
           , (_ : Guard_file.identity_outcome)
+          , (_ : Guard_file.epoch_outcome)
           , h ) =
         opened "crc setup" r0 in
+      (* Step 21: a Bound epoch now stamps identity AND epoch headers before
+         this open returns, so the event frames no longer start at byte 0.
+         The header length is measured, not hardcoded, the same "from the
+         codec itself" discipline the frame offsets already follow below. *)
+      let header_len = size_of (journal_of dir) in
       let* () = Lwt_list.iter_s (put "three whole frames" sink) [ e1; e2; e3 ] in
       let* () = Guard_file.close h in
       let path = journal_of dir in
@@ -279,18 +303,20 @@ let () =
          well-formed frame 3 behind it. Frame offsets come from the codec
          itself, not from hardcoded sizes. *)
       let cut =
-        String.length (Guard_sink.Codec.to_bytes e1)
+        header_len
+        + String.length (Guard_sink.Codec.to_bytes e1)
         + String.length (Guard_sink.Codec.to_bytes e2)
         - 1
       in
       let bytes = Bytes.of_string (read_file path) in
       Bytes.set bytes cut (Char.chr (Char.code (Bytes.get bytes cut) lxor 0xff));
       write_file path (Bytes.to_string bytes);
-      let* r1 = Guard_file.open_ ~dir ~cap:8 ~head_water:no_heads ~identity in
+      let* r1 = Guard_file.open_ ~dir ~cap:8 ~head_water:no_heads ~identity ~epoch:epoch0 in
       let ( (_ : Guard_sink.t)
           , floors
           , (_ : Guard_file.verdict)
           , (_ : Guard_file.identity_outcome)
+          , (_ : Guard_file.epoch_outcome)
           , h2 ) =
         opened "reopen over a bad CRC" r1 in
       check "floors stop at the corruption; later well-formed frames are discarded"
@@ -305,11 +331,12 @@ let () =
 let () =
   in_scratch (fun dir ->
       let r = replica "crowded" in
-      let* r0 = Guard_file.open_ ~dir ~cap:4 ~head_water:no_heads ~identity in
+      let* r0 = Guard_file.open_ ~dir ~cap:4 ~head_water:no_heads ~identity ~epoch:epoch0 in
       let ( sink
           , (_ : Floors.t)
           , (_ : Guard_file.verdict)
           , (_ : Guard_file.identity_outcome)
+          , (_ : Guard_file.epoch_outcome)
           , h ) =
         opened "cap 4" r0 in
       (* Five distinct keys against cap 4, then key 1 touched again: by last
@@ -327,11 +354,12 @@ let () =
           ]
       in
       let* () = Guard_file.close h in
-      let* r1 = Guard_file.open_ ~dir ~cap:4 ~head_water:no_heads ~identity in
+      let* r1 = Guard_file.open_ ~dir ~cap:4 ~head_water:no_heads ~identity ~epoch:epoch0 in
       let ( (_ : Guard_sink.t)
           , floors
           , (_ : Guard_file.verdict)
           , (_ : Guard_file.identity_outcome)
+          , (_ : Guard_file.epoch_outcome)
           , h2 ) =
         opened "reopen capped" r1 in
       check "the reopened floor count is bounded by cap"
@@ -355,11 +383,12 @@ let () =
   in_scratch (fun dir ->
       let r = replica "compact" in
       let ta = tab 1 and tb = tab 2 in
-      let* r0 = Guard_file.open_ ~dir ~cap:2 ~head_water:no_heads ~identity in
+      let* r0 = Guard_file.open_ ~dir ~cap:2 ~head_water:no_heads ~identity ~epoch:epoch0 in
       let ( sink
           , (_ : Floors.t)
           , (_ : Guard_file.verdict)
           , (_ : Guard_file.identity_outcome)
+          , (_ : Guard_file.epoch_outcome)
           , h ) =
         opened "cap 2" r0 in
       let* () =
@@ -383,11 +412,12 @@ let () =
       (* The sink must stay live across the temp+rename cut-over. *)
       let* () = put "post-compaction append" sink (advance r tb 5) in
       let* () = Guard_file.close h in
-      let* r1 = Guard_file.open_ ~dir ~cap:2 ~head_water:no_heads ~identity in
+      let* r1 = Guard_file.open_ ~dir ~cap:2 ~head_water:no_heads ~identity ~epoch:epoch0 in
       let ( (_ : Guard_sink.t)
           , floors
           , (_ : Guard_file.verdict)
           , (_ : Guard_file.identity_outcome)
+          , (_ : Guard_file.epoch_outcome)
           , h2 ) =
         opened "reopen after compaction" r1 in
       check "the floors survive compaction and the reopen unchanged"
@@ -401,11 +431,12 @@ let () =
 let () =
   in_scratch (fun dir ->
       let keep = replica "keep" and drop = replica "drop" in
-      let* r0 = Guard_file.open_ ~dir ~cap:8 ~head_water:no_heads ~identity in
+      let* r0 = Guard_file.open_ ~dir ~cap:8 ~head_water:no_heads ~identity ~epoch:epoch0 in
       let ( sink
           , (_ : Floors.t)
           , (_ : Guard_file.verdict)
           , (_ : Guard_file.identity_outcome)
+          , (_ : Guard_file.epoch_outcome)
           , h ) =
         opened "forget setup" r0 in
       let* () =
@@ -418,11 +449,12 @@ let () =
           ]
       in
       let* () = Guard_file.close h in
-      let* r1 = Guard_file.open_ ~dir ~cap:8 ~head_water:no_heads ~identity in
+      let* r1 = Guard_file.open_ ~dir ~cap:8 ~head_water:no_heads ~identity ~epoch:epoch0 in
       let ( (_ : Guard_sink.t)
           , floors
           , (_ : Guard_file.verdict)
           , (_ : Guard_file.identity_outcome)
+          , (_ : Guard_file.epoch_outcome)
           , h2 ) =
         opened "reopen after forget" r1 in
       check "a journalled Forget scrubs that replica's floors across restart"
@@ -437,11 +469,12 @@ let () =
 let () =
   in_scratch (fun dir ->
       let r = replica "closing" in
-      let* r0 = Guard_file.open_ ~dir ~cap:4 ~head_water:no_heads ~identity in
+      let* r0 = Guard_file.open_ ~dir ~cap:4 ~head_water:no_heads ~identity ~epoch:epoch0 in
       let ( sink
           , (_ : Floors.t)
           , (_ : Guard_file.verdict)
           , (_ : Guard_file.identity_outcome)
+          , (_ : Guard_file.epoch_outcome)
           , h ) =
         opened "close semantics" r0 in
       let* () = put "one record" sink (advance r (tab 1) 1) in
@@ -473,7 +506,7 @@ let () =
   write_file file_not_dir "not a directory";
   let r =
     Lwt_main.run
-      (Guard_file.open_ ~dir:file_not_dir ~cap:4 ~head_water:no_heads ~identity)
+      (Guard_file.open_ ~dir:file_not_dir ~cap:4 ~head_water:no_heads ~identity ~epoch:epoch0)
   in
   let is_io =
     Result.fold r
@@ -482,11 +515,13 @@ let () =
            , (_ : Floors.t)
            , (_ : Guard_file.verdict)
            , (_ : Guard_file.identity_outcome)
+           , (_ : Guard_file.epoch_outcome)
            , (_ : Guard_file.t) ) :
             Guard_sink.t
             * Floors.t
             * Guard_file.verdict
             * Guard_file.identity_outcome
+            * Guard_file.epoch_outcome
             * Guard_file.t)
         -> false)
       ~error:(fun (e : Guard_file.open_err) ->
@@ -512,8 +547,13 @@ let () =
             else Char.chr (Int64.to_int (Test_util.lcg_next state) land 0xff))
       in
       write_file (journal_of dir) garbage;
-      let* r0 = Guard_file.open_ ~dir ~cap:4 ~head_water:no_heads ~identity in
-      let sink, floors, (_ : Guard_file.verdict), (_ : Guard_file.identity_outcome), h =
+      let* r0 = Guard_file.open_ ~dir ~cap:4 ~head_water:no_heads ~identity ~epoch:epoch0 in
+      let ( sink
+          , floors
+          , (_ : Guard_file.verdict)
+          , (_ : Guard_file.identity_outcome)
+          , (_ : Guard_file.epoch_outcome)
+          , h ) =
         opened "garbage journal" r0 in
       check "a journal of pure garbage opens Ok with empty floors"
         (Int.equal (Floors.cardinal floors) 0);

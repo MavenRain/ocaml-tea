@@ -67,6 +67,30 @@ let explain_outcome ~(binding : Tea_core.Prim.Store_identity.binding)
          "tea_server_pack: %s channel: dropped %d delivery floor(s) because this pack root's own identity token could not be read or minted; the journal's binding is LEFT INTACT and nothing is re-stamped or appended, so a boot that can read the token again keeps its floors - until then every boot re-applies the affected replays as visible duplicates\n"
          channel n)
 
+(* [explain_outcome]'s twin for the boot-epoch stamp (step 21, R20b): a pure
+   function of the outcome, so what an operator reads can be asserted by a
+   test. [Epoch_matched] is the ordinary reopen and stays silent, the
+   [Freshly_bound] rule one family over. *)
+let explain_epoch_outcome ~(channel : string) (o : Guard_file.epoch_outcome) :
+    string option =
+  match o with
+  | Guard_file.Epoch_matched -> None
+  | Guard_file.Epoch_adopted ->
+    Some
+      (Printf.sprintf
+         "tea_server_pack: %s channel: this guard journal carries no boot-epoch stamp (a pre-step-21 journal); its floors are kept on trust and the journal is stamped with this boot's counter now\n"
+         channel)
+  | Guard_file.Epoch_diverged n ->
+    Some
+      (Printf.sprintf
+         "tea_server_pack: %s channel: dropped ALL %d delivery floor(s): this guard journal's boot-epoch stamp does not equal this root's counter (a journal restored beside a diverged COPY of its own store, a root rolled back under a surviving journal, or a torn stamp); the affected replays will re-apply as visible duplicates rather than be silently lost, and the journal is re-stamped to this boot now\n"
+         channel n)
+  | Guard_file.Epoch_unresolved ->
+    Some
+      (Printf.sprintf
+         "tea_server_pack: %s channel: this pack root's boot-epoch counter could not be read; a journal carrying a stamp is HELD with its floors cleared this boot (nothing re-stamped or appended, so a boot that reads the counter again keeps its floors), and a journal carrying no stamp keeps its floors but stays unstamped\n"
+         channel)
+
 (** Open both channels' guard journals under [guard_dir].
 
     Since roadmap step 15 there are TWO journals, one per delivery channel:
@@ -99,18 +123,21 @@ let open_guards ~(guard_dir : string)
     ~(head_water :
        Tea_core.Crdt.Replica.t -> Tea_core.Prim.Store_water.t option)
     ~(identity : Tea_core.Prim.Store_identity.binding)
+    ~(epoch :
+       Tea_core.Prim.Store_epoch.binding * Tea_core.Prim.Store_epoch.binding)
     ?(fence : (unit -> unit Lwt.t) option) () : guards =
   let open_journal ~(channel : string) ~(dir : string) ~(cap : int)
       ~(sessions : Replay_guard.Bound.t) ~(tabs : Replay_guard.Bound.t) :
       Durable_guard.t * Guard_file.t option =
-    Lwt_main.run (Guard_file.open_ ~dir ~cap ~head_water ~identity)
+    Lwt_main.run (Guard_file.open_ ~dir ~cap ~head_water ~identity ~epoch)
     |> Result.fold
          ~ok:(fun
-             ((sink, floors, verdict, identity_outcome, jf) :
+             ((sink, floors, verdict, identity_outcome, epoch_outcome, jf) :
                Guard_sink.t
                * Durable_guard.Floors.t
                * Guard_file.verdict
                * Guard_file.identity_outcome
+               * Guard_file.epoch_outcome
                * Guard_file.t)
            ->
            let { Guard_file.kept = (_ : int)
@@ -138,6 +165,9 @@ let open_guards ~(guard_dir : string)
            Option.iter
              (fun (line : string) -> Printf.eprintf "%s%!" line)
              (explain_outcome ~binding:identity ~channel identity_outcome);
+           Option.iter
+             (fun (line : string) -> Printf.eprintf "%s%!" line)
+             (explain_epoch_outcome ~channel epoch_outcome);
            (* The mirror bound is DERIVED at this composition site, never a
               constant (D20.4), and this is the only place that knows [cap]:
               the guard reaches its journal through an append-only sink and
@@ -287,9 +317,15 @@ module Make_pack (A : Tea_core.App.APP) = struct
        newer head passes the filter. Step 18 (D23) answers that with a
        store-identity token minted once into [<root>/tea.identity] and stamped
        into each journal's first frame, so a journal beside an INDEPENDENT
-       store drops its floors instead of trusting them. What the token still
-       cannot answer is a divergent COPY of one lineage - a clone carries the
-       token unchanged (DESIGN R20b residual). *)
+       store drops its floors instead of trusting them. What the token
+       cannot answer is a divergent COPY of one lineage - a clone carries
+       the token unchanged. Step 21 (R20b) answers THAT with the boot-epoch
+       counter bumped below: [<root>/tea.epoch] moves at every open on
+       either side of a fork, so a journal beside a diverged copy reads an
+       unequal stamp and drops its floors too. What remains is the
+       coincidence residue the register keeps: a copy whose boot count since
+       the fork exactly equals the original's carries an equal counter
+       (DESIGN R20b close-out). *)
     let guard_dir = sibling root ".guard" in
     if (not (Sys.file_exists (Root.to_string root))) && Sys.file_exists guard_dir then (
       Printf.eprintf
@@ -367,6 +403,13 @@ module Make_pack (A : Tea_core.App.APP) = struct
        across a mint race and bind the two journals to different tokens. *)
     let identity, identity_origin = Store.resolve_identity root in
     Printf.eprintf "tea_server_pack: %s\n%!" (Store.explain_identity identity_origin);
+    (* The boot counter, bumped ONCE here (step 21, R20b): AFTER [open_root]
+       for [resolve_identity]'s mkdir reason, BEFORE [open_guards] because one
+       [(seen, now)] pair has to reach both channels - a stronger need than
+       the token's, since the counter MUTATES at every resolution, so two
+       reads could not even agree with each other. *)
+    let epoch, epoch_origin = Store.bump_epoch root in
+    Printf.eprintf "tea_server_pack: %s\n%!" (Store.explain_epoch_origin epoch_origin);
     (* Both channels' journals, opened together and against this one head
        snapshot (D20.3). The directory each channel lands in, and the order the
        two are opened in, live in {!open_guards} rather than here so a native
@@ -377,7 +420,7 @@ module Make_pack (A : Tea_core.App.APP) = struct
          on irmin-pack's undocumented batch-end flush, and no caller has a
          legitimate reason to want that. The fence is what makes the
          floor/commit ordering THIS repo's invariant. *)
-      open_guards ~guard_dir ~head_water ~identity
+      open_guards ~guard_dir ~head_water ~identity ~epoch
         ~fence:(fun () -> Store.flush repo) ()
     in
     (* [?rpc_once] takes a route BUILDER for the reason {!Tea_server.Make.serve}

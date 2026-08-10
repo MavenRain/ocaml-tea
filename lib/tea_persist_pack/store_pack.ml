@@ -328,6 +328,178 @@ module Identity = struct
         identity_file unresolved_effect
 end
 
+(* THE BOOT EPOCH COUNTER (roadmap step 21, R20b).
+
+   Free-standing for [Identity]'s reason: one synchronous resolution the
+   composition site sequences itself, [include]d into the functor rather than
+   rebuilt per instantiation. Unlike [resolve_identity] it MUTATES - every
+   readable call advances the counter on disk - so it is NOT idempotent and
+   the composition site calls it exactly once per boot. *)
+module Epoch = struct
+  module Store_epoch = Tea_core.Prim.Store_epoch
+
+  type epoch_origin =
+    | Epoch_bumped
+    | Epoch_minted
+    | Epoch_write_failed of string
+    | Epoch_unreadable of string
+    | Epoch_malformed
+
+  let epoch_file : string = "tea.epoch"
+
+  let epoch_path (root : Root.t) : string =
+    Filename.concat (Root.to_string root) epoch_file
+
+  (* 16 hex characters plus, generously, a trailing newline an editor added
+     ([max_identity_bytes]'s rule: the counter is fixed width, so anything
+     larger is not one). *)
+  let max_epoch_bytes : int = 32
+
+  (* [read_identity]'s shape with absence pulled out on its own: ENOENT is the
+     caller's mint arm, and BOTH refusals leave the bytes exactly as found. *)
+  let read_epoch (path : string) :
+      (Store_epoch.t, [ `Absent | `Unreadable of string | `Malformed ]) result =
+    Result.bind
+      (Identity.lstat_opt path
+      |> Result.map_error (fun (reason : string) -> `Unreadable reason))
+      (fun (found : Unix.stats option) ->
+        Option.fold found ~none:(Error `Absent) ~some:(fun (st : Unix.stats) ->
+            if not (Identity.is_regular st.Unix.st_kind) then
+              Error (`Unreadable "not a regular file")
+            else if st.Unix.st_size > max_epoch_bytes then
+              Error (`Unreadable (Printf.sprintf "oversized (%d bytes)" st.Unix.st_size))
+            else
+              Result.bind
+                (Identity.guard (fun () ->
+                     In_channel.with_open_bin path In_channel.input_all)
+                |> Result.map_error (fun (reason : string) -> `Unreadable reason))
+                (fun (raw : string) ->
+                  Store_epoch.of_string (Identity.strip_nl raw)
+                  |> Result.map_error (fun `Malformed -> `Malformed))))
+
+  (* A killed boot can strand its [O_EXCL] staging file between the create
+     and the unlink, and nothing else ever reclaims it: irmin-pack's post-GC
+     cleanup deliberately never removes files it classifies [`Unknown] - the
+     same fact that makes [tea.]-prefixed names safe to keep inside the root
+     is what makes a stranded one permanent. Unlike the identity mint this
+     path runs at EVERY boot, so the sweep runs where the exposure recurs.
+     The writer lock taken under [open_root] excludes a live sibling
+     process, so any staging file found here belongs to a dead boot. *)
+  let sweep_stale_staging (path : string) : unit =
+    let dir = Filename.dirname path in
+    let prefix = Filename.basename path ^ ".tmp." in
+    Identity.guard (fun () -> Sys.readdir dir)
+    |> Result.fold
+         ~error:(fun (_ : string) -> ())
+         ~ok:
+           (Array.iter (fun (entry : string) ->
+                if String.starts_with ~prefix entry then
+                  let (_ : (unit, string) result) =
+                    Identity.guard (fun () ->
+                        Unix.unlink (Filename.concat dir entry))
+                  in
+                  ()))
+
+  (* [rename], not [link_or_adopt]: the counter is REWRITTEN every boot, so
+     last-writer-wins is the contract, not first-writer-wins. Two boots racing
+     one root cannot happen through the production path - irmin-pack's index
+     writer lock, taken under [open_root] before any bump runs, refuses a
+     second PROCESS (a per-PID record lock, not flock, so a second serve
+     inside ONE process is excluded by the one-bump-per-boot contract
+     instead) - and an operator who forces it mints one more divergence
+     for the next boot to clear noisily. The bytes are fsynced while still
+     nameless to any reader ([publish]'s rule), and the staging name carries
+     the pid and fresh entropy for [publish]'s stated reason, so no boot can
+     read a torn counter that this process wrote. *)
+  let write_epoch (path : string) (value : Store_epoch.t) : (unit, string) result =
+    let hex = Store_epoch.to_string value in
+    let want = String.length hex in
+    Result.bind (Identity.draw_bytes Identity.salt_bytes) (fun (salt : int list) ->
+        let tmp =
+          Printf.sprintf "%s.tmp.%d.%s" path (Unix.getpid ()) (Identity.hex_of salt)
+        in
+        Result.bind
+          (Identity.guard (fun () -> Unix.openfile tmp Identity.create_flags 0o644))
+          (fun (fd : Unix.file_descr) ->
+            let staged =
+              Identity.guard (fun () ->
+                  let n = Unix.write_substring fd hex 0 want in
+                  Unix.fsync fd;
+                  n)
+            in
+            let (_ : (unit, string) result) = Identity.guard (fun () -> Unix.close fd) in
+            let renamed =
+              Result.bind staged (fun (n : int) ->
+                  if Int.equal n want then
+                    Identity.guard (fun () -> Unix.rename tmp path)
+                  else
+                    Error (Printf.sprintf "short write (%d of %d bytes)" n want))
+            in
+            (* Scoped to the branch whose [O_EXCL] open succeeded ([publish]'s
+               rule); after a successful rename the unlink refuses ENOENT and
+               is discarded the same way. *)
+            let (_ : (unit, string) result) = Identity.guard (fun () -> Unix.unlink tmp) in
+            renamed))
+
+  (* Total, and the one MUTATING resolver in this family. [`Absent] is the
+     mint arm ([read_identity]'s rule: absence is not a refusal); either read
+     refusal HOLDS - no write, bytes exactly as found - so a transient failure
+     can never manufacture a permanent false-divergence baseline against
+     journals that never diverged. A refused WRITE still returns both values:
+     this boot proceeds on them, and the next boot's compare against the stale
+     file clears floors noisily - the duplicate side, never loss. *)
+  let bump_epoch (root : Root.t) :
+      (Store_epoch.binding * Store_epoch.binding) * epoch_origin =
+    let path = epoch_path root in
+    sweep_stale_staging path;
+    let stamped ((prev : Store_epoch.t), (fresh : epoch_origin)) =
+      let next = Store_epoch.succ prev in
+      write_epoch path next
+      |> Result.fold
+           ~ok:(fun () -> ((Store_epoch.Bound prev, Store_epoch.Bound next), fresh))
+           ~error:(fun (reason : string) ->
+             ((Store_epoch.Bound prev, Store_epoch.Bound next), Epoch_write_failed reason))
+    in
+    read_epoch path
+    |> Result.fold
+         ~ok:(fun (prev : Store_epoch.t) -> stamped (prev, Epoch_bumped))
+         ~error:(fun (refusal : [ `Absent | `Unreadable of string | `Malformed ]) ->
+           match refusal with
+           | `Absent -> stamped (Store_epoch.bottom, Epoch_minted)
+           | `Unreadable (reason : string) ->
+             ((Store_epoch.Unresolved, Store_epoch.Unresolved), Epoch_unreadable reason)
+           | `Malformed ->
+             ((Store_epoch.Unresolved, Store_epoch.Unresolved), Epoch_malformed))
+
+  (* [unresolved_effect]'s conditional sentence, one family over: an
+     unresolved counter does not do one thing to every journal either. *)
+  let unresolved_epoch_effect : string =
+    "guard journals that carry a boot-epoch stamp are held and their floors cleared this \
+     boot (the affected replays re-apply as visible duplicates); journals carrying no \
+     stamp keep their floors but stay UNSTAMPED, because there is no counter to stamp \
+     them with"
+
+  let explain_epoch_origin (o : epoch_origin) : string =
+    match o with
+    | Epoch_bumped ->
+      Printf.sprintf "advanced the boot epoch counter in %s in the pack root" epoch_file
+    | Epoch_minted ->
+      Printf.sprintf "minted a boot epoch counter into %s (this root carried none)"
+        epoch_file
+    | Epoch_write_failed (reason : string) ->
+      Printf.sprintf
+        "the boot epoch counter advanced in memory but %s could not be rewritten (%s); journals stamped this boot will read as diverged from the stale file on the next boot, so their floors will clear then, noisily and on the duplicate side"
+        epoch_file reason
+    | Epoch_unreadable (reason : string) ->
+      Printf.sprintf
+        "the boot epoch counter %s is present but could not be read (%s); it is left exactly as found, and %s, until it reads"
+        epoch_file reason unresolved_epoch_effect
+    | Epoch_malformed ->
+      Printf.sprintf
+        "the boot epoch counter %s is not 16 lowercase hex characters; it is left exactly as found, and %s, until it reads"
+        epoch_file unresolved_epoch_effect
+end
+
 module Make (A : Tea_core.App.APP) = struct
   module Contents = struct
     include Tea_persist.Store_core.Contents (A)
@@ -452,6 +624,12 @@ module Make (A : Tea_core.App.APP) = struct
      [Store.resolve_identity] at the composition site without the functor
      rebuilding one closure of it per app. *)
   include Identity
+
+  (* [epoch_path], [bump_epoch] and [explain_epoch_origin], re-exported for
+     [Identity]'s reason. The constructor names do not collide: both origin
+     sums land in one namespace here, so the epoch arms carry their own
+     [Epoch_] prefix. *)
+  include Epoch
 
   (** Whether GC on this store archives discarded data to a lower layer
       ([`Archive], a [lower_root] was configured) or deletes it ([`Delete]).

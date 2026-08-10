@@ -168,6 +168,11 @@ let now : unit -> int64 = fun () -> 1_000L
 let store_id : Store_identity.t = Store_identity.of_draws (fun () -> 0x4b)
 let identity : Store_identity.binding = Store_identity.Bound store_id
 
+let epoch0 :
+    Tea_core.Prim.Store_epoch.binding * Tea_core.Prim.Store_epoch.binding =
+  ( Tea_core.Prim.Store_epoch.Bound Tea_core.Prim.Store_epoch.bottom
+  , Tea_core.Prim.Store_epoch.Bound Tea_core.Prim.Store_epoch.bottom )
+
 let parent_dir = Filename.temp_dir "ocaml-tea-kill-durability" ""
 
 (* root, guard dir, and the per-rep file the child's stderr is dup2'd to. *)
@@ -242,7 +247,8 @@ let child_body ~(root : string) ~(guard_dir : string) ~(fenced : bool)
     if fenced then Some (fun () -> Store.flush t) else None
   in
   let { Tea_server_pack.ws; ws_journal; rpc = (_ : Dguard.t); rpc_journal } =
-    Tea_server_pack.open_guards ~guard_dir ~head_water ~identity ?fence ()
+    Tea_server_pack.open_guards ~guard_dir ~head_water ~identity ~epoch:epoch0
+      ?fence ()
   in
   (* A [None] journal is a null sink: the rep would measure nothing, so the
      child refuses loudly (a nonzero status fails the parent's status
@@ -401,7 +407,8 @@ let boot_filter ~(what : string) ~(guard_dir : string)
     ~(head_water : Replica.t -> Water.t option) :
     Guard_file.verdict * Floors.t =
   Lwt_main.run
-    (Guard_file.open_ ~dir:guard_dir ~cap:journal_cap ~head_water ~identity)
+    (Guard_file.open_ ~dir:guard_dir ~cap:journal_cap ~head_water ~identity
+       ~epoch:epoch0)
   |> Result.fold
        ~error:(fun (e : Guard_file.open_err) ->
          die (Printf.sprintf "setup: %s journal reopen (%s)" what (open_err_name e)))
@@ -410,6 +417,7 @@ let boot_filter ~(what : string) ~(guard_dir : string)
            , (fl : Floors.t)
            , (v : Guard_file.verdict)
            , (_ : Guard_file.identity_outcome)
+           , (_ : Guard_file.epoch_outcome)
            , (jf : Guard_file.t) )
          ->
          Lwt_main.run (Guard_file.close jf);

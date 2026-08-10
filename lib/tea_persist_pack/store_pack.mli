@@ -150,6 +150,58 @@ module Make (A : Tea_core.App.APP) : sig
   (** One sentence per constructor, matched HERE so a new constructor is a
       compile error in one place ({!explain}'s rule). *)
 
+  type epoch_origin =
+    | Epoch_bumped  (** decoded from an existing [<root>/tea.epoch] and advanced *)
+    | Epoch_minted  (** absent; this boot started the counter at its bottom *)
+    | Epoch_write_failed of string
+        (** the counter advanced in memory but the file write refused; this
+            boot proceeds on the in-memory pair, and the NEXT boot reads the
+            stale file, diverges against every journal stamped now, and clears
+            their floors noisily - the duplicate side, never loss *)
+    | Epoch_unreadable of string  (** present, but lstat/open/read refused it; the reason *)
+    | Epoch_malformed  (** present and read, but not 16 lowercase hex *)
+
+  val epoch_path : Root.t -> string
+  (** [<root>/tea.epoch]. Exposed for {!identity_path}'s reason: tests delete,
+      corrupt, freeze, and stat it without duplicating the filename literal. *)
+
+  val bump_epoch :
+    Root.t -> (Tea_core.Prim.Store_epoch.binding * Tea_core.Prim.Store_epoch.binding) * epoch_origin
+  (** The store's boot counter (step 21, R20b): read [<root>/tea.epoch],
+      advance it, rewrite the file, and return [(seen, now)] - [seen] is the
+      pre-bump value the boot COMPARES each journal's stamp against, [now] is
+      the post-bump value it STAMPS journals with. One call yields both, so no
+      caller can race the read half against the write half. Total, synchronous,
+      never raises, and no refusal arm can stop a boot ({!resolve_identity}'s
+      construction).
+
+      NOT idempotent, unlike {!resolve_identity}: every readable call advances
+      the counter on disk. Call it exactly once per boot, and share the pair
+      with every channel of that boot - two calls would hand the second channel
+      a counter the first channel's journals were not stamped with.
+
+      A present-but-unreadable or malformed file yields [(Unresolved,
+      Unresolved)] and the bytes stay EXACTLY as found ({!resolve_identity}'s
+      never-rewrite rule): a re-mint over a transient read failure would
+      manufacture a permanent false-divergence baseline against journals that
+      never diverged. Absence is the one mint arm - the counter starts at
+      bottom and the first stamp is its successor.
+
+      The write is an [O_EXCL]-temp + [fsync] + [Unix.rename] - [rename], not
+      {!resolve_identity}'s [link], because the counter is rewritten every
+      boot, so last-writer-wins IS the contract; torn bytes under a crashed
+      rename are impossible to read back, and a reader therefore meets either
+      the old counter or the new one, never half of each.
+
+      ORDERING, load-bearing: after {!open_root}/{!create}
+      ({!resolve_identity}'s mkdir reason), and the file lives INSIDE [<root>]
+      for the same R20-recursion reason - the copy that creates R20b must
+      carry its epoch with it, frozen at copy time, because that frozen value
+      is exactly what the divergence check reads. *)
+
+  val explain_epoch_origin : epoch_origin -> string
+  (** One sentence per constructor ({!explain_identity}'s rule). *)
+
   val gc_behaviour : t -> [ `Archive | `Delete ]
   (** [`Archive] when a [lower_root] was configured (GC moves discarded data to
       the lower layer), [`Delete] otherwise. Observable without running a GC. *)

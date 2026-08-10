@@ -215,6 +215,7 @@ let opened (what : string)
         * Floors.t
         * Guard_file.verdict
         * Guard_file.identity_outcome
+        * Guard_file.epoch_outcome
         * Guard_file.t
       , Guard_file.open_err )
       result) :
@@ -222,6 +223,7 @@ let opened (what : string)
     * Floors.t
     * Guard_file.verdict
     * Guard_file.identity_outcome
+    * Guard_file.epoch_outcome
     * Guard_file.t =
   Result.fold r ~ok:Fun.id
     ~error:(fun (e : Guard_file.open_err) ->
@@ -235,6 +237,11 @@ let opened (what : string)
    [Matched] arm leave the step-13 water filter alone. *)
 let store_id : Store_identity.t = Store_identity.of_draws (fun () -> 0x5a)
 let identity : Store_identity.binding = Store_identity.Bound store_id
+
+let epoch0 :
+    Tea_core.Prim.Store_epoch.binding * Tea_core.Prim.Store_epoch.binding =
+  ( Tea_core.Prim.Store_epoch.Bound Tea_core.Prim.Store_epoch.bottom
+  , Tea_core.Prim.Store_epoch.Bound Tea_core.Prim.Store_epoch.bottom )
 
 let sink_err_name (e : Guard_sink.err) : string =
   match e with
@@ -408,9 +415,14 @@ let () =
       let* r1 =
         Guard_file.open_ ~dir ~cap:8
           ~head_water:(heads [ (ra, water 100); (rb, water 90) ])
-          ~identity
+          ~identity ~epoch:epoch0
       in
-      let (_ : Guard_sink.t), fl1, v1, (_ : Guard_file.identity_outcome), h1 =
+      let ( (_ : Guard_sink.t)
+          , fl1
+          , v1
+          , (_ : Guard_file.identity_outcome)
+          , (_ : Guard_file.epoch_outcome)
+          , h1 ) =
         opened "G1" r1 in
       (* Equality passes and is load-bearing: ra's head EQUALS its floor's
          water, the exact state of every floor after an orderly restart. *)
@@ -422,9 +434,14 @@ let () =
       let* r2 =
         Guard_file.open_ ~dir ~cap:8
           ~head_water:(heads [ (ra, water 60); (rb, water 90) ])
-          ~identity
+          ~identity ~epoch:epoch0
       in
-      let (_ : Guard_sink.t), fl2, v2, (_ : Guard_file.identity_outcome), h2 =
+      let ( (_ : Guard_sink.t)
+          , fl2
+          , v2
+          , (_ : Guard_file.identity_outcome)
+          , (_ : Guard_file.epoch_outcome)
+          , h2 ) =
         opened "G2" r2 in
       check
         "G2 the SAME journal bytes drop the rolled-back floor under the \
@@ -485,9 +502,14 @@ let () =
       let* r1 =
         Guard_file.open_ ~dir ~cap:8
           ~head_water:(heads [ (rl, water 10); (rq, water 150) ])
-          ~identity
+          ~identity ~epoch:epoch0
       in
-      let (_ : Guard_sink.t), fl1, v1, (_ : Guard_file.identity_outcome), h1 =
+      let ( (_ : Guard_sink.t)
+          , fl1
+          , v1
+          , (_ : Guard_file.identity_outcome)
+          , (_ : Guard_file.epoch_outcome)
+          , h1 ) =
         opened "G3 upgrade arm" r1 in
       check
         "G3 a legacy floor is adopted at a real head while an uncovered real \
@@ -507,8 +529,13 @@ let () =
         write_file (journal_of dir)
           (legacy ^ Guard_sink.Codec.to_bytes (adv rq (tab 1) 9 (water 200)))
       in
-      let* r2 = Guard_file.open_ ~dir ~cap:8 ~head_water:no_heads ~identity in
-      let (_ : Guard_sink.t), fl2, v2, (_ : Guard_file.identity_outcome), h2 =
+      let* r2 = Guard_file.open_ ~dir ~cap:8 ~head_water:no_heads ~identity ~epoch:epoch0 in
+      let ( (_ : Guard_sink.t)
+          , fl2
+          , v2
+          , (_ : Guard_file.identity_outcome)
+          , (_ : Guard_file.epoch_outcome)
+          , h2 ) =
         opened "G3 fresh arm" r2 in
       check
         "G3 a fresh store still adopts the legacy floor; the real claim reads \
@@ -530,9 +557,14 @@ let () =
       let* r0 =
         Guard_file.open_ ~dir ~cap:8
           ~head_water:(heads [ (live, water 80) ])
-          ~identity
+          ~identity ~epoch:epoch0
       in
-      let (_ : Guard_sink.t), fl, v, (_ : Guard_file.identity_outcome), h =
+      let ( (_ : Guard_sink.t)
+          , fl
+          , v
+          , (_ : Guard_file.identity_outcome)
+          , (_ : Guard_file.epoch_outcome)
+          , h ) =
         opened "G4" r0 in
       check
         "G4 a floor whose replica names NO branch drops in the same open \
@@ -552,11 +584,12 @@ let () =
 let () =
   in_scratch (fun dir ->
       let ra = replica "g-compact-a" and rb = replica "g-compact-b" in
-      let* r0 = Guard_file.open_ ~dir ~cap:2 ~head_water:no_heads ~identity in
+      let* r0 = Guard_file.open_ ~dir ~cap:2 ~head_water:no_heads ~identity ~epoch:epoch0 in
       let ( sink
           , (_ : Floors.t)
           , (_ : Guard_file.verdict)
           , (_ : Guard_file.identity_outcome)
+          , (_ : Guard_file.epoch_outcome)
           , h ) =
         opened "G5" r0
       in
@@ -585,9 +618,14 @@ let () =
       let* r1 =
         Guard_file.open_ ~dir ~cap:2
           ~head_water:(heads [ (ra, water 50); (rb, water 90) ])
-          ~identity
+          ~identity ~epoch:epoch0
       in
-      let (_ : Guard_sink.t), fl, v, (_ : Guard_file.identity_outcome), h2 =
+      let ( (_ : Guard_sink.t)
+          , fl
+          , v
+          , (_ : Guard_file.identity_outcome)
+          , (_ : Guard_file.epoch_outcome)
+          , h2 ) =
         opened "G5 reopen" r1 in
       check
         "G5 compaction re-emitted each floor's water: the rolled-back key \
@@ -625,8 +663,13 @@ let () =
       in
       let* size0 = size_of (journal_of dir) in
       let under = heads [ (rb, water 60) ] in
-      let* r1 = Guard_file.open_ ~dir ~cap:2 ~head_water:under ~identity in
-      let (_ : Guard_sink.t), fl1, v1, (_ : Guard_file.identity_outcome), h1 =
+      let* r1 = Guard_file.open_ ~dir ~cap:2 ~head_water:under ~identity ~epoch:epoch0 in
+      let ( (_ : Guard_sink.t)
+          , fl1
+          , v1
+          , (_ : Guard_file.identity_outcome)
+          , (_ : Guard_file.epoch_outcome)
+          , h1 ) =
         opened "G6 first open" r1 in
       let* size1 = size_of (journal_of dir) in
       check
@@ -640,9 +683,14 @@ let () =
       let* r2 =
         Guard_file.open_ ~dir ~cap:2
           ~head_water:(heads [ (ra, water 500); (rb, water 60) ])
-          ~identity
+          ~identity ~epoch:epoch0
       in
-      let (_ : Guard_sink.t), fl2, v2, (_ : Guard_file.identity_outcome), h2 =
+      let ( (_ : Guard_sink.t)
+          , fl2
+          , v2
+          , (_ : Guard_file.identity_outcome)
+          , (_ : Guard_file.epoch_outcome)
+          , h2 ) =
         opened "G6 second open" r2 in
       check
         "G6 the drop is durable: a head risen past the stale water cannot \
@@ -682,12 +730,13 @@ let () =
       let* r0 =
         Guard_file.open_ ~dir ~cap:8
           ~head_water:(heads [ (rk, water 80) ])
-          ~identity
+          ~identity ~epoch:epoch0
       in
       let ( sink
           , fl
           , (_ : Guard_file.verdict)
           , (_ : Guard_file.identity_outcome)
+          , (_ : Guard_file.epoch_outcome)
           , h ) =
         opened "G7" r0
       in
@@ -724,9 +773,14 @@ let () =
         Guard_file.open_ ~dir ~cap:1
           ~head_water:
             (heads [ (r1, water 50); (r2, water 50); (r3, water 50) ])
-          ~identity
+          ~identity ~epoch:epoch0
       in
-      let (_ : Guard_sink.t), fla, va, (_ : Guard_file.identity_outcome), ha =
+      let ( (_ : Guard_sink.t)
+          , fla
+          , va
+          , (_ : Guard_file.identity_outcome)
+          , (_ : Guard_file.epoch_outcome)
+          , ha ) =
         opened "G8 covered arm" ra in
       check
         "G8 the verdict counts water drops only: three kept in the verdict, \
@@ -751,9 +805,14 @@ let () =
       let* rb =
         Guard_file.open_ ~dir ~cap:1
           ~head_water:(heads [ (r1, water 50); (r2, water 50); (r3, water 5) ])
-          ~identity
+          ~identity ~epoch:epoch0
       in
-      let (_ : Guard_sink.t), flb, vb, (_ : Guard_file.identity_outcome), hb =
+      let ( (_ : Guard_sink.t)
+          , flb
+          , vb
+          , (_ : Guard_file.identity_outcome)
+          , (_ : Guard_file.epoch_outcome)
+          , hb ) =
         opened "G8 companion arm" rb in
       check
         "G8 companion: the water drop is counted, the cap eviction still is \

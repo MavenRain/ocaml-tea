@@ -50,6 +50,15 @@ val tag_identity : char
     not-yet-written region reads back as, and giving it meaning would invite a
     torn file to parse as a valid frame. *)
 
+val tag_epoch : char
+(** ['\005'], the boot-epoch stamp's tag (roadmap step 21, R20b), owned here
+    for {!tag_identity}'s reason. The stamp is the frame DIRECTLY after the
+    identity header and never exists without one: an epoch frame at byte 0
+    would read as event bytes to every decoder, old and new, and the
+    downgrade story belongs to the identity frame - a pre-step-21 binary
+    meets tag [4] at byte 0, reads [Bad_tag], and keeps zero frames, exactly
+    as before; the extra frame behind it changes nothing it can see. *)
+
 type verdict = Tea_server.Durable_guard.Floors.verdict =
   { kept : int
   ; dropped_behind : int
@@ -121,6 +130,47 @@ type identity_outcome =
 (** What {!open_} made of the journal's identity header, reported beside the
     water {!verdict} rather than folded into it. *)
 
+type epoch_outcome =
+  | Epoch_matched
+      (** The journal's stamp equals this boot's pre-bump counter - the
+          ordinary same-lineage reopen - or there was nothing to check
+          because identity already cleared or held the journal, or the file
+          was empty. The no-news arm: printers stay quiet on it. The journal
+          is still REWRITTEN on a match (unlike identity's own [Matched]),
+          because the stamp must advance to this boot's post-bump value. *)
+  | Epoch_adopted
+      (** Identity trusted the bytes and no epoch stamp is present: a
+          pre-step-21 journal, adopted on trust and stamped before {!open_}
+          returns - [Adopted_unbound]'s one-boot window, one family over.
+          Absence is a version signal, never a numeric mismatch: treating it
+          as divergence would wipe every floor on every upgrade boot. *)
+  | Epoch_diverged of int
+      (** The journal's stamp differs from this boot's pre-bump counter - in
+          EITHER direction, deliberately one arm for both (R20b's rule: a
+          root rolled back under a newer journal and a journal restored
+          beside an advanced root are the same fact) - or the stamp is torn,
+          which is corruption evidence and must not masquerade as the
+          upgrade window. [int] is the floors the journal claimed, all of
+          them cleared; the replays land as visible duplicates, and the
+          journal is restamped with this boot's value. The R20b close: a
+          [cp -r] freezes [<root>/tea.epoch] at copy time, every later boot
+          on EITHER side moves exactly one of the two values, and equality
+          sees the split that a constant create-time token provably
+          cannot. *)
+  | Epoch_unresolved
+      (** The root's own counter could not be established
+          ({!Tea_core.Prim.Store_epoch.Unresolved}). A journal CARRYING a
+          stamp is held and its floors clear this boot
+          ([Unresolved_cleared]'s strict hold, one family over: not one byte
+          rewritten, so a boot that reads the counter again finds the
+          original stamp); a journal carrying NO stamp keeps identity's
+          verdict and stays unstamped - there is no counter to stamp it
+          with, so the upgrade window stays open one more boot. *)
+(** What {!open_} made of the journal's boot-epoch stamp, nested strictly
+    INSIDE identity's trust: consulted only where identity kept the bytes,
+    because a foreign journal's stamp answers a question about the wrong
+    store. Reported beside {!identity_outcome}, never folded into it. *)
+
 val head_water_of_list :
   (Tea_core.Crdt.Replica.t * Tea_core.Prim.Store_water.t) list ->
   Tea_core.Crdt.Replica.t ->
@@ -136,10 +186,12 @@ val open_ :
   cap:int ->
   head_water:(Tea_core.Crdt.Replica.t -> Tea_core.Prim.Store_water.t option) ->
   identity:Tea_core.Prim.Store_identity.binding ->
+  epoch:Tea_core.Prim.Store_epoch.binding * Tea_core.Prim.Store_epoch.binding ->
   ( Tea_server.Guard_sink.t
     * Tea_server.Durable_guard.Floors.t
     * verdict
     * identity_outcome
+    * epoch_outcome
     * t
   , open_err )
   result
@@ -165,6 +217,16 @@ val open_ :
     carries and checks its OWN header, no channel's stamp can satisfy another
     channel's check, which makes the two channels identical by construction
     rather than by a rule someone has to remember.
+
+    [~epoch] is REQUIRED for [~identity]'s exact reason, and it is the PAIR
+    [(seen, now)] from one {!Tea_persist_pack} [bump_epoch] call: [seen] (the
+    pre-bump counter, equal to the immediately preceding same-lineage boot's
+    [now]) is what a journal's stamp is COMPARED against, [now] (the
+    post-bump counter) is what every rewrite this boot performs STAMPS. Two
+    separate reads could disagree with each other - the counter mutates at
+    every boot - so the pair crosses this boundary together, and every
+    channel of one boot must receive the same pair. The stamp is checked by
+    EQUALITY, never order (see {!Epoch_diverged}).
 
     The identity header is the file's FIRST frame or it is absent; it is
     written ONLY as part of the compacting rewrite, which stages the whole

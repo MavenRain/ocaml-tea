@@ -86,6 +86,11 @@ let journal_cap = 16384
 let store_id : Store_identity.t = Store_identity.of_draws (fun () -> 0x7e)
 let identity : Store_identity.binding = Store_identity.Bound store_id
 
+let epoch0 :
+    Tea_core.Prim.Store_epoch.binding * Tea_core.Prim.Store_epoch.binding =
+  ( Tea_core.Prim.Store_epoch.Bound Tea_core.Prim.Store_epoch.bottom
+  , Tea_core.Prim.Store_epoch.Bound Tea_core.Prim.Store_epoch.bottom )
+
 type life =
   { driver : Dream.request -> Dream.response
   ; repo : Store.t
@@ -129,17 +134,20 @@ let boot ?(binding : Store_identity.binding = identity) () : life =
       * Durable_guard.Floors.t
       * Guard_file.verdict
       * Guard_file.identity_outcome
+      * Guard_file.epoch_outcome
       * Guard_file.t =
-    Lwt_main.run (Guard_file.open_ ~dir ~cap ~head_water ~identity:binding)
+    Lwt_main.run
+      (Guard_file.open_ ~dir ~cap ~head_water ~identity:binding ~epoch:epoch0)
     |> Result.fold
          ~ok:(fun
-             ((s, f, v, o, j) :
+             ((s, f, v, o, e, j) :
                Guard_sink.t
                * Durable_guard.Floors.t
                * Guard_file.verdict
                * Guard_file.identity_outcome
+               * Guard_file.epoch_outcome
                * Guard_file.t)
-           -> (s, f, v, o, j))
+           -> (s, f, v, o, e, j))
          ~error:(fun (e : Guard_file.open_err) ->
            die
              (match e with
@@ -152,10 +160,16 @@ let boot ?(binding : Store_identity.binding = identity) () : life =
       , (_ : Durable_guard.Floors.t)
       , (_ : Guard_file.verdict)
       , (_ : Guard_file.identity_outcome)
+      , (_ : Guard_file.epoch_outcome)
       , ws_journal ) =
     open_journal ~what:"websocket" ~dir:guard_dir ~cap:32768
   in
-  let file_sink, floors, verdict, (_ : Guard_file.identity_outcome), journal =
+  let ( file_sink
+      , floors
+      , verdict
+      , (_ : Guard_file.identity_outcome)
+      , (_ : Guard_file.epoch_outcome)
+      , journal ) =
     open_journal ~what:"rpc" ~dir:rpc_dir ~cap:journal_cap
   in
   (* Every record the guard appends, in write order. A recorder rather than a

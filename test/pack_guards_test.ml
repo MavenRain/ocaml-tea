@@ -86,6 +86,11 @@ let head_water (r : Replica.t) : Store_water.t option =
 let store_id : Store_identity.t = Store_identity.of_draws (fun () -> 0x1f)
 let identity : Store_identity.binding = Store_identity.Bound store_id
 
+let epoch0 :
+    Tea_core.Prim.Store_epoch.binding * Tea_core.Prim.Store_epoch.binding =
+  ( Tea_core.Prim.Store_epoch.Bound Tea_core.Prim.Store_epoch.bottom
+  , Tea_core.Prim.Store_epoch.Bound Tea_core.Prim.Store_epoch.bottom )
+
 let rpc_tab = tab_of "a1b2c3d4e5f60718293a4b5c6d7e8f90"
 let ws_tab = tab_of "0f9e8d7c6b5a4938271605f4e3d2c1b0"
 
@@ -109,7 +114,7 @@ let stamped (g : Durable_guard.t) (tab : Tab_id.t) :
 (* Nothing exists under [parent] yet: not the guard directory, not the rpc
    subdirectory. This is a first boot on a step-14 root, or a fresh install. *)
 let { Tea_server_pack.ws = ws1; ws_journal = ws_j1; rpc = rpc1; rpc_journal = rpc_j1 } =
-  Tea_server_pack.open_guards ~guard_dir ~head_water ~identity ()
+  Tea_server_pack.open_guards ~guard_dir ~head_water ~identity ~epoch:epoch0 ()
 
 let () =
   check "the websocket channel opens a journal on a bare root"
@@ -163,7 +168,7 @@ let () =
 
 (* The restart. Everything from here is read off the FILES. *)
 let { Tea_server_pack.ws = ws2; ws_journal = ws_j2; rpc = rpc2; rpc_journal = rpc_j2 } =
-  Tea_server_pack.open_guards ~guard_dir ~head_water ~identity ()
+  Tea_server_pack.open_guards ~guard_dir ~head_water ~identity ~epoch:epoch0 ()
 
 let stamped_is (g : Durable_guard.t) (tab : Tab_id.t) (seq : int)
     (water : Store_water.t) : bool =
@@ -211,10 +216,12 @@ let ws_journal_file = Filename.concat guard_dir "journal"
 let rpc_journal_file = Filename.concat rpc_dir "journal"
 
 (* The identity header is the journal's FIRST frame: [len:4][tag:1]
-   [payload:32][crc:4], 41 bytes. Built through the PUBLIC [Codec.frame] and
-   the public tag, so this fixture and the writer cannot drift apart without
-   one of them changing the shared seam. *)
-let header_len = 41
+   [payload:32][crc:4], 41 bytes, and step 21 adds the epoch stamp directly
+   behind it: [len:4][tag:1][payload:16][crc:4], 25 more, 66 total whenever
+   the epoch is Bound (this fixture's [epoch0] always is). Built through the
+   PUBLIC [Codec.frame] and the public tags, so this fixture and the writer
+   cannot drift apart without one of them changing the shared seam. *)
+let header_len = 66
 
 let header_of (id : Store_identity.t) : string =
   Guard_sink.Codec.frame ~tag:Guard_file.tag_identity
@@ -262,9 +269,12 @@ let () =
   check "both journals left the restart carrying the OWNING store's token"
     (token_is ws_journal_file store_id && token_is rpc_journal_file store_id)
 
-(* The rpc journal's bytes as they stand before the drift. A [Matched] open
-   rewrites nothing, so this is what has to come back byte for byte. *)
+(* The rpc journal's FLOORS as they stand before the drift (the header is
+   excluded on purpose: step 21's epoch stamp now rewrites on every [Matched]
+   open, even this fixture's degenerate bottom-to-bottom one, so only the
+   floor bytes behind the header still have to come back byte for byte). *)
 let rpc_raw_before = read_journal rpc_journal_file
+let rpc_floors_before = floors_after_header rpc_raw_before
 
 (* ONLY the websocket header moves. Its floor records are carried across byte
    for byte, so what the boot below refuses is the BINDING and not a damaged
@@ -285,7 +295,7 @@ let () =
 
 (* The SAME binding both earlier boots used. *)
 let { Tea_server_pack.ws = ws3; ws_journal = ws_j3; rpc = rpc3; rpc_journal = rpc_j3 } =
-  Tea_server_pack.open_guards ~guard_dir ~head_water ~identity ()
+  Tea_server_pack.open_guards ~guard_dir ~head_water ~identity ~epoch:epoch0 ()
 
 let () =
   (* The presence. The rpc header still names this store, so that channel is
@@ -314,8 +324,10 @@ let () =
     (token_is ws_journal_file store_id);
   check "and nothing but that header survived the rebind"
     (String.length (read_journal ws_journal_file) = header_len);
-  check "while the matched rpc journal was not rewritten by one byte"
-    (String.equal (read_journal rpc_journal_file) rpc_raw_before)
+  check "while the matched rpc journal's floors were not rewritten by one byte"
+    (Option.equal String.equal
+       (floors_after_header (read_journal rpc_journal_file))
+       rpc_floors_before)
 
 let rec rm_rf (path : string) : unit =
   if Sys.is_directory path then (

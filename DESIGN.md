@@ -1893,13 +1893,63 @@ Each lean-tea private-constructor primitive → an OCaml `.mli` boundary:
   with `tea.identity` from another, gets a matching read - the token is
   exactly as reliable as the root being restored as a UNIT, and it is
   deliberately not MAC'd against `<root>.secret`, which is itself a
-  restorable sibling whose rotation would then clear every floor. The
-  successor is a boot EPOCH: a counter bumped in the root at each open
-  and echoed into each journal, which MOVES on divergence and would see
-  the copy. Not shipped in step 18 - it is a larger change and its own
-  failure mode (a journal whose stamp lagged a boot false-positives into
-  a floor wipe) is accept-side but noisy, so it is named here rather than
-  half-built.
+  restorable sibling whose rotation would then clear every floor.
+  **CLOSED in step 21, narrowed to the boot-count coincidence.** The
+  successor the register named is shipped: `<root>/tea.epoch`, a monotone
+  counter read and durably bumped exactly once per boot
+  (`Store_pack.bump_epoch` returns the pre-bump and post-bump pair;
+  `serve_pack` shares one pair with both channels, the identity's
+  one-read rule made mandatory by mutation) and echoed into each journal
+  as a second header frame (tag 5) directly behind the identity frame,
+  nested strictly inside identity's trust: a foreign journal's stamp
+  answers a question about the wrong store, so epoch is consulted only
+  where identity kept the bytes. `Guard_file.open_` checks a journal's
+  stamp against the PRE-bump value by EQUALITY, never order - a journal
+  ahead of the root (the root is the restored copy) and a journal behind
+  it are the same fact, and a lag-only check would silently keep floors
+  in the first case - and any mismatch, either direction or a torn
+  stamp, clears that journal's floors through the identity mismatch's
+  own all-zero verdict and restamps with the post-bump value: one noisy
+  wipe, then quiet (boot_epoch_test E1/E2/E1b). The register's
+  pre-approved cost stands exactly as named: a stamp that merely lagged
+  a boot (a journal absent for one boot, a crash between the root bump
+  and the restamp) is a false positive that clears accept-side and never
+  refuses (E6). A pre-step-21 journal is adopted on trust and stamped
+  within one boot (E4, the step-18 window one family over); a
+  pre-step-21 binary meets tag 4 at byte 0 exactly as before, and the
+  extra frame behind it changes nothing it can see. An unreadable or
+  malformed `tea.epoch` HOLDS - `(Unresolved, Unresolved)`, bytes
+  exactly as found, stamped journals held and cleared for that boot's
+  view only, unstamped journals kept and unstamped (E5a) - because a
+  re-mint over a transient read failure would manufacture a permanent
+  false divergence against journals that never diverged. A torn journal
+  stamp is corruption evidence, never version skew: it clears
+  conservatively (E5b), and when the damaged frame still framed cleanly
+  the divergence report counts the floors behind it. What remains, named
+  rather than glossed: (1) the COINCIDENCE residue - a diverged copy
+  whose independent boot count since the fork happens to EQUAL the
+  original's carries an equal counter, so a swap at exactly that
+  alignment is invisible to equality; the zero-advance boundary is its
+  degenerate case, the never-booted half of the window stays bounded by
+  per-floor store waters, and a counter cannot close it - only per-boot
+  entropy could, a different successor than the one this register
+  reserved; (2) the operator hand-mix and no-MAC residues above,
+  unchanged - `tea.epoch` is exactly as reliable as the root restored as
+  a UNIT; (3) the bump-after-`open_root` ordering is pinned by comment
+  and review, not by a check: no test drives `serve_pack` itself (the
+  M11 documented-weak mutant, step 20's own wiring gap one step over);
+  (4) the ceiling: `succ` saturates at the top of its half-domain, so a
+  store that somehow reached it would stop moving and every same-lineage
+  boot would match forever - divergence detection off AT the ceiling -
+  priced by magnitude (one boot per microsecond for two hundred
+  millennia) and fenced by `of_string` refusing the wrap half of the
+  16-hex space outright; (5) a SUSTAINED `tea.epoch` write failure
+  degrades to one audible floor clear per boot: the stamp advances in
+  memory, the file cannot follow, and the next boot reads the stale
+  value and diverges - accept-side and announced each boot
+  (`Epoch_write_failed`), never a silent keep, because journals are
+  stamped with the post-bump value but compared against the value read
+  off disk.
 - **R21 (low) - delivery dedup is not intent dedup.** Repeated user intents
   (a double-click) are distinct calls, distinct seqs, and apply twice,
   visibly. App-level intent coalescing is out of scope because it would
@@ -2516,7 +2566,26 @@ Each lean-tea private-constructor primitive → an OCaml `.mli` boundary:
     a constant create-time token cannot. The register's caution
     governs the design: a journal whose stamp lagged a boot must
     degrade accept-side (a noisy floor clear), never refuse.
-    **Planned.**
+    **Done** (step 21: `<root>/tea.epoch` + `Store_pack.bump_epoch`,
+    once per boot, the `(seen, now)` pair shared to both channels;
+    tag-5 journal stamp directly behind the identity frame;
+    `Guard_file.open_` equality check with `Epoch_matched` /
+    `Epoch_adopted` / `Epoch_diverged` / `Epoch_unresolved` outcomes
+    nested inside identity's trust; `test/boot_epoch_test.ml`, 54
+    checks: the divergent copy in BOTH directions with the strict
+    compare asserted either side (E1/E2), one wipe then quiet (E1b),
+    a 3-cycle same-lineage false-positive guard (E3), the step-20
+    upgrade window plus its required second-boot follow-up (E4),
+    torn/garbage epoch state on the root file and on the journal
+    frame in both damage shapes (E5a/E5b), the crash between bump and
+    restamp pinned as a noisy accept-side wipe (E6), one shared
+    per-boot pair earning per-channel verdicts (E7), the dead-boot
+    staging-file sweep by exact prefix (E8), and the hex-domain gate
+    that keeps `succ` below its wrap point (E9); 11 mutants
+    killed on predicted checks, M11 (`serve_pack` bump ordering)
+    documented weak - no test drives `serve_pack` itself, step 20's
+    own wiring gap one step over; suite floor 1280 native checks
+    across 53 executables.)
 22. **Reaper wiring** - wire the bounded session reaper
     (`Store_core.reap`, D3) into the serve entry points, so a
     long-running deployment stops accumulating abandoned session

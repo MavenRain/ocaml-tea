@@ -333,3 +333,42 @@ module Store_identity = struct
     | Bound of t
     | Unresolved
 end
+
+module Store_epoch = struct
+  type t = int64
+
+  (* The [Clock] shape, one layer up: a monotone counter that SATURATES at
+     the top rather than wrap, because a wrap would re-mint an old stamp and
+     an old stamp is exactly what this counter exists to expose. *)
+  let bottom = 0L
+  let succ t = if Int64.equal t Int64.max_int then t else Int64.add t 1L
+  let compare = Int64.compare
+  let equal = Int64.equal
+  let hex_length = 16
+
+  (* Fixed-width lowercase hex, the [Store_identity] encoding one value
+     down: no padding ambiguity, no second spelling of one stamp. The domain
+     is [bottom, max_int] on BOTH sides: [to_string] only ever prints values
+     the mint can reach, and [of_string] refuses the top half of the 16-hex
+     space, because [succ] saturates only at [max_int] itself - a value
+     above it would WRAP back through zero, and a wrap re-mints old stamps,
+     which is exactly what this counter exists to expose. The mint never
+     emits one, so refusing costs nothing ([Store_identity.of_string]'s
+     uppercase rule, one failure class over). Reads forward: length, then
+     charset, then parse, then the domain gate. *)
+  let to_string t = Printf.sprintf "%016Lx" t
+
+  let of_string s =
+    if
+      Int.equal (String.length s) hex_length
+      && Option.is_none (first_where (fun c -> not (Store_identity.is_hex c)) s)
+    then
+      Int64.of_string_opt ("0x" ^ s)
+      |> Option.fold ~none:(Error `Malformed) ~some:(fun (t : int64) ->
+             if Int64.compare t 0L >= 0 then Ok t else Error `Malformed)
+    else Error `Malformed
+
+  type binding =
+    | Bound of t
+    | Unresolved
+end

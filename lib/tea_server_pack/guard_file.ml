@@ -1,6 +1,7 @@
 module Guard_sink = Tea_server.Guard_sink
 module Durable_guard = Tea_server.Durable_guard
 module Store_identity = Tea_core.Prim.Store_identity
+module Store_epoch = Tea_core.Prim.Store_epoch
 
 module Key = struct
   type t = Tea_core.Crdt.Replica.t * Tea_core.Prim.Tab_id.t
@@ -35,6 +36,10 @@ type t =
   ; mutable touch : int Key_map.t (* last-append tick per live key *)
   ; mutable tick : int
   ; mutable header : Store_identity.t option (* stamped as frame 0 *)
+  ; mutable epoch : Store_epoch.t option
+      (* stamped as the frame AFTER the header, and only under one; fixed
+         once at [open_] to this boot's post-bump value, so every rewrite
+         this boot performs stamps the same generation *)
   ; held : bool (* the strict hold: no write path may touch the file *)
   ; mutable closed : bool
   }
@@ -45,12 +50,24 @@ type t =
    [Key_map] or cap eviction. *)
 let tag_identity = '\004'
 
+(* The boot-epoch stamp (roadmap step 21, R20b): tag 5, the frame directly
+   after the identity header, present only under one. [tag_identity]'s rule
+   holds here too: framed by {!Guard_sink.Codec} but decoded HERE, so it is
+   never a [Guard_sink.event] and cannot reach the floors fold. *)
+let tag_epoch = '\005'
+
 type identity_outcome =
   | Matched
   | Freshly_bound
   | Adopted_unbound of int
   | Rebound of int
   | Unresolved_cleared of int
+
+type epoch_outcome =
+  | Epoch_matched
+  | Epoch_adopted
+  | Epoch_diverged of int
+  | Epoch_unresolved
 
 type header_status =
   | No_header of { empty : bool }
@@ -88,6 +105,44 @@ let decode_header (s : string) : header_status =
                ~error:(fun (_ : Store_identity.err) ->
                  Foreign_header { consumed = next })
         else No_header { empty = false })
+
+type epoch_status =
+  | Epoch_frame of
+      { at : Store_epoch.t
+      ; consumed : int (* offset of the first frame after the stamp *)
+      }
+  | No_epoch_frame
+      (* No stamp: the bytes at the offset unframe under some OTHER tag (a
+         genuine event, the pre-step-21 shape), or there are no bytes at all.
+         The peel resumes exactly where it stood, zero bytes lost. *)
+  | Torn_epoch_frame of
+      { resume : int
+        (* where the event fold may honestly resume: after the frame when it
+           unframed cleanly and only its payload is no counter, so the floors
+           behind it still COUNT in the divergence report; at the damage
+           itself when the bytes would not unframe, where the fold stops by
+           construction and the count is genuinely unknowable *)
+      }
+      (* Corruption evidence, never version skew: a frame that unframes as
+         [tag_epoch] but carries no counter, or bytes that will not unframe at
+         the offset a clean header promised a next frame at. Kept apart from
+         [No_epoch_frame] because collapsing damage into the trusting
+         adoption arm would let a torn file masquerade as the upgrade
+         window. *)
+
+let peel_epoch (s : string) ~(pos : int) : epoch_status =
+  if pos >= String.length s then No_epoch_frame
+  else
+    Result.fold
+      (Guard_sink.Codec.unframe s ~pos)
+      ~error:(fun (_ : Guard_sink.Codec.decode_err) -> Torn_epoch_frame { resume = pos })
+      ~ok:(fun ((tag, payload, next) : char * string * int) ->
+        if Char.equal tag tag_epoch then
+          Store_epoch.of_string payload
+          |> Result.fold
+               ~ok:(fun (at : Store_epoch.t) -> Epoch_frame { at; consumed = next })
+               ~error:(fun `Malformed -> Torn_epoch_frame { resume = next })
+        else No_epoch_frame)
 
 (* Decode the valid prefix: every [decode_err] — torn, corrupt, unknown —
    stops the fold and discards the remainder. Frames before the break
@@ -173,8 +228,17 @@ let compact_now (t : t) : unit Lwt.t =
      pre-step-18 file byte for byte. *)
   let header =
     Option.fold t.header ~none:"" ~some:(fun (id : Store_identity.t) ->
+        (* The epoch stamp rides the identity frame and never exists without
+           one: an epoch frame at byte 0 would read as event bytes to every
+           decoder, old and new, and the downgrade story (tag 4 at byte 0 =
+           [Bad_tag], zero frames kept) belongs to the identity frame. An
+           unresolved counter omits the stamp; the next readable boot adds it
+           through the upgrade window. *)
         Guard_sink.Codec.frame ~tag:tag_identity
-          ~payload:(Store_identity.to_string id))
+          ~payload:(Store_identity.to_string id)
+        ^ Option.fold t.epoch ~none:"" ~some:(fun (e : Store_epoch.t) ->
+              Guard_sink.Codec.frame ~tag:tag_epoch
+                ~payload:(Store_epoch.to_string e)))
   in
   let tmp = t.path ^ ".tmp" in
   let* () =
@@ -287,8 +351,14 @@ let head_water_of_list
 let open_ ~(dir : string) ~(cap : int)
     ~(head_water :
        Tea_core.Crdt.Replica.t -> Tea_core.Prim.Store_water.t option)
-    ~(identity : Store_identity.binding) :
-    ( Guard_sink.t * Durable_guard.Floors.t * verdict * identity_outcome * t
+    ~(identity : Store_identity.binding)
+    ~(epoch : Store_epoch.binding * Store_epoch.binding) :
+    ( Guard_sink.t
+      * Durable_guard.Floors.t
+      * verdict
+      * identity_outcome
+      * epoch_outcome
+      * t
     , open_err )
     result
     Lwt.t =
@@ -307,13 +377,28 @@ let open_ ~(dir : string) ~(cap : int)
              as a record, so the [4 * cap] trigger measures what it always
              did. *)
           let hdr = decode_header contents in
-          let rest =
+          (* The epoch stamp is peeled at the offset the identity frame
+             reports - also under a FOREIGN header, so a stranger's stamp
+             never leaks into its own event count. The peel's verdict travels
+             separately from where the events begin: a torn stamp resumes
+             where [peel_epoch] says it may honestly resume - after a
+             cleanly-framed non-counter, so the floors behind it still count
+             in the divergence report; at the damage itself when the bytes
+             would not unframe, where the prefix fold stops by construction -
+             so no computed range ever skips bytes the peel did not decode. *)
+          let epoch_hdr, events_at =
             match hdr with
-            | No_header { empty = (_ : bool) } -> contents
+            | No_header { empty = (_ : bool) } -> (No_epoch_frame, 0)
             | Header { at = (_ : Store_identity.t); consumed }
             | Foreign_header { consumed } ->
-              String.to_seq contents |> Seq.drop consumed |> String.of_seq
+              (match peel_epoch contents ~pos:consumed with
+               | Epoch_frame { at; consumed = after } ->
+                 (Epoch_frame { at; consumed = after }, after)
+               | No_epoch_frame -> (No_epoch_frame, consumed)
+               | Torn_epoch_frame { resume } ->
+                 (Torn_epoch_frame { resume }, resume))
           in
+          let rest = String.to_seq contents |> Seq.drop events_at |> String.of_seq in
           let events, count = decode_prefix rest in
           (* Today's path, unchanged: the boot filter (R20) runs on the FULL
              fold, before any cap housekeeping, so the verdict reports what
@@ -395,6 +480,74 @@ let open_ ~(dir : string) ~(cap : int)
             | Foreign_header { consumed = (_ : int) }, Store_identity.Unresolved ->
               (Unresolved_cleared (stranger_count ()), cleared, None)
           in
+          (* The epoch layer (step 21, R20b), nested strictly INSIDE
+             identity's trust: consulted only where identity chose to keep
+             the bytes, because a foreign or unconfirmable journal is already
+             cleared or held by identity alone, and a stranger's stamp
+             answers a question about the WRONG store. The compare is
+             EQUALITY against [seen], never order: a journal AHEAD of the
+             root (the root is the restored copy) and a journal BEHIND it
+             (the journal is) are the same verdict, and a lag-only check
+             would silently keep floors in the first case - the loss
+             direction, the design killer. *)
+          let epoch_seen, epoch_now = epoch in
+          let epoch_outcome, (floors, touch, tick, verdict), epoch_held =
+            match outcome with
+            | Rebound (_ : int) | Unresolved_cleared (_ : int) ->
+              (* Not consulted: identity already cleared or held these
+                 floors. The report follows the ROOT's counter alone -
+                 [Epoch_matched] is the no-news arm the printers keep quiet,
+                 and an unresolved counter stays visible as such. *)
+              ( (match epoch_now with
+                 | Store_epoch.Bound (_ : Store_epoch.t) -> Epoch_matched
+                 | Store_epoch.Unresolved -> Epoch_unresolved)
+              , (floors, touch, tick, verdict)
+              , false )
+            | Matched | Freshly_bound | Adopted_unbound (_ : int) ->
+              (match (epoch_seen, epoch_hdr) with
+               | ( Store_epoch.Unresolved
+                 , ( Epoch_frame
+                       { at = (_ : Store_epoch.t); consumed = (_ : int) }
+                   | Torn_epoch_frame { resume = (_ : int) } ) ) ->
+                 (* [Unresolved_cleared]'s treatment one family over: the
+                    journal carries a stamp this boot cannot check, so its
+                    floors clear for this boot's view and the STRICT HOLD
+                    keeps every byte as found for a boot that can read the
+                    counter again. *)
+                 (Epoch_unresolved, cleared, true)
+               | Store_epoch.Unresolved, No_epoch_frame ->
+                 (* No stamp to check and no counter to stamp with: floors
+                    keep identity's verdict and the journal stays unstamped
+                    ([Adopted_unbound]-under-[Unresolved]'s rule) - the
+                    upgrade window simply stays open one more boot. *)
+                 (Epoch_unresolved, (floors, touch, tick, verdict), false)
+               | Store_epoch.Bound seen, Epoch_frame { at; consumed = (_ : int) } ->
+                 if Store_epoch.equal at seen then
+                   (Epoch_matched, (floors, touch, tick, verdict), false)
+                 else (Epoch_diverged (stranger_count ()), cleared, false)
+               | Store_epoch.Bound (_ : Store_epoch.t), Torn_epoch_frame { resume = (_ : int) }
+                 ->
+                 (Epoch_diverged (stranger_count ()), cleared, false)
+               | Store_epoch.Bound (_ : Store_epoch.t), No_epoch_frame ->
+                 (match hdr with
+                  | No_header { empty = true } ->
+                    (* A zero-byte file carries no claim to check, so there
+                       is no adoption to report: [Freshly_bound]'s silence,
+                       extended to its epoch half. *)
+                    (Epoch_matched, (floors, touch, tick, verdict), false)
+                  | No_header { empty = false }
+                  | Header { at = (_ : Store_identity.t); consumed = (_ : int) }
+                  | Foreign_header { consumed = (_ : int) } ->
+                    (Epoch_adopted, (floors, touch, tick, verdict), false)))
+          in
+          (* Only a Bound counter may be stamped ([Store_epoch.binding]'s
+             rule), and the value is fixed HERE, once, so every rewrite this
+             boot performs stamps one generation. *)
+          let epoch_stamp =
+            match epoch_now with
+            | Store_epoch.Bound (now : Store_epoch.t) -> Some now
+            | Store_epoch.Unresolved -> None
+          in
           (* [held] is what makes an unresolvable identity a strict no-op on
              disk, and it is a FIELD rather than a local because the hold has
              to outlive [open_]: [compact] and [append] both consult it, so no
@@ -406,7 +559,9 @@ let open_ ~(dir : string) ~(cap : int)
             | Unresolved_cleared (_ : int) -> true
             | Matched | Freshly_bound | Adopted_unbound (_ : int)
             | Rebound (_ : int) ->
-              false
+              (* The epoch's own hold arrives through the same field, so
+                 [compact] and [append] need no second predicate. *)
+              epoch_held
           in
           let* fd = Lwt_unix.openfile path append_flags 0o644 in
           let t =
@@ -419,6 +574,7 @@ let open_ ~(dir : string) ~(cap : int)
             ; touch
             ; tick
             ; header
+            ; epoch = epoch_stamp
             ; held
             ; closed = false
             }
@@ -445,7 +601,20 @@ let open_ ~(dir : string) ~(cap : int)
              relies on. *)
           let restamp =
             match outcome with
-            | Matched | Unresolved_cleared (_ : int) -> false
+            | Unresolved_cleared (_ : int) -> false
+            | Matched ->
+              (* The identity stamp alone never moves on a match, but the
+                 epoch stamp moves EVERY boot, so a resolved counter now
+                 forces the rewrite this arm could always skip; an unresolved
+                 one writes nothing, which keeps the hold and the
+                 upgrade-window arms honest. A held journal is safe either
+                 way: [compact] answers it with [unit]. Named cost: the
+                 rewrite window [compact_now] already carries (no fsync, so
+                 a crash mid-compaction loses recent floors as duplicates)
+                 now opens at EVERY boot rather than only on a drop or an
+                 overflow - the accept direction, priced against a stamp
+                 that must move. *)
+              Option.is_some t.header && Option.is_some t.epoch
             | Freshly_bound | Adopted_unbound (_ : int) | Rebound (_ : int) ->
               Option.is_some t.header
           in
@@ -454,7 +623,13 @@ let open_ ~(dir : string) ~(cap : int)
             else Lwt.return_unit
           in
           Lwt.return
-            (Ok ({ Guard_sink.append = append t }, t.floors, verdict, outcome, t)))
+            (Ok
+               ( { Guard_sink.append = append t }
+               , t.floors
+               , verdict
+               , outcome
+               , epoch_outcome
+               , t )))
         (fun (exc : exn) -> Lwt.return (Error (Io (Printexc.to_string exc)))))
 
 let close (t : t) : unit Lwt.t =
