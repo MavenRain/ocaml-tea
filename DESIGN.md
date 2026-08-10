@@ -56,6 +56,8 @@ toolchain removes an entire tier lean-tea had to hand-write.
 | `test/store_identity_test`, `test/guard_identity_test` (I1-I13: both channels, the bottom-water stranger, the legacy adopt, the compaction round-trip, the Unresolved hold, its recovery and its held-file byte identity, the foreign header, the corrupt head) + `test/identity_explain_test` boot-log truthfulness + `pack_guards_test` header independence + `archive_gc_test` post-GC survival + `rpc_pack_once_test`'s end-to-end mismatch control | **passes** (confirmed by mutation: 12 s18 ids 12/12 killed + 5 review-fix ids) |
 | `Durable_guard ?fence` (called between the mirror advance and the sink append, inside the existing catch so a rejecting fence degrades to `Error (Io _)` with no floor appended) + `Store_pack.flush` (`Pack.flush`, rejecting on failure so `persist`'s catch is what degrades it) + `open_guards ?fence` behind a new trailing unit (the journal-open-failed null-sink arm composes fenceless) + `serve_pack` wiring `Store.flush repo` non-overridably - the D16 floor/commit ordering pinned as this repo's own invariant, after step 20's differential probe refuted R11's premise: irmin-pack 3.11 already ends every commit batch in `File_manager.flush`, so the fence meets a clean buffer, and an upstream that stops flushing cannot silently reopen R11 | **built, green** (roadmap step 20, R11) |
 | `test/commit_fence_test` (the fence;append;fence;append spy order, a rejecting fence appending nothing, `forget` never ticking the fence), `test/store_pack_flush_test` (commit bytes already on disk at commit-resolve, flush a byte-identical no-op, flush on a closed repo rejecting), `test/hot_copy_water_test` (a hot copy of a live unclosed root carries the commit and keeps its floor), `test/unwitnessed_rollback_pin_test` (the unwitnessed remainder pinned as R15 leaves it), `test/kill_durability_test` (real fork + SIGKILL reps; the unfenced arm is the upstream-drift alarm) | **passes** (confirmed by mutation: the fence-deleted and fence-reordered mutants killed on the ordering spy, the flush-emptied and swallow-re-introduced mutants on the closed-repo rejection pin; the serve_pack-wiring no-op mutant documented weak - behaviourally indistinguishable exactly because the upstream batch-end flush holds - and the null-sink mutant void, that arm composing fenceless by design) |
+| `lib/tea_server/reaper.{ml,mli}` (`Cadence` newtype + `spec` + the injected-timer `loop`: choose-not-pick, `is_sleeping` stop gates on both sides, zero sweeps before the first tick, a sweep in flight completes before the promise resolves) + `Store_core.reap` removal hardened to `Head.test_and_set ~test:(Some c) ~set:None` (a raced victim is kept, whole and uncounted; `?forget` still first) + `Tea_server_pack.forget_into` (ws-channel tombstone; a sink `Error` is one stderr line and the sweep continues) + `serve_pack ?reaper` (`Lwt.join` with `Dream.serve` inside the first `Lwt_main.run`, shared signal-woken stop) + `Make.serve ?reaper` (entry-point guard mint shared with the pipeline, never-stop `Lwt.async` loop) | **built, green** (roadmap step 22, D24) |
+| `test/reaper_loop_test` (L1-L6: queue-backed timer, stop-wins-ties, sweep-completes-before-resolve, `Lwt.state` anti-hang assertions), `test/reaper_wiring_test` (W1/W2/W4: a real journal-backed guard on a real pack root, the Forget tombstone honored across a reopen against the pre-sweep head snapshot, the replay reading Fresh, sweep continuation past a closed sink, reserved refs never reaching the hook), `reaper_test` += T-RACE (the racing commit preserved and uncounted) + T-BOUND (the strict cutoff) | **passes** (confirmed by mutation: M1-M12, 11/11 runnable killed on their predicted checks; M11 `serve_pack` join documented weak - no native harness binds a port) |
 
 Toolchain: OCaml 5.3.0, dune 3.24, a dedicated opam switch (`irmin-tea` locally) with
 `irmin 3.11`, `dream 1.0.0~alpha8`, `repr 0.8`, `vdom 0.3`, `js_of_ocaml 6.4`.
@@ -1282,6 +1284,67 @@ nothing is lost.
 > honest origin is `Unreadable` - fixed by forwarding the readback's own
 > origin, the arm a two-process race window, declared untested. Suite
 > after the round: 1178 native checks across 47 executables.
+
+> **D24 - the reaper wired: an opt-in sweep behind both entry points
+> (roadmap step 22).** The knob is `?reaper : Tea_server.Reaper.spec`
+> (`{ ttl; every }`, `Cadence` a positive-seconds newtype) on
+> `Make.serve` and `serve_pack`, default `None` - no sweep, byte for
+> byte the old serve path - because reaping deletes session branches
+> and no ttl is right for every deployment; the mli carries the
+> deployment guidance instead (pick ttl well above the longest idle a
+> CONNECTED client may sit: there is no live-socket exclusion registry,
+> ttl IS the idle bound, and a swept-then-active session degrades
+> visible-duplicate through the documented rebirth path, never
+> silently). `Reaper.loop` is the timing shell, sealed in
+> `lib/tea_server/reaper.{ml,mli}`: sweep, clock and timer are injected
+> seams, and each round is `Lwt.choose [tick; stop]` - choose and never
+> pick, the `live_session` pump ruling, because a cancelled sweep could
+> stop between a guard tombstone and its branch removal - with an
+> `is_sleeping stop` gate on each side, so zero sweeps run before the
+> first tick, stop wins ties, and a sweep in flight always completes
+> before the loop's promise resolves. The pack tier joins that promise
+> with `Dream.serve` inside the FIRST `Lwt_main.run`, sharing the
+> signal-woken stop, so a sweep mid-flight at SIGTERM finishes before
+> the teardown run closes the repo and the journals. The forget hook is
+> `forget_into` (module-level, app-generic, the `Rebase.absorb`
+> testability precedent): `Durable_guard.forget` keyed by the victim's
+> replica, ws channel ONLY - rpc floors key on reserved `main`, which
+> is never swept - and a sink `Error` degrades to one stderr line and
+> the sweep continues, because the memory is already scrubbed
+> (duplicate side) and the journal's stale floor is the D18 boot
+> filter's `dropped_no_branch` at the next boot. The wiring is also
+> what made `reap`'s own remove race REACHABLE, so the hardening ships
+> in the same step: removal is now `Head.test_and_set ~test:(Some c)
+> ~set:None` against the very head whose date was judged - atomic
+> removal under the branch-store lock - so a commit landing between the
+> date read and the removal keeps its branch, whole and uncounted;
+> `?forget` still fires first, the D16 ordering. The crash windows,
+> enumerated: (a) crash between the forget's sink append and the
+> removal - a tombstoned floor over a live branch, the replay reads
+> Fresh, visible duplicate; (b) crash after the removal - nothing
+> pending; (c) forget `Error`, then removal, then crash - a journal
+> floor over a dead branch, dropped by the D18 boot filter at the next
+> boot, duplicate; (d) a commit racing the sweep - the TAS fails, the
+> branch is kept, the already-fired forget is a spurious duplicate-side
+> tombstone; (e) stop during a sweep - the join completes the sweep
+> before the teardown closes anything. The mem tier reaps too: its
+> in-RAM floors are exactly as loss-prone after a reap as durable ones,
+> so `Make.serve ?reaper` mints the guard AT the entry point (the
+> router's own null-sink construction, the `?guard` argument that
+> existed "for tests" finding its load-bearing use) so pipeline and
+> sweep judge replays against ONE guard, and runs the loop as a
+> never-stop `Lwt.async` - that tier has no teardown to fence
+> (`Dream.run` never returns), and the loop dies with the process.
+> Clock stamps can run ahead of wall seconds after a same-second burst,
+> which under-ages a branch (kept longer) - the safe direction,
+> documented, no code. The sweep, from the measurement: M1-M12, 11 of
+> 11 runnable mutants killed on their predicted checks (M6's
+> plain-remove erased the racing commit, caught by T-RACE; M9's widened
+> cutoff by T-BOUND's strict-boundary pin; M12's propagated Error by
+> W2's sweep-continues check), M11 - the `serve_pack` join element
+> dropped - documented weak, no native harness binds a port, the
+> step-20/21 precedent. Suite after the step: 1317 native checks across
+> 55 executables.
 
 ## 8. Shared RPC contract - built (roadmap step 7; hardened step 8, D11/D12)
 
@@ -2589,10 +2652,16 @@ Each lean-tea private-constructor primitive → an OCaml `.mli` boundary:
 22. **Reaper wiring** - wire the bounded session reaper
     (`Store_core.reap`, D3) into the serve entry points, so a
     long-running deployment stops accumulating abandoned session
-    branches. The mechanism and its tests exist (`reaper_test`); no
-    serve path calls it. The step-11 caution governs the wiring: a
-    reap past a live durable guard goes through `Durable_guard.forget`
-    or it is itself a loss path. **Planned.**
+    branches. The step-11 caution governs the wiring: a reap past a
+    live durable guard goes through `Durable_guard.forget` or it is
+    itself a loss path. **Done.** (Opt-in `?reaper :
+    Tea_server.Reaper.spec` on both entry points, default `None`;
+    `Reaper.loop` the injected-timer shell, `forget_into` the
+    ws-channel tombstone hook, and `reap`'s removal hardened to a
+    head-TAS so a racing commit keeps its branch - D24. Mutation
+    sweep M1-M12: 11 of 11 runnable killed on predicted checks, M11
+    (`serve_pack` join) documented weak, the step-20/21 precedent;
+    suite 1317 native checks across 55 executables.)
 23. **Compiler-enforced boundary** - close R7's residual (§10): the
     direct-sink discipline (never call raw Dream/Irmin/Unix past a
     `tea_safe` boundary; keep `Rpc.route`'s two arms distinct - R8)

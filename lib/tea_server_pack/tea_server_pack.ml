@@ -17,6 +17,7 @@ module Durable_guard = Tea_server.Durable_guard
 module Replay_guard = Tea_server.Replay_guard
 module Session_secret = Tea_server.Session_secret
 module Rpc_once = Tea_server.Rpc_once
+module Reaper = Tea_server.Reaper
 
 type guards =
   { ws : Durable_guard.t
@@ -208,6 +209,40 @@ let open_guards ~(guard_dir : string)
   in
   { ws; ws_journal; rpc; rpc_journal }
 
+(** Tombstone one reaped session's delivery floor through the websocket
+    channel's guard: {!Durable_guard.forget} keyed by the replica the session
+    applied under. The ws channel ONLY: RPC floors are keyed on the reserved
+    [main] replica (see [serve_pack]'s [?rpc_once] wiring), which is never
+    swept, so a victim could never match one and the tombstone would only grow
+    that journal. An [Error] from the sink is ONE stderr line and a normal
+    return, and the sweep continues: the in-memory floor is already scrubbed
+    (the duplicate side, {!Durable_guard.forget}'s contract), the journal's
+    stale floor is dropped by the boot filter at the next boot
+    ([dropped_no_branch]), and aborting would only leave other stale branches
+    standing until the next tick. Module-level and app-generic, shared
+    verbatim with [reaper_wiring_test] (the [Rebase.absorb] precedent): the
+    closure the test drives cannot drift from the one [serve_pack] runs. The
+    mem tier ({!Tea_server.Make.serve}) writes the same three lines locally,
+    because its library is this one's dependency, not the reverse. *)
+let forget_into (guard : Durable_guard.t) (sid : Tea_core.Prim.Session_id.t) :
+    unit Lwt.t =
+  let open Lwt.Syntax in
+  let* forgotten =
+    Durable_guard.forget guard ~replica:(Tea_core.Crdt.Replica.v sid)
+  in
+  Result.fold forgotten ~ok:Lwt.return
+    ~error:(fun (e : Guard_sink.err) ->
+      let reason =
+        match e with
+        | Guard_sink.Sink_closed -> "sink closed"
+        | Guard_sink.Io io -> io
+      in
+      Printf.eprintf
+        "tea_server_pack: reaper: forget failed for session %s (%s); its stale journal floor is dropped at the next boot\n%!"
+        (Tea_core.Prim.Session_id.to_string sid)
+        reason;
+      Lwt.return_unit)
+
 module Make_pack (A : Tea_core.App.APP) = struct
   module Store = Tea_persist_pack.Store_pack.Make (A)
   include Tea_server.Handlers (A) (Store)
@@ -296,7 +331,7 @@ module Make_pack (A : Tea_core.App.APP) = struct
       record. The wake is guarded by [is_sleeping], so a second signal (or both
       signals) resolves the promise once. *)
   let serve_pack ?(interface = "localhost") ?(port = 8080) ?client_dir ?rpc ?rpc_once
-      ?coalesce ?retention ?lower_root ?sessions ~(root : Root.t) () : unit =
+      ?coalesce ?retention ?lower_root ?sessions ?reaper ~(root : Root.t) () : unit =
     (* The three durability siblings are three separate paths with no
        cross-binding, so a restore or a manual wipe can keep some and drop
        others (DESIGN R20). One direction is silent LOSS rather than the
@@ -454,10 +489,45 @@ module Make_pack (A : Tea_core.App.APP) = struct
         in
         ())
       [ Sys.sigint; Sys.sigterm ];
+    let serve () : unit Lwt.t =
+      Dream.serve ~interface ~port ~stop
+        (Dream.logger
+           (handler_pack ?client_dir ?rpc ?coalesce ?retention ~guard ~sessions repo))
+    in
+    (* The reaper loop rides INSIDE this first [Lwt_main.run], joined with the
+       serve promise and sharing its [stop]: the join resolves only once BOTH
+       are done, so a sweep in flight at shutdown completes before the
+       teardown run below closes the repo and the journals - a removal can
+       never race the close. [Lwt.join], not a second [Lwt_main.run], and not
+       [Lwt.async]: nothing would fence an async sweep from the close. When
+       [?reaper] is [None] the serve path is exactly what it was. The sweep's
+       [now] is [Store.default_now], the wall family [open_root] seeded the
+       store's clock from: commit stamps can run AHEAD of it after a
+       same-second burst, which under-ages a branch (kept longer), the safe
+       direction. *)
     Lwt_main.run
-      (Dream.serve ~interface ~port ~stop
-         (Dream.logger
-            (handler_pack ?client_dir ?rpc ?coalesce ?retention ~guard ~sessions repo)));
+      (Option.fold reaper ~none:serve
+         ~some:(fun (r : Reaper.spec) () ->
+           Printf.eprintf
+             "tea_server_pack: reaper: sweeping session branches idle longer than %.0fs, every %.0fs\n%!"
+             (Tea_core.Prim.Ttl.to_seconds r.ttl)
+             (Reaper.Cadence.to_seconds r.every);
+           let sweep ~(now : int64) : int Lwt.t =
+             let* swept = Store.reap ~forget:(forget_into guard) repo ~ttl:r.ttl ~now in
+             (if swept > 0 then
+                Printf.eprintf
+                  "tea_server_pack: reaper: swept %d idle session branch(es)\n%!"
+                  swept);
+             Lwt.return swept
+           in
+           Lwt.join
+             [ serve ()
+             ; Reaper.loop ~sweep ~now:Store.default_now
+                 ~timer:(fun (c : Reaper.Cadence.t) ->
+                   Lwt_unix.sleep (Reaper.Cadence.to_seconds c))
+                 ~every:r.every ~stop
+             ])
+         ());
     (* The REPO first, then the journal — the order is load-bearing. Both
        fsync on this path, and a crash between the two closes must land on
        the duplicate side: repo-first leaves commits durable and floors

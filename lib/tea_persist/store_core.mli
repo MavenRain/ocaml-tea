@@ -329,7 +329,9 @@ module type CORE = sig
 
       [?forget] is called with each victim's session id {i before} its branch
       is removed (default: nothing, today's behaviour exactly, and the
-      {b unsafe} default). {b Hard precondition when a durable replay guard
+      {b unsafe} default; the wired entry points - [Tea_server.Make.serve]
+      and [Tea_server_pack.Make_pack.serve_pack], behind [?reaper] since
+      step 22 - always pass it). {b Hard precondition when a durable replay guard
       is live} (roadmap step 11, D16): a server wiring [reap] in {b must}
       pass [Tea_server.Durable_guard.forget] here, because a guard floor that
       outlives its branch converts every replay onto the recreated branch
@@ -354,7 +356,15 @@ module type CORE = sig
       replay is judged [Duplicate] against an empty model - total silent loss.
       Reap WITH forget is sound but not free of surprise: the replay reads
       [Fresh] (a first sighting is accepted whatever its seq) and applies once
-      onto [bottom], so the client observes a rollback followed by one edit. *)
+      onto [bottom], so the client observes a rollback followed by one edit.
+
+      Removal is conditional (step 22): the branch head is removed by
+      test-and-set against the very commit whose date was judged, so a victim
+      whose head moves between the date read and the removal is KEPT, with its
+      racing commit intact, and NOT counted. Its [?forget] has already fired
+      by then; that spurious tombstone is duplicate-side (the next replay on
+      the kept branch reads [Fresh] and re-applies visibly), which is the
+      direction every disturbance here degrades toward. *)
 
   (** Commit coalescing (R1): fold a run of chatty Msgs into one commit by
       amending the head — same parents, new tree, relabelled — while the

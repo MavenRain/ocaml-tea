@@ -111,6 +111,21 @@ val open_guards :
     [Store_core.CORE.branch_waters] read. Caller closes every [Some] journal at
     teardown, after the repo. *)
 
+val forget_into :
+  Tea_server.Durable_guard.t -> Tea_core.Prim.Session_id.t -> unit Lwt.t
+(** The reaper's [?forget] hook (roadmap step 22, D24): tombstone one reaped
+    session's delivery floor through the websocket channel's guard, keyed by
+    the replica the session applied under. The ws channel only: RPC floors are
+    keyed on the reserved [main] replica, which is never swept, so a victim
+    could never match one. A sink [Error] degrades to one stderr line naming
+    the session, and the sweep continues: the in-memory floor is already
+    scrubbed (duplicate side), and the journal's stale floor is dropped by the
+    boot filter at the next boot ([dropped_no_branch]). Module-level and
+    app-generic so [reaper_wiring_test] drives the same definition
+    {!Make_pack.serve_pack} wires (the [Rebase.absorb] precedent); the mem
+    tier ({!Tea_server.Make.serve}) writes the same closure locally, because
+    its library cannot depend on this one. *)
+
 module Make_pack (A : Tea_core.App.APP) : sig
   module Store : module type of Tea_persist_pack.Store_pack.Make (A)
 
@@ -138,10 +153,10 @@ module Make_pack (A : Tea_core.App.APP) : sig
       {!Tea_server.Session_secret.memory}; {!serve_pack} is the entry point
       that defaults to a durable identity, this handler on its own does not.
 
-      A future reap invocation from this tier {b must} pass
-      [~forget:(fun sid -> Durable_guard.forget guard
-      ~replica:(Tea_core.Crdt.Replica.v sid) |> Lwt.map ignore)] — see
-      [Tea_persist.Store_core.CORE.reap]'s precondition. *)
+      Reap is wired behind {!serve_pack}'s [?reaper] since step 22, and its
+      sweep passes [~forget:(forget_into guard)], which satisfies
+      [Tea_persist.Store_core.CORE.reap]'s precondition; a caller wiring a
+      sweep of its own must do the same. *)
 
   val serve_pack :
     ?interface:string ->
@@ -153,6 +168,7 @@ module Make_pack (A : Tea_core.App.APP) : sig
     ?retention:Store.Retention.t ->
     ?lower_root:string ->
     ?sessions:Tea_server.Session_secret.t ->
+    ?reaper:Tea_server.Reaper.spec ->
     root:Root.t ->
     unit ->
     unit
@@ -192,6 +208,20 @@ module Make_pack (A : Tea_core.App.APP) : sig
       Both siblings are named off [root] with any trailing separator
       normalised away, so [TEA_ROOT=/data/store/] cannot put them {i inside}
       the directory irmin-pack owns.
+
+      [?reaper] (roadmap step 22, D24) runs the bounded session sweep
+      ({!Store.reap} through {!forget_into}) every [every], removing session
+      branches idle longer than [ttl]. Default [None]: no sweep, byte for byte
+      the pre-step-22 serve path, because reaping deletes user data and no ttl
+      is right for every deployment. The loop shares the serve promise's stop
+      signal and is joined with it inside the one scheduler run, so a sweep in
+      flight at SIGINT/SIGTERM completes before the repo and the journals
+      close. Pick [ttl] well above the longest a CONNECTED client may sit
+      idle: a live socket does not exclude its branch, and a swept-then-active
+      session degrades visibly (the watch rebirths the model at load, the
+      replay reads Fresh onto bottom: a rollback followed by one edit), never
+      silently. Boot announces the policy on stderr; each sweep that removes
+      at least one branch says how many.
 
       This function does {b not} always return: two conditions refuse to serve
       and [exit 1] without binding a port, because returning [unit] would end

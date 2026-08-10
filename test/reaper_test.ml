@@ -165,6 +165,57 @@ let () =
           recorded);
      check "main still survives the tombstoning sweep" (List.mem "main" final);
 
+     (* --- T-BOUND: the cutoff is strict (step 22) ------------------------ *)
+     (* [reap] sweeps heads strictly older than [now - ttl]. Driving [now]
+        FROM the live head date pins the boundary without guessing what the
+        Clock stamped; the Some-check above the fold keeps the derivation
+        from passing vacuously off a missing head. *)
+     let* bound = Store.session t2 (sid "boundaa") in
+     let* (_ : model) = Store.apply bound Increment in
+     let* bound_head = Store.S.Branch.find (Store.repo t2) (branch_of "boundaa") in
+     check "T-BOUND: the probe branch has a head" (Option.is_some bound_head);
+     let bound_date =
+       Option.fold bound_head ~none:0L
+         ~some:(fun c -> Store.S.Info.date (Store.S.Commit.info c))
+     in
+     let ttl_span = Int64.of_float (Prim.Ttl.to_seconds ttl) in
+     let* kept = Store.reap t2 ~ttl ~now:(Int64.add bound_date ttl_span) in
+     let* still_bound = Store.S.Branch.mem (Store.repo t2) (branch_of "boundaa") in
+     check "T-BOUND: a head dated exactly [now - ttl] is KEPT (strict inequality)"
+       (kept = 0 && still_bound);
+     let* swept_bound =
+       Store.reap t2 ~ttl ~now:(Int64.add bound_date (Int64.add ttl_span 1L))
+     in
+     let* gone_bound = Store.S.Branch.mem (Store.repo t2) (branch_of "boundaa") in
+     check "T-BOUND: one second older is swept" (swept_bound = 1 && not gone_bound);
+
+     (* --- T-RACE: a commit racing the sweep is preserved (step 22) ------- *)
+     (* The erased-commit shape the TAS removal exists to catch: a writer
+        lands a commit AFTER the sweep judged the head's date and BEFORE the
+        removal. The [?forget] callback IS that window, so the racing writer
+        lives inside it, committing through a SECOND session handle onto the
+        victim's own branch. *)
+     let* race = Store.session t2 (sid "raceaa") in
+     let* (_ : model) = Store.apply race Increment in
+     let raced = ref 0 in
+     let forget_race (_ : Prim.Session_id.t) : unit Lwt.t =
+       let* s2 = Store.session t2 (sid "raceaa") in
+       let* (_ : model) = Store.apply s2 Increment in
+       raced := !raced + 1;
+       Lwt.return_unit
+     in
+     let* swept_race = Store.reap ~forget:forget_race t2 ~ttl ~now:1_000_000L in
+     check "T-RACE: the raced victim is NOT counted" (swept_race = 0 && !raced = 1);
+     let* still_race = Store.S.Branch.mem (Store.repo t2) (branch_of "raceaa") in
+     check "T-RACE: the victim branch is KEPT" still_race;
+     let* race_m = Store.load race in
+     check "T-RACE: the racing commit is intact and readable after the sweep (count = 2)"
+       (value race_m = 2);
+     (* The TAS keep is a one-round reprieve, not an escape: once the branch
+        goes quiet its next sweep removes it. *)
+     let* cleanup = Store.reap t2 ~ttl ~now:2_000_000L in
+     check "T-RACE: a later quiet sweep does remove it" (cleanup = 1);
+
      let* () = Store.close t2 in
 
      let rec rm_rf (path : string) : unit =

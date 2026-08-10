@@ -36,6 +36,12 @@ module Reply_cache = Reply_cache
     witness that a replay parked rather than raced. *)
 module Ack_park = Ack_park
 
+(** The reaper loop's timing shell (roadmap step 22, D24), re-exported so an
+    entry point's caller spells the knob [Tea_server.Reaper.spec] and a test
+    drives {!Reaper.loop} with an injected timer, without reaching into the
+    library's internals. *)
+module Reaper = Reaper
+
 (** Where a browser's identity lives and for how long (roadmap step 12, D17),
     re-exported for the same reason: the session id names the Irmin branch and
     {i is} the CRDT replica id, so choosing a back end is choosing how long a
@@ -874,7 +880,7 @@ module Make (A : Tea_core.App.APP) = struct
       because {!Tea_server_pack.Make_pack.serve_pack} genuinely needs it and
       {!Tea_server_pack.Make_pack} pairs it with a durable store. *)
   let serve ?(interface = "localhost") ?(port = 8080) ?client_dir ?rpc ?rpc_once
-      ?coalesce () : unit =
+      ?coalesce ?reaper () : unit =
     let repo = Lwt_main.run (Store.create ()) in
     (* [?rpc_once] takes a route BUILDER, not a built list, because the value it
        needs does not exist until the entry point makes it. On this tier that is
@@ -902,8 +908,69 @@ module Make (A : Tea_core.App.APP) = struct
             @ build repo (Rpc_once.mem ~floor_replica:Store.main_replica)))
         ()
     in
+    (* [?reaper] (roadmap step 22, D24): the pipeline and the sweep must
+       judge replays against ONE guard, so when the reaper is on the guard is
+       minted HERE - the router's own default construction, null sink over
+       empty floors - and handed to [handler ?guard], the argument that
+       existed "for tests" and finds its load-bearing use. The in-memory
+       floors this tier accumulates are exactly as loss-prone after a reap as
+       durable ones, which is why this tier reaps at all. The [forget]
+       closure is [Tea_server_pack.forget_into]'s local twin (that library
+       depends on this one, not the reverse). No teardown exists on this tier
+       (Dream.run never returns), so the loop's stop promise never resolves
+       and the loop dies with the process: [Lwt.async] needs no fence from a
+       close that never happens. The sweep's [now] is [Store.default_now],
+       the wall family [Store.create ()] seeded the clock from. *)
+    let guard =
+      Option.map
+        (fun (r : Reaper.spec) ->
+          let guard =
+            Durable_guard.v ~sessions:Replay_guard.default_sessions
+              ~tabs:Replay_guard.default_tabs ~sink:Guard_sink.null
+              ~floors:Durable_guard.Floors.empty ()
+          in
+          let forget (sid : Tea_core.Prim.Session_id.t) : unit Lwt.t =
+            let open Lwt.Syntax in
+            let* forgotten =
+              Durable_guard.forget guard ~replica:(Tea_core.Crdt.Replica.v sid)
+            in
+            Result.fold forgotten ~ok:Lwt.return
+              ~error:(fun (e : Guard_sink.err) ->
+                let reason =
+                  match e with
+                  | Guard_sink.Sink_closed -> "sink closed"
+                  | Guard_sink.Io io -> io
+                in
+                Printf.eprintf
+                  "tea_server: reaper: forget failed for session %s (%s); continuing the sweep\n%!"
+                  (Tea_core.Prim.Session_id.to_string sid)
+                  reason;
+                Lwt.return_unit)
+          in
+          let sweep ~(now : int64) : int Lwt.t =
+            let open Lwt.Syntax in
+            let* swept = Store.reap ~forget repo ~ttl:r.ttl ~now in
+            (if swept > 0 then
+               Printf.eprintf
+                 "tea_server: reaper: swept %d idle session branch(es)\n%!"
+                 swept);
+            Lwt.return swept
+          in
+          Printf.eprintf
+            "tea_server: reaper: sweeping session branches idle longer than %.0fs, every %.0fs\n%!"
+            (Tea_core.Prim.Ttl.to_seconds r.ttl)
+            (Reaper.Cadence.to_seconds r.every);
+          Lwt.async (fun () ->
+              Reaper.loop ~sweep ~now:Store.default_now
+                ~timer:(fun (c : Reaper.Cadence.t) ->
+                  Lwt_unix.sleep (Reaper.Cadence.to_seconds c))
+                ~every:r.every
+                ~stop:(fst (Lwt.wait ())));
+          guard)
+        reaper
+    in
     Dream.run ~interface ~port
-      (Dream.logger (handler ?client_dir ?rpc ?coalesce repo))
+      (Dream.logger (handler ?client_dir ?rpc ?coalesce ?guard repo))
 end
 
 (** Request-body admission (roadmap step 8, D11): a size cap enforced {i while}

@@ -809,11 +809,21 @@ struct
   (* --- D3: bounded session reaper ---------------------------------------- *)
 
   (** Sweep expired session branches: fold [S.Branch.list], skip every reserved
-      ref, and [S.Branch.remove] any remaining branch whose head [Info] date (a
-      {!Clock} stamp) is strictly older than [now - ttl]. Returns the count
-      removed. Bounded by the branch count and single-pass; the only [Lwt.catch]
-      fences the per-branch head lookup, which can raise once pack GC has
-      dropped a branch's head commit. *)
+      ref, and remove any remaining branch whose head [Info] date (a {!Clock}
+      stamp) is strictly older than [now - ttl]. Returns the count removed.
+      Bounded by the branch count and single-pass; the only [Lwt.catch] fences
+      the per-branch head lookup, which can raise once pack GC has dropped a
+      branch's head commit.
+
+      Removal is [Head.test_and_set ~set:None] against [c], the very head whose
+      date was judged, never a plain [Branch.remove]: a commit landing between
+      the date read and the removal would otherwise be erased unseen. The TAS
+      routes through the branch store's lock, so a raced victim is KEPT, whole,
+      and NOT counted. [?forget] still fires FIRST, before the outcome is
+      known: a spurious tombstone over a branch the TAS then keeps degrades
+      duplicate-side (the returning replay reads Fresh), while tombstoning
+      after a successful removal would open the window where a floor outlives
+      its branch, the loss side (D16). *)
   let reap ?(forget = fun (_ : Tea_core.Prim.Session_id.t) -> Lwt.return_unit)
       (t : t) ~(ttl : Tea_core.Prim.Ttl.t) ~(now : int64) : int Lwt.t =
     let cutoff = Int64.sub now (Int64.of_float (Tea_core.Prim.Ttl.to_seconds ttl)) in
@@ -836,10 +846,13 @@ struct
                   Tea_core.Prim.Session_id.of_string name
                   |> Option.fold ~none:Lwt.return_unit ~some:forget
                 in
-                let remove_branch () : unit Lwt.t = S.Branch.remove t.repo name in
+                let remove_branch () : bool Lwt.t =
+                  let* s = S.of_branch t.repo name in
+                  S.Head.test_and_set s ~test:(Some c) ~set:None
+                in
                 let* () = forget_victim () in
-                let* () = remove_branch () in
-                Lwt.return (reaped + 1)
+                let* removed = remove_branch () in
+                Lwt.return (if removed then reaped + 1 else reaped)
               else Lwt.return reaped))
       0 names
 

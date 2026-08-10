@@ -184,10 +184,12 @@ val release :
 val forget : t -> replica:Tea_core.Crdt.Replica.t -> t
 (** Drop every tab entry for one replica.
 
-    {b Hard precondition for any future reaper loop.} If
-    [Tea_persist.Store_core.CORE.reap] is ever wired into a server (today it is
-    a library function nothing in [lib/] calls), it {b must} call this for each
-    collected session. Otherwise: a laptop suspends past the ttl with a tab open
+    {b Hard precondition for any reaper loop.}
+    [Tea_persist.Store_core.CORE.reap] is wired into both entry points behind
+    [?reaper] since step 22, and each wiring satisfies this by passing a
+    [?forget] built on {!Durable_guard.forget}
+    ([Tea_server_pack.forget_into], and {!Make.serve}'s local twin); any new
+    sweep wiring {b must} do the same for each collected session. Otherwise: a laptop suspends past the ttl with a tab open
     and a non-empty unacknowledged queue, the branch is deleted, the reconnect
     ladder comes back, [session] recreates the branch at [A.init], and every
     replay reads [Duplicate] against a stale high water — total silent loss onto
