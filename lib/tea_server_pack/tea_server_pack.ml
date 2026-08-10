@@ -98,7 +98,8 @@ let explain_outcome ~(binding : Tea_core.Prim.Store_identity.binding)
 let open_guards ~(guard_dir : string)
     ~(head_water :
        Tea_core.Crdt.Replica.t -> Tea_core.Prim.Store_water.t option)
-    ~(identity : Tea_core.Prim.Store_identity.binding) : guards =
+    ~(identity : Tea_core.Prim.Store_identity.binding)
+    ?(fence : (unit -> unit Lwt.t) option) () : guards =
   let open_journal ~(channel : string) ~(dir : string) ~(cap : int)
       ~(sessions : Replay_guard.Bound.t) ~(tabs : Replay_guard.Bound.t) :
       Durable_guard.t * Guard_file.t option =
@@ -144,7 +145,7 @@ let open_guards ~(guard_dir : string)
               overflowing the very table it is refilling. *)
            ( Durable_guard.v ~sessions ~tabs
                ~mirror:(Durable_guard.default_mirror ~sessions ~tabs ~journal_cap:cap ())
-               ~sink ~floors ()
+               ?fence ~sink ~floors ()
            , Some jf ))
          ~error:(fun (e : Guard_file.open_err) ->
            let reason =
@@ -156,7 +157,11 @@ let open_guards ~(guard_dir : string)
              "tea_server_pack: %s channel: guard journal unavailable (%s); serving at-least-once\n%!"
              channel reason;
            (* No journal, hence no cap to clear: the sinkless derivation, the
-              mem tier's composition exactly. *)
+              mem tier's composition exactly — including NO fence. A null
+              sink appends nothing, so there is nothing to order, and a live
+              fence here would bill [Store.flush] per message (or turn an
+              unconditionally [Ok] persist into [Error]) for a zero
+              invariant. *)
            ( Durable_guard.v ~sessions ~tabs ~sink:Guard_sink.null
                ~floors:Durable_guard.Floors.empty ()
            , None ))
@@ -367,7 +372,13 @@ module Make_pack (A : Tea_core.App.APP) = struct
        two are opened in, live in {!open_guards} rather than here so a native
        test can drive the real composition without binding a port. *)
     let { ws = guard; ws_journal = journal; rpc = rpc_guard; rpc_journal } =
+      (* The commit fence is hard-wired, not a [serve_pack] parameter: a
+         production boot with the fence off would quietly go back to leaning
+         on irmin-pack's undocumented batch-end flush, and no caller has a
+         legitimate reason to want that. The fence is what makes the
+         floor/commit ordering THIS repo's invariant. *)
       open_guards ~guard_dir ~head_water ~identity
+        ~fence:(fun () -> Store.flush repo) ()
     in
     (* [?rpc_once] takes a route BUILDER for the reason {!Tea_server.Make.serve}
        gives, and here the reason is at its strongest: the guard it wraps is
@@ -412,7 +423,15 @@ module Make_pack (A : Tea_core.App.APP) = struct
        pack's user-space buffer, and a replay would then read Duplicate
        against a commit that never reached disk — silent loss. "Floor
        durability never exceeds commit durability" is the invariant, and at
-       teardown this ordering is what enforces it. *)
+       teardown this ordering is what enforces it.
+
+       One window survives the ordering: a cancelled span's orphan body
+       (R10d) can resume inside THIS [Lwt_main.run] and reach [persist]
+       after the repo closed. Its fence then rejects on the closed repo,
+       and [persist] degrades that to [Error] with no floor appended — one
+       audible line, the duplicate direction. That is why the fence must
+       reject rather than swallow (see [Store_pack.flush]): a swallowing
+       fence would append that orphan's floor against a closed repo. *)
     Lwt_main.run
       (let open Lwt.Syntax in
        let* () = Store.close repo in

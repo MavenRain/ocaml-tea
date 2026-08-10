@@ -249,6 +249,7 @@ type t =
   ; mutable floors : Floors.t
   ; sink : Guard_sink.t
   ; mirror : Replay_guard.Bound.t
+  ; fence : unit -> unit Lwt.t
   }
 
 (* The fallback is unreachable: both bounds are strictly positive by
@@ -265,8 +266,9 @@ let default_mirror ~(sessions : Replay_guard.Bound.t)
   |> Option.value ~default:sessions
 
 let v ~(sessions : Replay_guard.Bound.t) ~(tabs : Replay_guard.Bound.t)
-    ?(mirror : Replay_guard.Bound.t option) ~(sink : Guard_sink.t)
-    ~(floors : Floors.t) () : t =
+    ?(mirror : Replay_guard.Bound.t option)
+    ?(fence : unit -> unit Lwt.t = fun () -> Lwt.return_unit)
+    ~(sink : Guard_sink.t) ~(floors : Floors.t) () : t =
   let mirror =
     Option.value mirror ~default:(default_mirror ~sessions ~tabs ())
   in
@@ -279,6 +281,7 @@ let v ~(sessions : Replay_guard.Bound.t) ~(tabs : Replay_guard.Bound.t)
   ; floors = Floors.cap ~bound:mirror floors
   ; sink
   ; mirror
+  ; fence
   }
 
 let mirror_bound (t : t) : Replay_guard.Bound.t = t.mirror
@@ -334,8 +337,21 @@ let persist (t : t) ~(replica : Tea_core.Crdt.Replica.t)
      once-ever. Caught here, at the one seam both tiers share, a rejecting
      sink degrades to the same audible [Error] the honest sinks already
      return. *)
+  (* The commit fence (roadmap step 20, R11) runs strictly between the
+     mirror advance above and the sink append, unconditionally — a fence
+     that inspected the water would be a policy fork at the one seam both
+     tiers share, and a bottom-water floor's wasted call is cheap
+     (irmin-pack short-circuits an empty buffer). It lives INSIDE this
+     catching seam for the same reason the append does: a rejecting fence
+     would otherwise be born after the mirror advance, cross the WS release
+     barrier, and desync the Cell — caught here it degrades to the same
+     audible [Error], with the floor never appended (the duplicate
+     direction, never loss). *)
   Lwt.catch
-    (fun () -> t.sink.Guard_sink.append e)
+    (fun () ->
+      let open Lwt.Syntax in
+      let* () = t.fence () in
+      t.sink.Guard_sink.append e)
     (fun (exn : exn) ->
       Lwt.return (Error (Guard_sink.Io (Printexc.to_string exn))))
 

@@ -109,7 +109,7 @@ let stamped (g : Durable_guard.t) (tab : Tab_id.t) :
 (* Nothing exists under [parent] yet: not the guard directory, not the rpc
    subdirectory. This is a first boot on a step-14 root, or a fresh install. *)
 let { Tea_server_pack.ws = ws1; ws_journal = ws_j1; rpc = rpc1; rpc_journal = rpc_j1 } =
-  Tea_server_pack.open_guards ~guard_dir ~head_water ~identity
+  Tea_server_pack.open_guards ~guard_dir ~head_water ~identity ()
 
 let () =
   check "the websocket channel opens a journal on a bare root"
@@ -163,7 +163,7 @@ let () =
 
 (* The restart. Everything from here is read off the FILES. *)
 let { Tea_server_pack.ws = ws2; ws_journal = ws_j2; rpc = rpc2; rpc_journal = rpc_j2 } =
-  Tea_server_pack.open_guards ~guard_dir ~head_water ~identity
+  Tea_server_pack.open_guards ~guard_dir ~head_water ~identity ()
 
 let stamped_is (g : Durable_guard.t) (tab : Tab_id.t) (seq : int)
     (water : Store_water.t) : bool =
@@ -285,7 +285,7 @@ let () =
 
 (* The SAME binding both earlier boots used. *)
 let { Tea_server_pack.ws = ws3; ws_journal = ws_j3; rpc = rpc3; rpc_journal = rpc_j3 } =
-  Tea_server_pack.open_guards ~guard_dir ~head_water ~identity
+  Tea_server_pack.open_guards ~guard_dir ~head_water ~identity ()
 
 let () =
   (* The presence. The rpc header still names this store, so that channel is

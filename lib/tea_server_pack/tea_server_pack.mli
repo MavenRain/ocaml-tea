@@ -48,10 +48,27 @@ val open_guards :
   guard_dir:string ->
   head_water:(Tea_core.Crdt.Replica.t -> Tea_core.Prim.Store_water.t option) ->
   identity:Tea_core.Prim.Store_identity.binding ->
+  ?fence:(unit -> unit Lwt.t) ->
+  unit ->
   guards
 (** Open the websocket channel's journal at [<guard_dir>/journal] and the keyed
     RPC channel's at [<guard_dir>/rpc/journal], filtering both against
-    [head_water] (R20).
+    [head_water] (R20). The trailing [unit] is what makes [?fence] erasable.
+
+    [?fence] is the commit fence (roadmap step 20, R11), threaded into BOTH
+    channels' {!Tea_server.Durable_guard.v} compositions: each persisted
+    floor's own commit bytes are forced into the page cache strictly before
+    the floor's journal append. A channel whose journal failed to open
+    composes its null-sink guard WITHOUT the fence: a null sink appends
+    nothing, so there is nothing to order, which is the no-op default's own
+    rationale. Default: no-op, which is what every direct
+    test composition wants. {!serve_pack} wires [Store.flush repo]
+    non-overridably — there is deliberately no [?fence] on [serve_pack]
+    itself. The fence is belt-and-braces ordering: irmin-pack 3.11 already
+    flushes at each commit batch's end, so the fence meets a clean buffer —
+    but nothing upstream promises that, and a production boot must not be
+    able to shed the one call that keeps R11 closed if upstream ever stops
+    flushing.
 
     What {!serve_pack} calls, exposed because the pair is a unit and the
     relation between its halves is the part that can silently break. The two

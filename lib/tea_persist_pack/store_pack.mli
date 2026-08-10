@@ -167,4 +167,30 @@ module Make (A : Tea_core.App.APP) : sig
       truncation/[None]. Precondition: run with other sessions quiescent,
       merged, or forked after the checkpoint — branch heads written {i
       before} it become unreadable. *)
+
+  val flush : t -> unit Lwt.t
+  (** The commit fence (roadmap step 20, R11): force every byte irmin-pack
+      still buffers for this store into the page cache. {!Tea_server_pack}
+      wires this as {!Tea_server.Durable_guard}'s fence, so a delivery
+      floor's own journal append can never reach the page cache before the
+      commit bytes it witnesses — the D16 inequality as a LOCAL invariant
+      of the persist path. The discovery this step pinned
+      ([store_pack_flush_test]): irmin-pack 3.11 already ends every commit
+      batch in a file-manager flush, so on the pump path this call meets a
+      clean buffer and moves nothing; it exists because nothing in
+      irmin-pack's interface promises that batch-end flush, and an
+      upstream that dropped it must not be able to silently reopen R11.
+      Rejects on failure: the one production composer,
+      {!Tea_server.Durable_guard.persist}, runs the fence inside its own
+      catch, so a failed flush becomes [Error (Io _)] with the floor never
+      appended — an audible, at-least-once persist (the duplicate
+      direction), never a floor ordered ahead of the commit bytes the
+      flush failed to move. The deeper backstop, independent of the fence:
+      the R20 boot filter drops any floor whose water the restored head no
+      longer covers, so even an unfenced append degrades to a visible
+      duplicate at the next boot rather than silent loss.
+      Page-cache arrival only:
+      [use_fsync] stays false, so a power cut is explicitly out of scope.
+      Cheap when nothing is buffered (the empty-buffer short-circuit),
+      which on the pump path is always. *)
 end

@@ -54,6 +54,8 @@ toolchain removes an entire tier lean-tea had to hand-write.
 | `test/cancel_test` s1-s7 - a deterministic mid-span sender death, the session promise waiting on the in-flight span, a `handle_frame` rejection releasing the taken seq for a Fresh replay that applies exactly once, an external cancel leaving a completed orphan with no ack minted, a replay raced against the still-parked orphan reading Duplicate, the fuel arm's once-ever bottom floor under cancellation, and a cancelled wrapper whose orphan then rejects still releasing for a Fresh replay | **passes** (confirmed by mutation: 7 s16 ids) |
 | `Tea_core.Prim.Store_identity` + `Store_pack.resolve_identity` minting `<root>/tea.identity` + the tag-`'\004'` identity header on both guard journals + `Guard_file.open_ ~identity` with the five-way `identity_outcome` + `Guard_sink.Codec.frame`/`unframe` - a create-once store lineage token cross-binding the pack root to its guard journals, so a journal restored beside a DIFFERENT store drops its floors as visible duplicates instead of losing the replays silently | **built, green** (roadmap step 18, D23) |
 | `test/store_identity_test`, `test/guard_identity_test` (I1-I13: both channels, the bottom-water stranger, the legacy adopt, the compaction round-trip, the Unresolved hold, its recovery and its held-file byte identity, the foreign header, the corrupt head) + `test/identity_explain_test` boot-log truthfulness + `pack_guards_test` header independence + `archive_gc_test` post-GC survival + `rpc_pack_once_test`'s end-to-end mismatch control | **passes** (confirmed by mutation: 12 s18 ids 12/12 killed + 5 review-fix ids) |
+| `Durable_guard ?fence` (called between the mirror advance and the sink append, inside the existing catch so a rejecting fence degrades to `Error (Io _)` with no floor appended) + `Store_pack.flush` (`Pack.flush`, rejecting on failure so `persist`'s catch is what degrades it) + `open_guards ?fence` behind a new trailing unit (the journal-open-failed null-sink arm composes fenceless) + `serve_pack` wiring `Store.flush repo` non-overridably - the D16 floor/commit ordering pinned as this repo's own invariant, after step 20's differential probe refuted R11's premise: irmin-pack 3.11 already ends every commit batch in `File_manager.flush`, so the fence meets a clean buffer, and an upstream that stops flushing cannot silently reopen R11 | **built, green** (roadmap step 20, R11) |
+| `test/commit_fence_test` (the fence;append;fence;append spy order, a rejecting fence appending nothing, `forget` never ticking the fence), `test/store_pack_flush_test` (commit bytes already on disk at commit-resolve, flush a byte-identical no-op, flush on a closed repo rejecting), `test/hot_copy_water_test` (a hot copy of a live unclosed root carries the commit and keeps its floor), `test/unwitnessed_rollback_pin_test` (the unwitnessed remainder pinned as R15 leaves it), `test/kill_durability_test` (real fork + SIGKILL reps; the unfenced arm is the upstream-drift alarm) | **passes** (confirmed by mutation: the fence-deleted and fence-reordered mutants killed on the ordering spy, the flush-emptied and swallow-re-introduced mutants on the closed-repo rejection pin; the serve_pack-wiring no-op mutant documented weak - behaviourally indistinguishable exactly because the upstream batch-end flush holds - and the null-sink mutant void, that arm composing fenceless by design) |
 
 Toolchain: OCaml 5.3.0, dune 3.24, a dedicated opam switch (`irmin-tea` locally) with
 `irmin 3.11`, `dream 1.0.0~alpha8`, `repr 0.8`, `vdom 0.3`, `js_of_ocaml 6.4`.
@@ -579,6 +581,35 @@ nothing is lost.
 >   can answer. And `<root>.secret` remains bound to neither sibling: an
 >   absent or rotated secret still silently orphans every branch and every
 >   floor.
+> - **Amended in step 20 (the commit fence): the inequality was found
+>   ALREADY HELD upstream, and is now pinned as this repo's own invariant.**
+>   Step 20's differential harness refuted the premise this entry has
+>   carried since step 11: irmin-pack does NOT buffer a commit past its own
+>   completion. Every write batch ends in `File_manager.flush` on the
+>   success path (irmin-pack 3.11, `unix/store.ml` `batch`/`on_success`),
+>   and `Commit.v` runs inside such a batch — so a commit's bytes are in
+>   the page cache before `Head.test_and_set` moves the head, and long
+>   before `persist` appends the floor. The kill -9 inversion (a floor in
+>   the page cache over a commit in a user-space buffer) is unreachable
+>   through this repo's write path, and so is the head-before-its-own-bytes
+>   sub-commit window. Nothing in irmin-pack's interface PROMISES that
+>   batch-end flush, so `Durable_guard.persist` now runs an optional fence
+>   strictly between its mirror advance and its sink append, and the pack
+>   tier wires `Store_pack.flush` (`Pack.flush`) as that fence,
+>   non-overridably at `serve_pack`'s composition: the ordering becomes a
+>   local guarantee of the persist path, not an inherited accident, and an
+>   upstream that stops flushing cannot silently reopen R11. A fence
+>   failure REJECTS, and `persist` degrades it to an error with the floor
+>   never appended — the duplicate direction; a swallowing fence would
+>   append a floor over commit bytes the flush just failed to order, and
+>   the R20 boot filter stays the deeper backstop either way. Proven three
+>   ways: an ordering test (`commit_fence_test.ml`), filesystem-level pins
+>   of the discovered invariant (`store_pack_flush_test.ml` F1,
+>   `hot_copy_water_test.ml`) that go RED if upstream ever drops the
+>   batch-end flush, and an executed fork+SIGKILL integration test
+>   (`kill_durability_test.ml`) — not inference from POSIX semantics alone.
+>   What the fence does not buy: power-loss durability (`use_fsync` stays
+>   false) and bottom-water floors (nothing to fence).
 >
 > **Residuals, stated rather than hidden:**
 >
@@ -1625,7 +1656,31 @@ Each lean-tea private-constructor primitive → an OCaml `.mli` boundary:
   bottom drown an elder stamp) and divergence after the boot check; the
   loss stays bounded by the
   pack's auto-flush lag. Every other durable-layer failure (torn tail, cap
-  eviction, failed append) falls on the duplicate side.
+  eviction, failed append) falls on the duplicate side. **Resolved by step
+  20 (the commit fence), by refutation and by pin.** The step's
+  differential harness found the premise above false: irmin-pack 3.11 ends
+  every commit batch in `File_manager.flush` (`unix/store.ml`
+  `batch`/`on_success`), so commits do NOT stay in user space past their
+  own completion — the bytes are on disk before the head moves and before
+  any floor append, and the kill -9 inversion this entry describes is
+  unreachable through the repo's write path (so is the
+  head-before-its-own-bytes sub-commit variant; both were inference from
+  the buffering premise, and the auto-flush-lag bound never carried the
+  claim). Because no irmin-pack interface promises that batch-end flush,
+  `Durable_guard.persist` now runs `Store_pack.flush` as a composed fence
+  strictly between its mirror advance and its sink append: the ordering is
+  this repo's own invariant, and `store_pack_flush_test.ml` F1 /
+  `hot_copy_water_test.ml` go RED if upstream ever stops flushing. The
+  residual un-bundles into three separately-reasoned pieces: (1)
+  bottom-water floors protect no commit at all and are unaffected by any
+  amount of flushing — pre-existing since step 11, not a step-20
+  regression, not fixable this way; (2) divergence past
+  `Guard_file.open_`'s once-only boot snapshot is a
+  multi-writer/second-process question, orthogonal to kill-timing,
+  unaddressed by step 20; (3) power-loss/disk durability stays explicitly
+  out of scope (`use_fsync` remains false) — batch-end flush and fence
+  alike guarantee page-cache arrival, never fsync, and flipping that flag
+  is a separate, unbenchmarked, stricter-threat-model future step.
 - **R12 (low) - `Durable_guard`'s in-process floor mirror is unbounded.
   CLOSED in step 15 (D20.4, the ride-along).** The `Replay_guard.Cell` in
   front of it is bounded precisely because an attacker mints session cookies
@@ -2411,7 +2466,50 @@ Each lean-tea private-constructor primitive → an OCaml `.mli` boundary:
     that never minted a witness and to divergence past the boot
     check, bounded by the pack's auto-flush lag; this step restores
     the inequality under a hard kill, or pins exactly that remainder
-    by test. **Planned.**
+    by test. **Done.** (By refutation and by pin: a differential
+    filesystem probe and the irmin-pack 3.11 source agree that every
+    write batch already ends in `File_manager.flush` on the success
+    path, and `Commit.v` runs inside such a batch — so a commit's
+    bytes reach the page cache at commit-resolve, before the head
+    moves and before any floor append. The kill -9 inversion this row
+    describes, and the head-before-its-own-bytes sub-commit window
+    with it, are unreachable through this repo's write path; the
+    "auto-flush lag" above governs only mid-batch overflow. Nothing
+    upstream PROMISES that flush, so the ordering is pinned as this
+    repo's own invariant: `Durable_guard.persist` gained `?fence`,
+    called strictly between mirror advance and sink append and inside
+    the existing catch, so a rejecting fence degrades to
+    `Error (Io _)` with the floor never appended; `Store_pack.flush`
+    (`Pack.flush`, rejecting on failure - swallowing would append a
+    floor over commit bytes the flush just failed to order, R11's loss
+    direction at exactly the moment the fence exists for; the R20 boot
+    filter is the deeper backstop either way) implements it;
+    `open_guards` threads `?fence` to both channels behind a new
+    trailing unit, the journal-open-failed null-sink arm composing
+    fenceless;
+    `serve_pack` wires `Store.flush repo` non-overridably. Pinned by
+    `test/commit_fence_test` (14 checks: the
+    fence;append;fence;append spy order, a rejecting fence appending
+    nothing, `forget` never ticking the fence),
+    `test/store_pack_flush_test` (6: commit bytes already on disk at
+    commit-resolve, the auto-flush threshold never fired, flush a
+    byte-identical no-op twice, and flush on a closed repo rejecting -
+    the pin that keeps the fence's failure mode a rejection persist
+    degrades, never a swallowed append), `test/hot_copy_water_test` (5: a hot
+    copy of a live unclosed root carries the commit and keeps its
+    floor), `test/unwitnessed_rollback_pin_test` (4: the unwitnessed
+    remainder pinned exactly as R15 leaves it), and
+    `test/kill_durability_test` (11: real fork + SIGKILL reps -
+    fenced, unfenced and clean-shutdown; the unfenced arm is the
+    alarm that goes red first if upstream ever drops the batch-end
+    flush); 4-mutant sweep (fence deleted, fence reordered after the
+    append, flush body emptied, a swallow re-introduced around the
+    flush), 4/4 killed on their predicted checks; the serve_pack-wiring
+    no-op mutant stays documented weak - kill_durability_test's
+    unfenced arm is the proof of why: upstream's own flush holds - and
+    the null-sink mutant is void because that arm composes fenceless
+    by design; suite baseline 1226 native checks across 52
+    executables.)
 21. **Boot epoch** - close R20b (§10) with the successor the register
     names: a counter bumped in the root at each open and echoed into
     each journal, which MOVES on divergence and so sees the copy that

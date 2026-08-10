@@ -96,12 +96,25 @@ val v :
   sessions:Replay_guard.Bound.t ->
   tabs:Replay_guard.Bound.t ->
   ?mirror:Replay_guard.Bound.t ->
+  ?fence:(unit -> unit Lwt.t) ->
   sink:Guard_sink.t ->
   floors:Floors.t ->
   unit ->
   t
-(** The trailing [unit] is what makes [?mirror] erasable, every other argument
-    being labelled.
+(** The trailing [unit] is what makes [?mirror] and [?fence] erasable, every
+    other argument being labelled.
+
+    [?fence] is the commit fence (roadmap step 20, R11): {!persist} runs it
+    strictly between its mirror advance and its sink append, on every
+    persist, so the composition site can force the floor's own commit bytes
+    into the page cache before the floor itself can get there. Default: a
+    no-op, which is the mem tier's composition (a null sink protects
+    nothing, so there is nothing to order). The pack tier wires
+    [Store_pack.flush]. The call sits inside {!persist}'s catching seam, so
+    a rejecting fence degrades to the same audible [Error] a rejecting sink
+    does — with the floor never appended, the duplicate direction — rather
+    than escaping after the mirror advance. {!forget} never runs the fence:
+    it appends a tombstone, which protects no commit.
 
     [?mirror] caps the in-process floor mirror (roadmap step 15, R12 as
     amended by R15: before this the mirror was the last uncapped table in the

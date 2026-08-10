@@ -341,6 +341,26 @@ module Make (A : Tea_core.App.APP) = struct
   module Pack = Maker_kv.Make (Contents)
   include Tea_persist.Store_core.Make (A) (Pack)
 
+  (* The commit fence (roadmap step 20, R11): [Pack.flush] forces irmin-pack's
+     still-buffered suffix/dict bytes into the page cache, so a guard floor
+     appended AFTER this resolves cannot reach the page cache before the
+     commit bytes it witnesses. irmin-pack 3.11 already ends every commit
+     batch in [File_manager.flush] (unix/store.ml [batch] on_success), so on
+     the pump path this meets a clean buffer and is a no-op — it exists
+     because no interface PROMISES that batch-end flush, and an upstream that
+     dropped it must not be able to silently reopen R11. Page-cache arrival
+     only — [use_fsync] stays false, so power loss stays out of scope. A
+     failed flush REJECTS rather than degrade to stderr here: the one
+     production composer, [Durable_guard.persist], runs the fence inside its
+     own catch, where the rejection becomes [Error (Io _)] with the floor
+     never appended — an audible, at-least-once persist, the duplicate
+     direction. Swallowing the failure would append a floor over commit
+     bytes the flush just failed to order, which is R11's loss direction at
+     exactly the moment the fence exists for. *)
+  let flush (t : t) : unit Lwt.t =
+    Pack.flush (repo t);
+    Lwt.return_unit
+
   (* ALWAYS minimal indexing: the default [always] strategy permanently
      poisons the root against delete-mode GC. And deliberately no [?fresh]:
      reopening must never silently truncate a durable store.

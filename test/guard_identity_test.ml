@@ -607,7 +607,7 @@ let () =
   in
   let { Tea_server_pack.ws; ws_journal; rpc; rpc_journal } =
     Tea_server_pack.open_guards ~guard_dir:dir_own ~head_water:no_heads
-      ~identity:bound_a
+      ~identity:bound_a ()
   in
   let ws_fl = Dguard.floors ws and rpc_fl = Dguard.floors rpc in
   check
@@ -627,7 +627,7 @@ let () =
   let () = Lwt_main.run (plant_tree dir_other) in
   let { Tea_server_pack.ws = ws2; ws_journal = wsj2; rpc = rpc2; rpc_journal = rpcj2 } =
     Tea_server_pack.open_guards ~guard_dir:dir_other ~head_water:no_heads
-      ~identity:bound_b
+      ~identity:bound_b ()
   in
   check "I10 under a stranger binding BOTH channels come up empty"
     (Int.equal (Floors.cardinal (Dguard.floors ws2)) 0
