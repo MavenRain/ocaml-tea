@@ -7,10 +7,11 @@
     anti-vacuity: a reaper hardwired to reap everything fails "live branch
     KEPT", a no-op reaper fails "stale branch swept".
 
-    Redo: [undo] durably records the pre-undo head on the session's [redo-]
-    pointer (write-ref-first), and the pointer plus [redo] survive a
-    close/reopen — the crash-safety observable that a durable, ordered redo
-    pointer provides. *)
+    Redo: a won [undo] durably records the pre-undo head on the session's
+    [redo-] pointer (stamped only inside the won head move since step 19, so
+    a refused undo leaves no trace), and the pointer plus [redo] survive a
+    close/reopen — the crash-safety observable that a durable redo pointer
+    provides. *)
 
 module Store = Tea_persist_pack.Store_pack.Make (Counter_app.App)
 module Prim = Tea_core.Prim
@@ -64,17 +65,18 @@ let () =
      let* live_m = Store.load live in
      check "the kept live branch still loads its model (count = 1)" (value live_m = 1);
 
-     (* --- Crash-safe redo (write-ref-first) ------------------------------- *)
+     (* --- Crash-safe redo (stamped inside the won move) ------------------- *)
      (* Build a little history on the live branch, then undo. *)
      let* (_ : model) = Store.apply live Increment in
      let* (_ : model) = Store.apply live Increment in
      let* before_undo = Store.load live in
      check "live branch is at count = 3 before undo" (value before_undo = 3);
-     let* undone = Store.undo live in
+     let* wl = Store.load_based live in
+     let* undone = Store.undo wl in
      let undo_ok =
-       match undone with
-       | Some m -> value m = 2
-       | None -> false
+       Result.fold undone
+         ~ok:(fun m -> value m = 2)
+         ~error:(fun (_ : Store.undo_error) -> false)
      in
      check "undo walks back one commit (count = 2)" undo_ok;
 
@@ -104,9 +106,9 @@ let () =
      check "the redo pointer survives a close/reopen (durable)" survived;
      let* redone = Store.redo live2 in
      let redo_ok =
-       match redone with
-       | Some m -> value m = 3
-       | None -> false
+       Result.fold redone
+         ~ok:(fun m -> value m = 3)
+         ~error:(fun (_ : Store.redo_error) -> false)
      in
      check "redo after restart restores the pre-undo head (count = 3)" redo_ok;
      let* cleared = Store.S.Branch.mem (Store.repo t2) redo_ref in

@@ -773,12 +773,25 @@ struct
                  ~none:(Dream.respond ~status:`Bad_Request "missing msg field")
                  ~some:(apply_msg s request)))
 
-  let handle_undo (repo : St.t) (request : Dream.request) : Dream.response Lwt.t =
+  (* [?interpose] fires between the witness and the guarded move - the one
+     window that matters - so the denial arm is testable in program order,
+     mirroring the [step] seam. Default no-op; production never passes it. *)
+  let handle_undo ?(interpose : St.session -> unit Lwt.t = fun (_ : St.session) -> Lwt.return_unit)
+      (repo : St.t) (request : Dream.request) : Dream.response Lwt.t =
     with_session repo request (fun s ->
         with_form request (fun _fields ->
-            (* At the history root undo is a no-op; either way, re-render. *)
-            let* _restored = St.undo s in
-            Dream.redirect request "/"))
+            let* w = St.load_based s in
+            let* () = interpose s in
+            let* undone = St.undo w in
+            Result.fold undone
+              ~ok:(fun (_ : St.model) -> Dream.redirect request "/")
+              ~error:(fun (e : St.undo_error) ->
+                match e with
+                (* At the history root undo is a no-op; re-render. *)
+                | St.At_root -> Dream.redirect request "/"
+                (* A commit landed past the witness (step 19, R10b): surface
+                   the refusal instead of re-rendering it as a success. *)
+                | St.Branch_moved -> Dream.redirect request "/?undo=denied")))
 
   (* --- Assembly ----------------------------------------------------------- *)
 
@@ -788,7 +801,8 @@ struct
      session cookie require. *)
   let router ?(client_dir : string option) ?(rpc : Dream.route list = [])
       ?(coalesce = Tea_core.Coalesce_spec.Keep_all) ?(guard = guard)
-      ?(park = park) (repo : St.t) : Dream.handler =
+      ?(park = park) ?(undo_interpose : (St.session -> unit Lwt.t) option)
+      (repo : St.t) : Dream.handler =
     let client_routes =
       Option.fold client_dir ~none:[]
         ~some:(fun dir ->
@@ -799,7 +813,7 @@ struct
     Dream.router
       ([ Dream.get "/" (handle_root repo)
        ; Dream.post msg_path (handle_msg repo)
-       ; Dream.post undo_path (handle_undo repo)
+       ; Dream.post undo_path (handle_undo ?interpose:undo_interpose repo)
        ; Dream.get ws_path (handle_ws ~coalesce ~guard ~park repo)
        ]
       @ rpc @ client_routes)
@@ -827,13 +841,14 @@ struct
       that this is a {i per-application} default, not a per-request one: the
       middleware is built once, when the handler is, so a caller cannot change
       back ends mid-flight and strand the branches already minted. *)
-  let handler ?client_dir ?rpc ?coalesce ?guard ?park
+  let handler ?client_dir ?rpc ?coalesce ?guard ?park ?undo_interpose
       ?(sessions = Session_secret.memory) (repo : St.t) : Dream.handler =
     (* Sessions OUTSIDE the security headers, exactly as before: the header
        middleware decorates whatever response comes back, including the
        redirects and 403s the session layer itself can produce. *)
     Session_secret.middleware sessions
-      (secure_headers (router ?client_dir ?rpc ?coalesce ?guard ?park repo))
+      (secure_headers
+         (router ?client_dir ?rpc ?coalesce ?guard ?park ?undo_interpose repo))
 
   (** Blocking entry point for a native server binary. [?coalesce] is the
       app's commit-coalescing policy for live (WS) sessions; the default

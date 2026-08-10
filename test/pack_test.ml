@@ -57,8 +57,15 @@ let () =
        | [] | _ :: _ :: _ -> false
      in
      check "history after checkpoint is exactly [the checkpoint]" cp_pinned;
-     let* undone = Store.undo main in
-     check "undo at the squashed root is None" (Option.is_none undone);
+     let* wm = Store.load_based main in
+     let* undone = Store.undo wm in
+     check "undo at the squashed root refuses with At_root"
+       (Result.fold undone
+          ~ok:(fun _m -> false)
+          ~error:(fun (e : Store.undo_error) ->
+            match e with
+            | Store.At_root -> true
+            | Store.Branch_moved -> false));
      let* fresh = Store.session t (sid "fresh") in
      let* cp_empty = Store.checkpoint fresh ~label:"nothing" in
      let empty_arm =
@@ -106,16 +113,23 @@ let () =
         | `Still_readable -> false);
      let* m_b = Store.load b in
      check "the post-checkpoint fork's model is intact (count = 4)" (value m_b = 4);
-     let* undo_b = Store.undo b in
+     let* wb = Store.load_based b in
+     let* undo_b = Store.undo wb in
      let undo_b_ok =
-       match undo_b with
-       | Some u -> value u = 3
-       | None -> false
+       Result.fold undo_b
+         ~ok:(fun u -> value u = 3)
+         ~error:(fun (_ : Store.undo_error) -> false)
      in
      check "undo on the fork lands on the checkpoint model (count = 3)" undo_b_ok;
-     let* undo_b2 = Store.undo b in
-     check "a second undo degrades to None at the squashed root (no exception)"
-       (Option.is_none undo_b2);
+     let* wb2 = Store.load_based b in
+     let* undo_b2 = Store.undo wb2 in
+     check "a second undo refuses at the squashed root (At_root, no exception)"
+       (Result.fold undo_b2
+          ~ok:(fun _m -> false)
+          ~error:(fun (e : Store.undo_error) ->
+            match e with
+            | Store.At_root -> true
+            | Store.Branch_moved -> false));
 
      (* (d) GC error path: waiting for an already-finalised GC is fine, but a
         second run retaining the same checkpoint must fail cleanly — the

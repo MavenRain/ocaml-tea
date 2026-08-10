@@ -149,6 +149,43 @@ let () =
   let b3 = body (get handle ~cookie "/") in
   check "undo restores count 1" (contains ~needle:">1<" b3);
 
+  (* Step 19 (R10b): a denied undo surfaces as its own redirect, never as a
+     silent success. [~undo_interpose] lands a racing Increment between the
+     handler's witness and the guarded move - the one window that matters -
+     so the denial is driven in program order. A separate handler instance:
+     memory sessions are per-handler, so this flow mints its own cookie. The
+     rig needs TWO commits before the undo - a one-commit head refuses one
+     arm earlier (At_root, a silent no-op redirect) without consulting the
+     guard. *)
+  let racer (s : Server.Store.session) : unit Lwt.t =
+    let open Lwt.Syntax in
+    let* w = Server.Store.load_based s in
+    let ctx = Server.Store.ctx_of_session s in
+    let* (_ : Server.Store.committed) =
+      Server.Store.commit_based w ~label:"racer"
+        (fst
+           (Counter_app.App.update ctx Counter_app.App.Increment
+              (Server.Store.based_model w)))
+    in
+    Lwt.return_unit
+  in
+  let handle_d = Dream.test (Server.handler ~undo_interpose:racer repo) in
+  let rd0 = handle_d (Dream.request ~method_:`GET ~target:"/" "") in
+  let cookie_d = cookie_of rd0 in
+  let bd0 = body rd0 in
+  let rd1 = post handle_d ~cookie:cookie_d ~token:(csrf_of bd0) ~path:"/msg" [ ("msg", inc) ] in
+  check "denied-undo rig: first Increment lands" (status rd1 = 303);
+  let bd1 = body (get handle_d ~cookie:cookie_d "/") in
+  let rd2 = post handle_d ~cookie:cookie_d ~token:(csrf_of bd1) ~path:"/msg" [ ("msg", inc) ] in
+  check "denied-undo rig: second Increment lands" (status rd2 = 303);
+  let bd2 = body (get handle_d ~cookie:cookie_d "/") in
+  let rd3 = post handle_d ~cookie:cookie_d ~token:(csrf_of bd2) ~path:"/undo" [] in
+  check "a denied undo redirects with the denial signal, not as success"
+    (status rd3 = 303 && Dream.header rd3 "Location" = Some "/?undo=denied");
+  let bd3 = body (get handle_d ~cookie:cookie_d "/") in
+  check "the racing commit survives the denied undo (count 3)"
+    (contains ~needle:">3<" bd3);
+
   (* Rejection paths. *)
   let forged = post handle ~cookie ~token:"forged" ~path:"/msg" [ ("msg", inc) ] in
   check "a forged csrf token is rejected (403)" (status forged = 403);

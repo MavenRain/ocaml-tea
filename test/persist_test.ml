@@ -21,11 +21,12 @@ let () =
      check "three increments -> count = 3" (value m3 = 3);
      let* hist = Store.history s in
      check "history has one commit per update (3)" (List.length hist = 3);
-     let* undone = Store.undo s in
+     let* wu = Store.load_based s in
+     let* undone = Store.undo wu in
      let undo_ok =
-       match undone with
-       | Some m -> value m = 2
-       | None -> false
+       Result.fold undone
+         ~ok:(fun m -> value m = 2)
+         ~error:(fun (_ : Store.undo_error) -> false)
      in
      check "undo walks to previous commit -> count = 2" undo_ok;
      let* loaded = Store.load s in
@@ -111,8 +112,15 @@ let () =
      check "history after checkpoint is exactly one commit" (List.length hist = 1);
      let* m = Store.load s in
      check "the model survives the squash (count = 2)" (value m = 2);
-     let* u = Store.undo s in
-     check "undo at the squashed root is None" (Option.is_none u);
+     let* wu2 = Store.load_based s in
+     let* u = Store.undo wu2 in
+     check "undo at the squashed root refuses with At_root"
+       (Result.fold u
+          ~ok:(fun _m -> false)
+          ~error:(fun (e : Store.undo_error) ->
+            match e with
+            | Store.At_root -> true
+            | Store.Branch_moved -> false));
      let sid = Option.get (Tea_core.Prim.Session_id.of_string "cafe") in
      let* empty_s = Store.session repo sid in
      let* cp_e = Store.checkpoint empty_s ~label:"nothing" in

@@ -80,7 +80,12 @@ module type CORE = sig
       branch, and what makes that floor's water checkable against the head
       water [branch_waters] reports for [main]. *)
 
-  val fork : t -> from:session -> Tea_core.Prim.Session_id.t -> session Lwt.t
+  val fork :
+    ?interpose:(unit -> unit Lwt.t) ->
+    t ->
+    from:session ->
+    Tea_core.Prim.Session_id.t ->
+    session Lwt.t
   val load : session -> model Lwt.t
   (** The model standing at this session branch's head, read off the branch.
       A read-only surface since D19: the model it returns carries no witness,
@@ -236,16 +241,35 @@ module type CORE = sig
   val head_ref : session -> Tea_core.Prim.Commit_ref.t option Lwt.t
   val history : session -> Tea_core.Prim.Commit_ref.t list Lwt.t
 
-  val undo : session -> model option Lwt.t
-  (** Move the branch head back one commit, returning the restored model
-      ([None] at the root). Crash-safe (D3): the pre-undo head is recorded on
-      the session's durable [redo-] ref {i before} the head moves, so a crash
-      strands only a harmless redo pointer, never a moved head with no way
-      back. *)
+  type undo_error =
+    | At_root  (** empty witness, at the root, or the parent is gone (GC) *)
+    | Branch_moved
+        (** a commit landed past the witness; nothing was erased *)
 
-  val redo : session -> model option Lwt.t
-  (** Undo's inverse: move the head forward onto the session's durable redo
-      pointer and clear it ([None] when there is nothing to redo). *)
+  val undo : based -> (model, undo_error) result Lwt.t
+  (** Move the branch head back one commit, guarded by the caller's witness
+      (R10b, step 19): the move is a test-and-set against the witness head, so
+      an undo computed from a stale view refuses with [Branch_moved] rather
+      than erase a commit - one the pump may already have floored and acked -
+      that landed after the witness was taken. The redo pointer is written
+      only after the move lands, so a refused undo leaves no trace: it never
+      clobbers the single redo slot. The D3 write-ref-first ordering is
+      deliberately reversed, and its cost is named: a crash between the move
+      and the ref write strands a moved head with no redo pointer - a lost
+      affordance, never lost data. *)
+
+  type redo_error =
+    | Nothing_to_redo  (** no redo pointer is set *)
+    | Branch_moved
+        (** a commit landed past the pointer; nothing was erased *)
+
+  val redo : session -> (model, redo_error) result Lwt.t
+  (** Undo's inverse, guarded structurally: the redo target's own first parent
+      is the head the pointer expects, so the forward move is a test-and-set
+      against it - a redo following any commit past the pointer, however long
+      after the undo, refuses with [Branch_moved] instead of erasing the
+      intervening work. The single-slot pointer is cleared only by the redo
+      that consumed it. *)
 
   val model_at : t -> S.commit -> model Lwt.t
   (** The model as of one specific commit. Takes the handle because reading is

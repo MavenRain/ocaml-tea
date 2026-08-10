@@ -864,16 +864,22 @@ let () =
        && parented_on (must "the foreign writer's commit ref" foreign_head) hist);
      Tags_store.close t)
 
-(* --- C15: CHARACTERIZATION, not a property ----------------------------------
-   This check pins TODAY's behaviour so residual R10b is falsifiable, and it is
-   expected to go RED when R10b is fixed. [undo] moves the head with a plain
-   [S.Head.set] (store_core.ml:662) while [checkpoint] does the same move by
-   test-and-set (store_core.ml:734), so the CAS a based commit just won buys
-   nothing against it: an acked commit is erased outright, and the delivery
-   floor stamped from its water is left claiming a commit the store no longer
-   holds: the forged witness the whole guard family exists to prevent. A fix
-   that makes undo refuse, merge, or otherwise preserve the acked write turns
-   both halves of this line red on purpose. *)
+(* --- C15: R10b closed (step 19) ----------------------------------------------
+   Until step 19 this was a labelled CHARACTERIZATION: [undo] moved the head
+   with a plain [S.Head.set] while [checkpoint] moved by test-and-set, so the
+   CAS a based commit had just won bought nothing against it - the acked
+   commit was erased outright and the delivery floor stamped from its water
+   was left claiming a commit the store no longer held, the forged witness
+   the whole guard family exists to prevent. [undo] now takes the caller's
+   [based] witness and test-and-sets the head against it, so the same stale
+   undo REFUSES with [Branch_moved]: the acked commit keeps its place on the
+   branch and its floor stays covered. This check fails on erasure.
+
+   The witness sits on a NON-ROOT commit ("kept") on purpose: a witness at
+   the root would refuse one arm earlier ([At_root], before the test-and-set
+   is ever consulted), and a reverted guard would then still pass. Only the
+   non-root shape makes the erasure observable, so only it kills the
+   [S.Head.set] revertant. *)
 
 let () =
   Lwt_main.run
@@ -885,18 +891,130 @@ let () =
        Tags_store.commit_based seed ~label:"seed"
          (fst (Tags_app.update ctx (Tags_app.Add_tag "seed") (Tags_store.based_model seed)))
      in
+     let* w = Tags_store.load_based s in
+     let* (_ : Tags_store.committed) =
+       Tags_store.commit_based w ~label:"kept"
+         (fst (Tags_app.update ctx (Tags_app.Add_tag "kept") (Tags_store.based_model w)))
+     in
+     (* The undo's witness: taken while "kept" stands, BEFORE the racer. *)
      let* a = Tags_store.load_based s in
      let* landed =
        Tags_store.commit_based a ~label:"acked"
          (fst (Tags_app.update ctx (Tags_app.Add_tag "acked") (Tags_store.based_model a)))
      in
-     let* (_ : Tags_app.model option) = Tags_store.undo s in
+     let* refused = Tags_store.undo a in
      let* head = Tags_store.load s in
      let* water = Tags_store.head_water s in
-     check "undo racing a based commit erases it (R10b characterization)"
-       (has "seed" head
-       && (not (has "acked" head))
-       && not (Water.covers ~head:water ~floor:landed.Tags_store.water));
+     let denied =
+       Result.fold refused
+         ~ok:(fun (_ : Tags_app.model) -> false)
+         ~error:(fun (e : Tags_store.undo_error) ->
+           match e with
+           | Tags_store.Branch_moved -> true
+           | Tags_store.At_root -> false)
+     in
+     check "undo racing a based commit refuses and erases nothing (R10b closed)"
+       (denied
+       && has "kept" head
+       && has "acked" head
+       && Water.covers ~head:water ~floor:landed.Tags_store.water);
+     (* The refusal left no trace: the redo slot was never stamped. This is
+        the step-19 ordering reversal made observable - a write-ref-first
+        undo would answer [Branch_moved] here (a real, stale pointer), not
+        [Nothing_to_redo]. *)
+     let* after = Tags_store.redo s in
+     check "a refused undo leaves the redo slot empty (Nothing_to_redo)"
+       (Result.fold after
+          ~ok:(fun (_ : Tags_app.model) -> false)
+          ~error:(fun (e : Tags_store.redo_error) ->
+            match e with
+            | Tags_store.Nothing_to_redo -> true
+            | Tags_store.Branch_moved -> false));
+     Tags_store.close t)
+
+(* --- C16: redo refuses past intervening work ---------------------------------
+   The redo pointer is single-slot and durable, and until step 19 [redo]
+   consumed it with a plain [S.Head.set]: undo, then any ordinary commit, then
+   redo silently discarded the commit - no concurrency required. [redo] now
+   test-and-sets against the pointer target's own first parent, exactly the
+   head the pointer expects, so a redo following intervening work refuses with
+   [Branch_moved] (and NOT [Nothing_to_redo]: the pointer is real, merely
+   stale) and the intervening commit survives. *)
+
+let () =
+  Lwt_main.run
+    (let* t = Tags_store.create ~now:(frozen 9_300) () in
+     let* s = Tags_store.session t (sid "redointervene") in
+     let ctx = Tags_store.ctx_of_session s in
+     let* w0 = Tags_store.load_based s in
+     let* (_ : Tags_store.committed) =
+       Tags_store.commit_based w0 ~label:"one"
+         (fst (Tags_app.update ctx (Tags_app.Add_tag "one") (Tags_store.based_model w0)))
+     in
+     let* w1 = Tags_store.load_based s in
+     let* (_ : Tags_store.committed) =
+       Tags_store.commit_based w1 ~label:"two"
+         (fst (Tags_app.update ctx (Tags_app.Add_tag "two") (Tags_store.based_model w1)))
+     in
+     let* w2 = Tags_store.load_based s in
+     let* undone = Tags_store.undo w2 in
+     check "C16 rig: a fresh-witness undo of \"two\" lands (Ok)" (Result.is_ok undone);
+     let* w3 = Tags_store.load_based s in
+     let* (_ : Tags_store.committed) =
+       Tags_store.commit_based w3 ~label:"three"
+         (fst (Tags_app.update ctx (Tags_app.Add_tag "three") (Tags_store.based_model w3)))
+     in
+     let* redone = Tags_store.redo s in
+     let* head = Tags_store.load s in
+     let stale_pointer =
+       Result.fold redone
+         ~ok:(fun (_ : Tags_app.model) -> false)
+         ~error:(fun (e : Tags_store.redo_error) ->
+           match e with
+           | Tags_store.Branch_moved -> true
+           | Tags_store.Nothing_to_redo -> false)
+     in
+     check "redo past intervening work refuses; the intervening commit survives"
+       (stale_pointer && has "three" head && has "one" head && not (has "two" head));
+     Tags_store.close t)
+
+(* --- C17: fork's write is an atomic absent-check -----------------------------
+   fork's no-op premise ("the destination is empty") was checked and then
+   acted on in two separate steps; a racer's commit landing on the destination
+   between them was silently overwritten by fork's copy of [from]'s head.
+   Step 19 makes the write a [test_and_set ~test:None] - Irmin's own
+   must-be-absent idiom - so the racer's commit survives and it is fork's
+   copy that is discarded, the same arm the non-empty observation takes.
+   [?interpose] fires in exactly that window, in program order. *)
+
+let () =
+  Lwt_main.run
+    (let* t = Tags_store.create ~now:(frozen 9_600) () in
+     let* src = Tags_store.session t (sid "forksrc") in
+     let src_ctx = Tags_store.ctx_of_session src in
+     let* w = Tags_store.load_based src in
+     let* (_ : Tags_store.committed) =
+       Tags_store.commit_based w ~label:"src"
+         (fst (Tags_app.update src_ctx (Tags_app.Add_tag "src") (Tags_store.based_model w)))
+     in
+     let dst_sid = sid "forkdst" in
+     (* A second handle onto the destination branch: the racer. *)
+     let* racer = Tags_store.session t dst_sid in
+     let racer_ctx = Tags_store.ctx_of_session racer in
+     let interpose () =
+       let* rw = Tags_store.load_based racer in
+       let* (_ : Tags_store.committed) =
+         Tags_store.commit_based rw ~label:"racer"
+           (fst
+              (Tags_app.update racer_ctx (Tags_app.Add_tag "racer")
+                 (Tags_store.based_model rw)))
+       in
+       Lwt.return_unit
+     in
+     let* forked = Tags_store.fork ~interpose t ~from:src dst_sid in
+     let* head = Tags_store.load forked in
+     check "fork discards its own copy when a racer lands first (racer survives)"
+       (has "racer" head && not (has "src" head));
      Tags_store.close t)
 
 (* --- S1: the server step seam -----------------------------------------------
@@ -1037,5 +1155,6 @@ let () =
      The witnessed write path holds under contention: both writers survive \
      (C1-C6), the ancestor is re-based (C7), the declared arms are legible \
      (C8-C10), the pack round trip stands (C11-C12), the coalescer reconciles \
-     (C13-C14), R10b is pinned (C15), and the server seam carries it (S1-S2).\n\
+     (C13-C14), R10b is closed (C15-C17: undo, redo and fork refuse instead\n\
+     of erasing), and the server seam carries it (S1-S2).\n\
      %!"

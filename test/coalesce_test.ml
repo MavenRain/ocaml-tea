@@ -38,11 +38,12 @@ let () =
      check "the folded model is the full 3-step fold (count = 4)" (value m = 4);
 
      (* (c) undo after the burst restores the pre-burst model. *)
-     let* undone = Store.undo sa in
+     let* wa = Store.load_based sa in
+     let* undone = Store.undo wa in
      let undo_ok =
-       match undone with
-       | Some u -> value u = 1
-       | None -> false
+       Result.fold undone
+         ~ok:(fun u -> value u = 1)
+         ~error:(fun (_ : Store.undo_error) -> false)
      in
      check "undo after a burst is whole-run (back to pre-burst count = 1)" undo_ok;
 
@@ -62,11 +63,12 @@ let () =
      let* hist2 = Store.history sb in
      check "a policy None boundary yields two commits (run, then boundary msg)"
        (List.length hist2 = 2);
-     let* undone2 = Store.undo sb in
+     let* wb = Store.load_based sb in
+     let* undone2 = Store.undo wb in
      let one_back =
-       match undone2 with
-       | Some u -> value u = 2
-       | None -> false
+       Result.fold undone2
+         ~ok:(fun u -> value u = 2)
+         ~error:(fun (_ : Store.undo_error) -> false)
      in
      check "undo then steps exactly one boundary back (count = 2)" one_back;
 
@@ -80,11 +82,12 @@ let () =
      check "Keep_all parity: three increments -> count = 3" (value m3 = 3);
      check "Keep_all parity: history has one commit per update (3)"
        (List.length hist3 = 3);
-     let* u3 = Store.undo sd in
+     let* wd = Store.load_based sd in
+     let* u3 = Store.undo wd in
      let keep_all_undo =
-       match u3 with
-       | Some u -> value u = 2
-       | None -> false
+       Result.fold u3
+         ~ok:(fun u -> value u = 2)
+         ~error:(fun (_ : Store.undo_error) -> false)
      in
      check "Keep_all parity: undo walks one commit (count = 2)" keep_all_undo;
 

@@ -110,9 +110,12 @@ let () =
      check "and that one path is the field actually edited (likes)" (changed = [ "likes" ]);
 
      (* Undo still walks commits, so exploding did not break history. *)
-     let* undone = Mem.undo s in
+     let* wu = Mem.load_based s in
+     let* undone = Mem.undo wu in
      check "undo over an exploded tree restores the previous model (likes back to 2)"
-       (Option.fold undone ~none:false ~some:(fun m -> likes_of m = 2));
+       (Result.fold undone
+          ~error:(fun (_ : Mem.undo_error) -> false)
+          ~ok:(fun m -> likes_of m = 2));
 
      (* Two exploded sessions still converge: the per-path merge dispatches the
         per-field joins, which is the reason D6 waits on D1. *)

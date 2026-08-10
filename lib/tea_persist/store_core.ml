@@ -62,7 +62,12 @@ module type CORE = sig
   val session : t -> Tea_core.Prim.Session_id.t -> session Lwt.t
   val main_session : t -> session Lwt.t
   val main_replica : Tea_core.Crdt.Replica.t
-  val fork : t -> from:session -> Tea_core.Prim.Session_id.t -> session Lwt.t
+  val fork :
+    ?interpose:(unit -> unit Lwt.t) ->
+    t ->
+    from:session ->
+    Tea_core.Prim.Session_id.t ->
+    session Lwt.t
   val load : session -> model Lwt.t
   val commit : session -> label:string -> model -> Tea_core.Prim.Store_water.t Lwt.t
 
@@ -86,8 +91,17 @@ module type CORE = sig
   val apply : session -> msg -> model Lwt.t
   val head_ref : session -> Tea_core.Prim.Commit_ref.t option Lwt.t
   val history : session -> Tea_core.Prim.Commit_ref.t list Lwt.t
-  val undo : session -> model option Lwt.t
-  val redo : session -> model option Lwt.t
+  type undo_error =
+    | At_root
+    | Branch_moved
+
+  val undo : based -> (model, undo_error) result Lwt.t
+
+  type redo_error =
+    | Nothing_to_redo
+    | Branch_moved
+
+  val redo : session -> (model, redo_error) result Lwt.t
   val model_at : t -> S.commit -> model Lwt.t
 
   type watch = S.watch
@@ -252,8 +266,16 @@ struct
       already holds committed work it is returned unchanged, so a reused or
       double-forked [sid] can never silently lose history to a forced head move
       (R3-adjacent). Re-seeding a diverged session is a {!merge_into}, not a
-      fork. *)
-  let fork (t : t) ~(from : session) (sid : Tea_core.Prim.Session_id.t) : session Lwt.t =
+      fork.
+
+      The write is an atomic absent-check (step 19, R10b): a racer's commit
+      landing on [sid]'s branch between fork's own observation and its write
+      survives, and it is fork's copy that is discarded - the same no-op arm
+      the non-empty observation takes. [?interpose] (default no-op) fires in
+      that window; it exists so the property is testable in program order,
+      mirroring the {!Tea_server.step} seam. *)
+  let fork ?(interpose : unit -> unit Lwt.t = fun () -> Lwt.return_unit) (t : t)
+      ~(from : session) (sid : Tea_core.Prim.Session_id.t) : session Lwt.t =
     let* dst = session t sid in
     let* dst_head = S.Head.find dst.branch in
     match dst_head with
@@ -263,7 +285,8 @@ struct
       match head with
       | None -> Lwt.return dst
       | Some c ->
-        let* () = S.Head.set dst.branch c in
+        let* () = interpose () in
+        let* (_ : bool) = S.Head.test_and_set dst.branch ~test:None ~set:(Some c) in
         Lwt.return dst)
 
   (* D6: the (path, value) writes one model becomes — the single whole-blob
@@ -650,39 +673,79 @@ struct
     | None -> Lwt.return []
     | Some c -> walk c []
 
-  (** Move the branch head back one commit. Returns the restored model, or
-      [None] when already at the root. Crash-safe redo (D3): the pre-undo head
-      is durably recorded on the session's [redo-] ref {i before} the head
-      moves back (write-ref-first). A crash between the two strands only a
-      harmless redo pointer at [c] — which is still the branch head until the
-      move lands — instead of a moved head with no way back and an orphaned
-      commit. *)
-  let undo (s : session) : A.model option Lwt.t =
-    let* head = S.Head.find s.branch in
-    Option.fold head ~none:(Lwt.return None) ~some:(fun c ->
+  type undo_error =
+    | At_root
+    | Branch_moved
+
+  (** Move the branch head back one commit, guarded by the caller's witness
+      (step 19, R10b): the move is a test-and-set against [b]'s head, so an
+      undo computed from a stale view refuses with [Branch_moved] rather than
+      erase a commit - one the pump may already have floored and acked - that
+      landed after the witness was taken. [At_root] covers the empty witness,
+      the root, and a GC-hollow parent alike. The redo pointer is written only
+      inside the won move, so a refused undo leaves no trace: it never
+      clobbers the single redo slot with a stale, permanently GC-exempt
+      pointer. That reverses D3's write-ref-first ordering on purpose, and the
+      cost is named: a crash between the won move and the ref write strands a
+      moved head with no redo pointer - a lost affordance, never lost data. *)
+  let undo (b : based) : (A.model, undo_error) result Lwt.t =
+    let s = b.session in
+    Option.fold b.head
+      ~none:(Lwt.return (Error At_root))
+      ~some:(fun c ->
         match S.Commit.parents c with
-        | [] -> Lwt.return None
+        | [] -> Lwt.return (Error At_root)
         | pkey :: (_ : S.commit_key list) ->
           let* p = commit_of_key_opt s.repo pkey in
-          Option.fold p ~none:(Lwt.return None) ~some:(fun pc ->
-              let* redo = S.of_branch s.repo (redo_ref_name s) in
-              let* () = S.Head.set redo c in
-              let* () = S.Head.set s.branch pc in
-              let* model = load s in
-              Lwt.return (Some model)))
+          Option.fold p
+            ~none:(Lwt.return (Error At_root))
+            ~some:(fun pc ->
+              let* moved = S.Head.test_and_set s.branch ~test:b.head ~set:(Some pc) in
+              if moved then
+                let* redo = S.of_branch s.repo (redo_ref_name s) in
+                let* () = S.Head.set redo c in
+                (* Read through the commit the won move named, fenced (D19):
+                   never the branch, which may have moved again by now. *)
+                let* model = fenced_model_at s.exploded pc in
+                Lwt.return (Ok model)
+              else Lwt.return (Error Branch_moved)))
 
-  (** Undo's inverse: read the session's durable [redo-] pointer, move the head
-      forward onto it, and clear the pointer. [None] when there is nothing to
-      redo. The pointer is single-slot, so a fresh commit or a further undo
-      overwrites it; redo restores exactly the last undone step. *)
-  let redo (s : session) : A.model option Lwt.t =
+  type redo_error =
+    | Nothing_to_redo
+    | Branch_moved
+
+  (** Undo's inverse, guarded structurally (step 19, R10b): the redo target's
+      own first parent is exactly the head the pointer expects - commits are
+      immutable, and a guarded {!undo} never stamps a rootless target - so the
+      forward move is a test-and-set against that parent. A redo following any
+      commit past the pointer, however long after the undo, refuses with
+      [Branch_moved] instead of erasing the intervening work (the unconditional
+      move this replaces silently discarded it even with zero concurrency).
+      The single-slot pointer is cleared only inside the won move: a denied
+      redo never consumes a pointer it did not redeem. [Nothing_to_redo] also
+      covers a rootless or GC-hollow target, which no guarded undo mints. *)
+  let redo (s : session) : (A.model, redo_error) result Lwt.t =
     let* redo_b = S.of_branch s.repo (redo_ref_name s) in
     let* target = S.Head.find redo_b in
-    Option.fold target ~none:(Lwt.return None) ~some:(fun c ->
-        let* () = S.Head.set s.branch c in
-        let* () = S.Branch.remove s.repo (redo_ref_name s) in
-        let* model = load s in
-        Lwt.return (Some model))
+    Option.fold target
+      ~none:(Lwt.return (Error Nothing_to_redo))
+      ~some:(fun c ->
+        match S.Commit.parents c with
+        | [] -> Lwt.return (Error Nothing_to_redo)
+        | pkey :: (_ : S.commit_key list) ->
+          let* pc = commit_of_key_opt s.repo pkey in
+          Option.fold pc
+            ~none:(Lwt.return (Error Nothing_to_redo))
+            ~some:(fun expected ->
+              let* moved =
+                S.Head.test_and_set s.branch ~test:(Some expected) ~set:(Some c)
+              in
+              if moved then
+                let* () = S.Branch.remove s.repo (redo_ref_name s) in
+                (* Read through the commit the won move named, fenced (D19). *)
+                let* model = fenced_model_at s.exploded c in
+                Lwt.return (Ok model)
+              else Lwt.return (Error Branch_moved)))
 
   type watch = S.watch
 

@@ -47,7 +47,7 @@ toolchain removes an entire tier lean-tea had to hand-write.
 | `Tea_core.Prim.Store_water` + the water-stamped `Advance` frame (tag `'\003'`) + `Guard_file.open_ ~head_water` boot filter with the four-way `verdict` - every durable floor carries the head water of its own session branch, and a restored/rolled-back pack root drops exactly the floors it no longer covers | **built, green** (roadmap step 13, D18) |
 | `test/guard_water_test` (W1-W6 real waters on a pack store incl. a real dir-copy snapshot/restore, G1-G8 hand-built floors) + C1-C3 in `guard_sink_test` + browser B8 three-lives rollback scenario | **passes** (confirmed by mutation) |
 | `Store_core.based`/`load_based`/`based_model`/`committed`/`commit_based` + `commit_coalesced` and `append_commit` re-pinned to the witness + `step_with ?interpose` taking the token - the TEA step is a compare-and-set whose denial reconciles through the app's own `Merge_spec.t` instead of refusing or re-running, and `shared_doc_serve`'s `Lwt_mutex` is retired | **built, green** (roadmap step 14, D19) |
-| `test/contention_test` C1-C15, S1-S2 over four local apps (`Or_set`, a merging `Three_way`, a refusing `Three_way`, `Last_write_wins`) - the program-order interleave, distinct dots, parentage, the winning round's water, round count, the true ancestor across two rounds, both non-CRDT arms, a reap under the witness, pack close/reopen for both write arms, the coalesced append and the interrupted amend, undo as an R10b characterization, and the server seam through `?interpose` | **passes** (confirmed by mutation, except C11/C12 which are pins: see roadmap 14) |
+| `test/contention_test` C1-C17, S1-S2 over four local apps (`Or_set`, a merging `Three_way`, a refusing `Three_way`, `Last_write_wins`) - the program-order interleave, distinct dots, parentage, the winning round's water, round count, the true ancestor across two rounds, both non-CRDT arms, a reap under the witness, pack close/reopen for both write arms, the coalesced append and the interrupted amend, the undo/redo/fork refusals (R10b closed, step 19), and the server seam through `?interpose` | **passes** (confirmed by mutation, except C11/C12 which are pins: see roadmap 14) |
 | `Cmd.Http_delivery` + `Cmd.http_keyed` + `Tea_rpc.Key`/`keyed_resp`/`Applied_reply_lost` + `Tea_server.Reply_cache`/`Rpc_once`/`routes_once ?on_taken` + `Tea_client.Rpc_delivery` + a second `Guard_file` journal at `<root>.guard/rpc` behind `Tea_server_pack.open_guards` + `Durable_guard ?mirror` - the RPC tier routed through the D15-D18 guard family as a second channel (server-derived floor tabs, a bounded newest-reply cache, the `Mutating` 200 enveloped), with the floors mirror bounded as the ride-along | **built, green** (roadmap step 15, D20) |
 | `test/rpc_once_test` (incl. T1's ordering arm: the keyed 200 waits for the floor's append), `test/rpc_pack_once_test` (the native B10: two lives over one pack root), `test/rpc_window_test` (the `?on_taken` two-writer checks), `test/reply_cache_test`, `test/rpc_delivery_test`, `test/rpc_journal_test`, `test/pack_guards_test` + browser B9/B10 lost-response scenarios | **passes** (confirmed by mutation: 19 ids, full dual-suite sweep) |
 | `live_session` teardown restructured (`handle_frame` never a cancellation target, sender death a `Lwt.wait`-based `died` signal raced through `Lwt.choose`) + ONE `Lwt.protected` span over `step_ws` and both `persist_taken` arms - cancellation atomicity for the take-to-ack span | **built, green** (roadmap step 16, D21) |
@@ -1430,8 +1430,10 @@ Each lean-tea private-constructor primitive → an OCaml `.mli` boundary:
   QCheck framework is not in the switch, so those laws run over a seeded
   generator loop instead (same idea, zero new deps).
 - **R3 (med) - branch/Lwt lifecycle leaks.** Abandoned session branches pin
-  history. Mitigation: a reaper keyed to Dream session expiry; order undo writes
-  so a crash strands a harmless redo pointer, never a lost head.
+  history. Mitigation: a reaper keyed to Dream session expiry; undo stamps its
+  redo pointer only inside a won, guarded head move (step 19 reversed the old
+  write-ref-first order: a refused undo must leave no trace, so the crash
+  window now strands only the redo affordance, never a head and never data).
 - **R4 (med) - Irmin watch latency on the git FS backend.** Live view may lag.
   Mitigation: `irmin-pack` or an in-process pub/sub over `S.watch`.
 - **R5 (med) - Repr must behave identically under js_of_ocaml.** Shared-codec
@@ -1492,16 +1494,37 @@ Each lean-tea private-constructor primitive → an OCaml `.mli` boundary:
   `Irmin_mem` with an `Add_tag` that emits `Cmd.none` there is no Lwt yield
   between load and commit, so deleting the lock left `test/csrf_test` green,
   verified by mutation). Residuals below carry what D19 does *not* close.
-- **R10b (low) - unguarded head moves erase acked commits.** `undo`, `redo` and
-  `fork` still move the head with an unconditional `S.Head.set`, so a commit the
-  pump has already floored and acked can be erased by a racing undo. The fix is
-  mechanically small and semantically large (it forces a decision about what a
-  racing undo *means*: refuse, merge, or win positionally) and under `Crdt_join`
-  a later reconcile can rejoin undone content anyway, so it deserves its own
-  record rather than a line in D19. `fork` is the mildest of the three: it
-  writes only inside a branch it has just observed to be absent. Pinned as
-  behaviour by C15, a labelled characterization check, so a future fix turns it
-  red on purpose rather than by surprise.
+- **R10b (CLOSED in step 19) - unguarded head moves erase acked commits.**
+  `undo`, `redo` and `fork` moved the head with an unconditional `S.Head.set`,
+  so a commit the pump had already floored and acked could be erased by a
+  racing head move. Step 19 owns the deferred ruling, and the ruling is
+  **refuse**: `undo` takes the caller's `based` witness and test-and-sets the
+  head against it (`Branch_moved` on a lost race; `At_root` for the empty,
+  root and GC-hollow arms); `redo` derives the head it expects structurally -
+  the redo target's own first parent - and test-and-sets against that, which
+  closes both the race and the purely sequential stale-pointer erasure (undo,
+  then ordinary commits, then redo used to discard the intervening work with
+  zero concurrency); `fork`'s write becomes Irmin's own must-be-absent idiom,
+  `test_and_set ~test:None`, a positional win in which the racer's commit
+  survives and fork's own copy takes the same no-op arm a non-empty
+  observation takes. Merge was rejected for undo/redo: R10c's ours/theirs
+  machinery has no content pair here - these are navigation, not writes.
+  Two costs are chosen and named rather than hidden. D3's write-ref-first
+  ordering is reversed: the redo pointer is stamped only inside a won move,
+  so a refused undo leaves no trace and can never clobber the single,
+  permanently GC-exempt redo slot; the price is that a crash between the won
+  move and the ref write strands a moved head with no redo pointer - a lost
+  affordance, never lost data. And the HTTP tier captures its witness at
+  request-processing time (`load_based` inside `handle_undo`), which closes
+  the store-tier window but not the browser's think-time staleness; a denied
+  undo surfaces as a distinct redirect (`/?undo=denied`) instead of a
+  success-shaped one. C15 is re-cut from a labelled characterization into a
+  behaviour check that fails on erasure; C16 and C17 pin redo and fork; a
+  `server_test` flow pins the surfaced denial through the full middleware
+  stack; and the refusal-leaves-no-trace ordering is its own check. Still
+  open, recorded here: `retain`'s spine move stays an unguarded `Head.set`
+  (outside the step's named scope), and under `Crdt_join` a later reconcile
+  can rejoin undone content - unchanged, per this register's own text.
 - **R10c (low) - the non-CRDT arms keep content only for the writer that was
   already acked.** For a `Three_way` app whose merge returns `Error`, and for a
   `Last_write_wins` app, D19 keeps `ours` and demotes `theirs` to history.
@@ -2367,7 +2390,18 @@ Each lean-tea private-constructor primitive → an OCaml `.mli` boundary:
     racing head move. The step owns the semantic ruling the register
     defers - what a racing undo *means*: refuse, merge, or win
     positionally - and turns C15 from a labelled characterization pin
-    into a behaviour check that fails on erasure. **Planned.**
+    into a behaviour check that fails on erasure. **Done.** (Ruling:
+    refuse. `undo` test-and-sets against the caller's `based` witness;
+    `redo` against the redo target's own first parent, which also closes
+    the sequential stale-pointer erasure; `fork` against an absent head,
+    the racer's commit surviving. A denied undo surfaces as
+    `/?undo=denied`. The D3 write-ref-first ordering is reversed so a
+    refused undo leaves no trace, at the named cost of a crash window
+    that strands only the redo affordance, never data. C15 re-cut to
+    fail on erasure; C16, C17, the server-tier denial flow and the
+    empty-slot check added; 8-mutant sweep, 8/8 killed on their
+    predicted checks; suite baseline 1186 native checks across 47
+    executables.)
 20. **Kill-tolerant floor/commit ordering** - narrow R11 (§10): a
     `kill -9` can still drop the unacknowledged in-flight tail, because
     the journal reaches the page cache per record while irmin-pack
