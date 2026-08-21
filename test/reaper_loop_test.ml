@@ -150,6 +150,40 @@ let () =
      check "L5: zero sweeps ran" (!entered5 = 0);
      check "L5: zero timers were minted" (List.length !armed5 = 0);
 
+     (* --- L7: a rejecting sweep is fenced (step 22 follow-up) ------------ *)
+     (* Nothing on the sweep path is exception-free by contract: irmin raises.
+        Unfenced, the FIRST rejection would end every future sweep silently
+        and reject the loop's promise - which on the pack tier poisons the
+        [Lwt.join] and skips the ordered teardown behind [Lwt_main.run]. The
+        fence turns a rejected sweep into one stderr line and a zero round;
+        the loop's own promise never rejects. *)
+     let entered7 = ref 0 in
+     let armed7, timer7 = mk_timer () in
+     let stop7, wake_stop7 = Lwt.wait () in
+     let loop7 =
+       Reaper.loop
+         ~sweep:(fun ~now:(_ : int64) ->
+           entered7 := !entered7 + 1;
+           if !entered7 = 1 then Lwt.fail Stdlib.Exit else Lwt.return 0)
+         ~now:(fun () -> 0L) ~timer:timer7 ~every ~stop:stop7
+     in
+     let* () = settle () in
+     fire "L7 first tick (the rejecting sweep)" armed7;
+     let* () = settle () in
+     check "L7: the rejected sweep neither resolved nor rejected the loop"
+       (match Lwt.state loop7 with
+        | Lwt.Sleep -> true
+        | Lwt.Return () -> false
+        | Lwt.Fail (_ : exn) -> false);
+     check "L7: a fresh timer is armed after the rejected round"
+       (List.length !armed7 = 1);
+     fire "L7 second tick" armed7;
+     let* () = settle () in
+     check "L7: the loop swept again after the rejection (still alive)" (!entered7 = 2);
+     Lwt.wakeup_later wake_stop7 ();
+     let* () = settle () in
+     check "L7: stop resolves the loop with Return, never Fail" (resolved loop7);
+
      Printf.printf
        "\nThe reaper loop sweeps per tick, never before the first, and stop always wins (D24).\n%!";
      Lwt.return_unit)

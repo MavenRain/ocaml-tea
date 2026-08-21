@@ -324,8 +324,21 @@ module type CORE = sig
     int Lwt.t
   (** Sweep expired session branches: remove every non-reserved branch whose
       head [Info] date (a {!Clock} stamp) is older than [now - ttl]; [main],
-      the [__checkpoints] spine and every [redo-] pointer are never swept.
-      Returns the number removed (D3).
+      the [__checkpoints] spine and every [redo-] pointer are never swept
+      INDEPENDENTLY. Returns the number removed (D3).
+
+      The enforced ttl span is {!Tea_core.Prim.Ttl.whole_seconds} (ceil, in
+      whole seconds - the same value the serve banners announce), and a won
+      removal takes the victim's [redo-] pointer with it: the slot has no
+      other reclaim path once its branch is gone, and leaving it would leak
+      one branch ref per reaped session that undid without redoing. The
+      companion removal runs {i after} the won head TAS (removing it first
+      would erase a racing winner's redo slot) and is itself a test-and-set
+      against the pointer value read after the win - a session id reused
+      inside that window can mint a fresh pointer, and the failing TAS
+      leaves it standing rather than clobbering a live affordance. One
+      leaked ref per crash between the two removals is the accepted
+      residue.
 
       [?forget] is called with each victim's session id {i before} its branch
       is removed (default: nothing, today's behaviour exactly, and the

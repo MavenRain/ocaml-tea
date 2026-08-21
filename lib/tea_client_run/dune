@@ -5,4 +5,6 @@
  ; (key_header, Key.to_string): the runtime keys the header the server parses,
  ; from the same module, so a one-byte drift is a compile error rather than a
  ; silent fall back to at-least-once (T3/T20).
- (libraries tea_client tea_rpc vdom ojs))
+ ; tea_core and vdom.base are explicit under (implicit_transitive_deps
+ ; false): tea_client_run.ml names Tea_core.* and (_, _) Vdom.app directly.
+ (libraries tea_core tea_client tea_rpc vdom vdom.base ojs))

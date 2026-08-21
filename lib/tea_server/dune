@@ -1,3 +1,11 @@
 (library
  (name tea_server)
- (libraries tea_core tea_safe tea_persist tea_rpc repr dream lwt lwt.unix))
+ ; [unix] is explicit, not transitive: [session_secret.ml]'s resolver calls
+ ; [Unix.openfile]/[read]/[fsync]/... directly (the tea_persist precedent).
+ ; [irmin] is signature-visibility only under (implicit_transitive_deps
+ ; false): the [Handlers] functor's store parameter is spelled in
+ ; [Tea_persist.Store_core] types whose equalities mention irmin's module
+ ; types. The sink gate still refuses any [Irmin*] token in this library's
+ ; SOURCE - listing a library is not speaking it.
+ (libraries tea_core tea_safe tea_persist tea_rpc repr unix irmin dream lwt
+   lwt.unix))

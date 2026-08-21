@@ -27,7 +27,22 @@ let loop ~(sweep : now:int64 -> int Lwt.t) ~(now : unit -> int64)
     else
       let* () = Lwt.choose [ timer every; stop ] in
       if Lwt.is_sleeping stop then
-        let* (_ : int) = sweep ~now:(now ()) in
+        (* The sweep is fenced: nothing on its path is exception-free by
+           contract (irmin raises), and an unfenced rejection would end
+           every future sweep silently AND reject this promise - which on
+           the pack tier poisons the [Lwt.join] with [Dream.serve] and
+           skips the ordered teardown behind [Lwt_main.run]. A rejected
+           sweep is one stderr line and a zero round; the loop's own
+           promise never rejects. *)
+        let* (_ : int) =
+          Lwt.catch
+            (fun () -> sweep ~now:(now ()))
+            (fun (exn : exn) ->
+              Printf.eprintf
+                "tea_server: reaper: sweep failed (%s); the loop continues at the next tick\n%!"
+                (Printexc.to_string exn);
+              Lwt.return 0)
+        in
         go ()
       else Lwt.return_unit
   in

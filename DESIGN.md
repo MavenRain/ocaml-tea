@@ -56,7 +56,9 @@ toolchain removes an entire tier lean-tea had to hand-write.
 | `test/store_identity_test`, `test/guard_identity_test` (I1-I13: both channels, the bottom-water stranger, the legacy adopt, the compaction round-trip, the Unresolved hold, its recovery and its held-file byte identity, the foreign header, the corrupt head) + `test/identity_explain_test` boot-log truthfulness + `pack_guards_test` header independence + `archive_gc_test` post-GC survival + `rpc_pack_once_test`'s end-to-end mismatch control | **passes** (confirmed by mutation: 12 s18 ids 12/12 killed + 5 review-fix ids) |
 | `Durable_guard ?fence` (called between the mirror advance and the sink append, inside the existing catch so a rejecting fence degrades to `Error (Io _)` with no floor appended) + `Store_pack.flush` (`Pack.flush`, rejecting on failure so `persist`'s catch is what degrades it) + `open_guards ?fence` behind a new trailing unit (the journal-open-failed null-sink arm composes fenceless) + `serve_pack` wiring `Store.flush repo` non-overridably - the D16 floor/commit ordering pinned as this repo's own invariant, after step 20's differential probe refuted R11's premise: irmin-pack 3.11 already ends every commit batch in `File_manager.flush`, so the fence meets a clean buffer, and an upstream that stops flushing cannot silently reopen R11 | **built, green** (roadmap step 20, R11) |
 | `test/commit_fence_test` (the fence;append;fence;append spy order, a rejecting fence appending nothing, `forget` never ticking the fence), `test/store_pack_flush_test` (commit bytes already on disk at commit-resolve, flush a byte-identical no-op, flush on a closed repo rejecting), `test/hot_copy_water_test` (a hot copy of a live unclosed root carries the commit and keeps its floor), `test/unwitnessed_rollback_pin_test` (the unwitnessed remainder pinned as R15 leaves it), `test/kill_durability_test` (real fork + SIGKILL reps; the unfenced arm is the upstream-drift alarm) | **passes** (confirmed by mutation: the fence-deleted and fence-reordered mutants killed on the ordering spy, the flush-emptied and swallow-re-introduced mutants on the closed-repo rejection pin; the serve_pack-wiring no-op mutant documented weak - behaviourally indistinguishable exactly because the upstream batch-end flush holds - and the null-sink mutant void, that arm composing fenceless by design) |
-| `lib/tea_server/reaper.{ml,mli}` (`Cadence` newtype + `spec` + the injected-timer `loop`: choose-not-pick, `is_sleeping` stop gates on both sides, zero sweeps before the first tick, a sweep in flight completes before the promise resolves) + `Store_core.reap` removal hardened to `Head.test_and_set ~test:(Some c) ~set:None` (a raced victim is kept, whole and uncounted; `?forget` still first) + `Tea_server_pack.forget_into` (ws-channel tombstone; a sink `Error` is one stderr line and the sweep continues) + `serve_pack ?reaper` (`Lwt.join` with `Dream.serve` inside the first `Lwt_main.run`, shared signal-woken stop) + `Make.serve ?reaper` (entry-point guard mint shared with the pipeline, never-stop `Lwt.async` loop) | **built, green** (roadmap step 22, D24) |
+| `lib/tea_server/reaper.{ml,mli}` (`Cadence` newtype + `spec` + the injected-timer `loop`: choose-not-pick, `is_sleeping` stop gates on both sides, zero sweeps before the first tick, a sweep in flight completes before the promise resolves, a rejecting sweep is fenced to one stderr line so the loop's promise never rejects) + `Store_core.reap` removal hardened to `Head.test_and_set ~test:(Some c) ~set:None` (a raced victim is kept, whole and uncounted; `?forget` still first) + `Tea_server_pack.forget_into` (ws-channel tombstone; a sink `Error` is one stderr line and the sweep continues) + `serve_pack ?reaper` (`Lwt.join` with `Dream.serve` inside the first `Lwt_main.run`, shared signal-woken stop) + `Make.serve ?reaper` (entry-point guard mint shared with the pipeline, never-stop `Lwt.async` loop) | **built, green** (roadmap step 22, D24) |
+| `(implicit_transitive_deps false)` (dune-project) + explicit deps on every stanza that leaned on transitive reach (`tea_client_run` += `tea_core vdom.base`, `tea_server` += `unix` + signature-visibility `irmin`, `tea_server_pack` += `unix`, `test/` += `unix irmin`, example stanzas' functor-signature deps) + `examples/shared_doc/server` mem tier on `Make.serve ~rpc_once` (the hand-rolled `Dream.run`/`Dream.logger` pair retired from `main.ml`, mirroring its own pack arm and the counter binary) | **built, green** (roadmap step 23, R7/R8) |
+| `test/sink_gate_test` (own zero-library stanza with `source_tree` deps; byte-blanking comment/string stripper incl. nested comments, strings-inside-comments AND char-literals-inside-comments per OCaml's lexer; any spelling of a sink occurrence flagged - qualified path, open/include/let-open, module alias, functor argument; Irmin family prefix; five audited namespaces incl. `Lwt_io`; pinned `(file, namespace)` allowlist, default-deny `file:line`, load-bearing entry self-check; exact-count anti-vacuity pins 72 `lib/` files / 24 `Unix` occurrences in `session_secret.ml`; planted RED/GREEN inline fixtures; `csrf_test` existence + >= 30 check-lines pin) | **passes** (confirmed by mutation: M1-M8 killed on predicted checks, both stripping directions; roadmap step 23) |
 | `test/reaper_loop_test` (L1-L6: queue-backed timer, stop-wins-ties, sweep-completes-before-resolve, `Lwt.state` anti-hang assertions), `test/reaper_wiring_test` (W1/W2/W4: a real journal-backed guard on a real pack root, the Forget tombstone honored across a reopen against the pre-sweep head snapshot, the replay reading Fresh, sweep continuation past a closed sink, reserved refs never reaching the hook), `reaper_test` += T-RACE (the racing commit preserved and uncounted) + T-BOUND (the strict cutoff) | **passes** (confirmed by mutation: M1-M12, 11/11 runnable killed on their predicted checks; M11 `serve_pack` join documented weak - no native harness binds a port) |
 
 Toolchain: OCaml 5.3.0, dune 3.24, a dedicated opam switch (`irmin-tea` locally) with
@@ -1324,10 +1326,23 @@ nothing is lost.
 > Fresh, visible duplicate; (b) crash after the removal - nothing
 > pending; (c) forget `Error`, then removal, then crash - a journal
 > floor over a dead branch, dropped by the D18 boot filter at the next
-> boot, duplicate; (d) a commit racing the sweep - the TAS fails, the
-> branch is kept, the already-fired forget is a spurious duplicate-side
-> tombstone; (e) stop during a sweep - the join completes the sweep
-> before the teardown closes anything. The mem tier reaps too: its
+> boot, duplicate - for a WATERED floor; a bottom-water floor (the ws
+> pump's fuel-poison mint) is kept on trust by the filter before
+> `head_water` is consulted, so a failed Forget leaves it standing
+> across every later boot, the named residue, pinned beside the watered
+> arm by `reaper_wiring_test` W5; (d) a commit racing the sweep - the
+> TAS fails, the branch is kept, the already-fired forget is a spurious
+> duplicate-side tombstone; (e) stop during a sweep - the join
+> completes the sweep before the teardown closes anything; (f) the
+> sweep itself rejects - fenced in `Reaper.loop` (step-22 follow-up):
+> nothing on the sweep path is exception-free by contract (irmin
+> raises, and only `Branch.find` was fenced inside `reap`), and
+> unfenced, the first rejection ended every future sweep silently AND
+> rejected the joined promise, which made `Lwt_main.run` raise at stop
+> and skip the ordered `Store.close`-then-journals teardown; now a
+> rejected sweep is one stderr line and a zero round, the loop's
+> promise never rejects, and L7 pins alive-after-rejection plus
+> Return-never-Fail. The mem tier reaps too: its
 > in-RAM floors are exactly as loss-prone after a reap as durable ones,
 > so `Make.serve ?reaper` mints the guard AT the entry point (the
 > router's own null-sink construction, the `?guard` argument that
@@ -1345,6 +1360,29 @@ nothing is lost.
 > dropped - documented weak, no native harness binds a port, the
 > step-20/21 precedent. Suite after the step: 1317 native checks across
 > 55 executables.
+>
+> **Step-22 follow-up (same milestone, adversarial post-commit review):**
+> four hardenings, each red-first. (1) The sweep fence, window (f)
+> above. (2) `Ttl.of_seconds` grows a one-second floor and the enforced
+> span becomes `Ttl.whole_seconds` (ceil) - commit dates are whole
+> seconds, so a sub-second ttl truncated to the sweep-everything cutoff
+> (every branch not written in the current second) while the boot
+> banner rounded it up and announced the opposite; banners and `reap`
+> now read the ONE definition, so announced and enforced cannot
+> disagree (TTL pins + T-FRAC). (3) A won removal takes the victim's
+> `redo-` pointer with it, AFTER the TAS - reserved refs are never
+> swept independently, and `redo` clears the slot only through a live
+> session, so each reaped session that undid without redoing leaked one
+> branch ref forever, paid for on every tick's `Branch.list` and every
+> boot's `branch_waters`; removal-before-TAS was rejected because it
+> erases a racing winner's redo slot (T-REDO, both arms); refs leaked
+> by roots that reaped before this fix are not retro-reclaimed. (4) The
+> failed-Forget repair claim narrowed to watered floors in both
+> `forget_into` docs and window (c), with W5 pinning both filter arms.
+> Mutation sweep A-M1..A-M5 (fence deleted; gate relaxed; ceil dropped;
+> companion dropped; companion moved before the TAS): 5/5 killed on
+> their predicted checks. Suite after the follow-up: 1335 native
+> checks across 55 executables.
 
 ## 8. Shared RPC contract - built (roadmap step 7; hardened step 8, D11/D12)
 
@@ -1554,9 +1592,55 @@ Each lean-tea private-constructor primitive → an OCaml `.mli` boundary:
   are wired: `Origin_gate` mints the capability the WebSocket `accept_ws` demands
   (a socket accepted without the same-origin check is now uncompilable), `Store`
   speaks only `Safe_key`, and a `Security_headers` middleware puts a strict CSP on
-  every response. The remaining direct-sink discipline (never call raw
-  Dream/Irmin/Unix past a boundary) stays a review convention. **Extended to the
-  RPC tier** (roadmap step 8, D12): `Rpc.route`'s mutating dispatch demands the
+  every response. The remaining direct-sink discipline was **narrowed in step
+  23** from a review convention to two build-enforced tiers. Compile tier:
+  `(implicit_transitive_deps false)` in `dune-project`, so a module can only
+  name libraries its own stanza lists - the stanza is the audited surface -
+  with every stanza that leaned on transitive reach made explicit
+  (`tea_client_run` += `tea_core vdom.base`, `tea_server` += `unix` and
+  signature-visibility `irmin`, `tea_server_pack` += `unix`, `test/` +=
+  `unix irmin`, and the example stanzas' functor-signature deps). Mechanical
+  tier: `test/sink_gate_test` walks every `.ml`/`.mli` under `lib/`,
+  `examples/` and `test/` with comments and string literals stripped
+  byte-preserving (the stripper follows OCaml's lexer into comments: nested
+  comments, strings inside comments AND char literals inside comments - the
+  adversarial pass's differential showed a single `'"'` char literal in a
+  comment otherwise put the machine in a comment-string state that blanked
+  94% of `server_test.ml`, hiding 28 unclassified raw `Dream` calls, so the
+  over-stripping direction is now both fixed and mutation-pinned), and
+  fails with `file:line` on any bare `Dream` / `Irmin`-family-prefix /
+  `Unix` / `Lwt_unix` / `Lwt_io` occurrence - qualified path,
+  `open`/`include`/`let open`, module alias, functor argument: any spelling -
+  outside a `(file, namespace)` allowlist pinned in the check's own source; a
+  new file naming a sink and not classified FAILS, default-deny, and every
+  allowlist entry must itself match a live occurrence or the gate fails (no
+  silent entry rot - landing the gate already de-listed two candidate pairs
+  whose Irmin mentions turned out to be doc comments).
+  `examples/shared_doc/server/main.ml`'s hand-rolled mem-tier
+  `Dream.run`/`Dream.logger` - the one raw-Dream verb site outside the sink
+  modules - is retired onto `Tea_server.Make.serve ~rpc_once`, the wrapper
+  its own pack arm already used. Three residues are named rather than
+  claimed closed: (1) the allowlisted sink modules remain trusted to use the
+  raw primitive correctly - the grain is `(file, namespace)`, so a new call
+  inside a namespace a file already carries passes the scan (two exact-count
+  pins, 24 `Unix` occurrences in `session_secret.ml` and 72 files under
+  `lib/`, convert the likeliest silent drifts into visible gate events, at
+  the cost of a deliberate one-line pin update on legitimate change); (2) a
+  `dune` stanza edit granting a sink library remains a review event until
+  the file names a token, and a new top-level directory outside the walk
+  roots is unscanned; (3) token-free paths to raw sinks exist and are out of
+  any lexical scanner's reach: `tea_server.ml` has no `.mli`, so its
+  Dream-typed surface is reachable from dependents by type inference with no
+  forbidden token written, and `Store_core.CORE`'s `module S :
+  Irmin.Generic_key.KV ...` re-export (store_core.mli, an allowlisted file)
+  hands the full irmin API to any clean file as `Store.S.*` - the test
+  suite's deliberate seam, which is why four test files drive raw irmin
+  today with no `Irmin` token and no allowlist entry; sealing or scoping
+  that seam is its own future step, not a scanner rule. `Sys.`/`out_channel`
+  are ambient stdlib, deliberately out of scope; `Lwt_io` - raw file I/O,
+  `Lwt_unix`'s audited sibling, and a one-line migration target for journal
+  I/O - is IN scope since the review round.
+  **Extended to the RPC tier** (roadmap step 8, D12): `Rpc.route`'s mutating dispatch demands the
   same `Origin_gate` proof, so that path cannot be taken without one. Unlike
   `accept_ws` this is *not* an isolated sink, and the difference is worth being
   exact about: `accept_ws` is the module's only mention of `Dream.websocket`,
@@ -1685,7 +1769,20 @@ Each lean-tea private-constructor primitive → an OCaml `.mli` boundary:
   store-writing endpoint restores the CSRF exposure the gate removes.
   Mitigation: the per-constructor `kind` table pinned in `test/rpc_test` (so a
   silent reclassification fails a check rather than production), and
-  classification as a review obligation on every new endpoint.
+  classification as a review obligation on every new endpoint. **Amended in
+  step 23** to state precisely what the sink gate does and does not reach
+  here: `dispatch` and `dispatch_mutating` are two functions inside
+  `tea_server.ml`, an allowlisted file, so no namespace boundary the scan
+  watches is ever crossed - the exposure is a same-module call-graph
+  property, and a textual arm pin would be dishonest tooling:
+  `dispatch_mutating` contains `dispatch` as a substring, no `.ocamlformat`
+  pins layout, and rename/extract refactors change the text a region pin
+  keys on in both directions independent of the property. Keeping the two
+  arms distinct stays a review obligation backed by the per-constructor
+  `kind` table and `test/csrf_test`; what step 23 pins mechanically is the
+  artifact that backs the obligation - `sink_gate_test` asserts
+  `test/csrf_test.ml` exists in the walk with a non-trivial check count, so
+  the gate behind the review cannot be quietly deleted.
 - **R9 (low) - what the D11 cap does and does not bound.** It bounds *this
   loop*: the buffer never holds more than 64 KiB (the chunk that would cross the
   cap is refused rather than added), and bytes pulled never exceed the cap plus
@@ -2667,7 +2764,25 @@ Each lean-tea private-constructor primitive → an OCaml `.mli` boundary:
     `tea_safe` boundary; keep `Rpc.route`'s two arms distinct - R8)
     stays a review convention today. Move it to a gate the build
     enforces - a bypass must fail to compile or fail a mechanical
-    check, not wait on a reviewer. **Planned.**
+    check, not wait on a reviewer. **Done.** (Two tiers:
+    `(implicit_transitive_deps false)` with every stanza that leaned
+    on transitive reach made explicit, and `test/sink_gate_test`, a
+    zero-library scanner over every `.ml`/`.mli` in
+    `lib/`+`examples/`+`test/` - byte-preserving comment/string
+    stripping, Irmin matched by family prefix, any spelling of a sink
+    occurrence flagged, `(file, namespace)` allowlist pinned in source
+    with a load-bearing self-check, default-deny with `file:line`;
+    `shared_doc`'s mem tier retired onto `Make.serve ~rpc_once`
+    mirroring its own pack arm, so `main.ml` speaks no raw Dream; R8
+    kept review-status with the `csrf_test` existence/check-count pin.
+    Mutation sweep M1-M8 - stripper deleted, allowlist emptied and
+    widened, `.mli` dropped from the walk, default-deny inverted,
+    walker re-rooted, planted-RED assertion inverted, and the
+    comment-mode char-literal arm deleted (the OVER-stripping
+    direction, added after the adversarial differential found the
+    original sweep one-directional) - all killed on predicted
+    checks; suite 1410 native checks (the gate's own 75 included)
+    across 56 executables.)
 24. **Cookie rollback guard** - close R16 (§10) before first use: the
     cookie session payload is rollback-able, and today's safety is an
     accident of non-use (`session_field` and its writers have zero

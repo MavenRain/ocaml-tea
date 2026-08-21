@@ -30,4 +30,19 @@
   shared_doc_serve
   dream
   lwt
-  lwt.unix))
+  lwt.unix
+  ; explicit under (implicit_transitive_deps false): Unix.* constructors and
+  ; direct fork/kill in the durability tests, Irmin.Type in retention_test
+  unix
+  irmin))
+
+; The R7 sink gate (roadmap step 23). Its own stanza on purpose: the
+; source_tree deps re-materialize on ANY source change, and that rebuild
+; coupling must never touch the 55 executables above. No (libraries) at all:
+; the enforcer links zero sinks by construction.
+(test
+ (name sink_gate_test)
+ (deps
+  (source_tree ../lib)
+  (source_tree ../examples)
+  (source_tree .)))

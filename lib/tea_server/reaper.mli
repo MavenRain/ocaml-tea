@@ -16,9 +16,11 @@ module Cadence : sig
       how often the loop looks for one. *)
 
   val of_seconds : float -> t option
-  (** [None] unless the value is strictly positive (the
-      {!Tea_core.Prim.Ttl.of_seconds} shape): a zero or negative cadence
-      names a spin loop, not a policy. *)
+  (** [None] unless the value is strictly positive: a zero or negative
+      cadence names a spin loop, not a policy. Sub-second cadences are FINE
+      (a cadence is a wait, measured by a real timer), which is why this
+      gate is looser than {!Tea_core.Prim.Ttl.of_seconds}'s one-second
+      floor (a ttl is compared against whole-second commit dates). *)
 
   val to_seconds : t -> float
 end
@@ -29,7 +31,10 @@ type spec =
             value well above the longest a CONNECTED client may sit idle: a
             live socket does not exclude its branch from the sweep, and the
             ttl is the one idle bound (see the [?reaper] doc on the entry
-            points for the recovery semantics when it is picked too low). *)
+            points for the recovery semantics when it is picked too low).
+            The enforced span is {!Tea_core.Prim.Ttl.whole_seconds} (ceil),
+            the same value the boot banner announces; sub-second ttls are
+            refused at {!Tea_core.Prim.Ttl.of_seconds}. *)
   ; every : Cadence.t  (** How often the sweep runs. *)
   }
 (** Everything an entry point needs to run a reaper. *)
@@ -55,6 +60,15 @@ val loop :
       so a caller that sequences its teardown after this promise knows no
       removal is mid-air ({!Tea_server_pack.Make_pack.serve_pack} joins on
       exactly that).
+    - A sweep that REJECTS is fenced here: the failure is one stderr line,
+      the round counts as zero sweeps, and the loop arms the next tick.
+      The loop's own promise therefore never rejects - which is what lets
+      the pack tier [Lwt.join] it with the server and know the teardown
+      after that join always runs ([Lwt.join] re-raises only after every
+      member resolves, and a rejecting member would poison the whole
+      [Lwt_main.run], skipping the ordered closes behind it). The timer
+      seam stays trusted: it is the entry point's own [Lwt_unix.sleep] (or
+      a test's queue), not a store path.
     - [Lwt.choose], never [Lwt.pick]: pick cancels the losing branch, and a
       cancelled sweep could stop between a guard tombstone and its branch
       removal (the [live_session] pump ruling, for the same reason).

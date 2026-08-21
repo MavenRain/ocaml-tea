@@ -29,6 +29,14 @@ let () =
      let sid s = Option.get (Prim.Session_id.of_string s) in
      let ttl = Option.get (Prim.Ttl.of_seconds 1000.) in
 
+     (* The Ttl gate (step 22 follow-up): dates are whole seconds, so a
+        sub-second ttl names the sweep-everything policy, not a lifetime.
+        [of_seconds] refuses it at the type's front door. *)
+     check "TTL: of_seconds 0.9 is None (sub-second ttls are refused)"
+       (Option.is_none (Prim.Ttl.of_seconds 0.9));
+     check "TTL: of_seconds 1.0 is Some (the smallest honest ttl)"
+       (Option.is_some (Prim.Ttl.of_seconds 1.0));
+
      let parent = Filename.temp_dir "ocaml-tea-reaper" "" in
      let root = Tea_persist_pack.Store_pack.Root.v (Filename.concat parent "store") in
 
@@ -178,7 +186,7 @@ let () =
        Option.fold bound_head ~none:0L
          ~some:(fun c -> Store.S.Info.date (Store.S.Commit.info c))
      in
-     let ttl_span = Int64.of_float (Prim.Ttl.to_seconds ttl) in
+     let ttl_span = Prim.Ttl.whole_seconds ttl in
      let* kept = Store.reap t2 ~ttl ~now:(Int64.add bound_date ttl_span) in
      let* still_bound = Store.S.Branch.mem (Store.repo t2) (branch_of "boundaa") in
      check "T-BOUND: a head dated exactly [now - ttl] is KEPT (strict inequality)"
@@ -188,6 +196,37 @@ let () =
      in
      let* gone_bound = Store.S.Branch.mem (Store.repo t2) (branch_of "boundaa") in
      check "T-BOUND: one second older is swept" (swept_bound = 1 && not gone_bound);
+
+     (* --- T-FRAC: a fractional ttl is enforced at its ceiling (step 22
+        follow-up) --------------------------------------------------------- *)
+     (* Dates are whole seconds; the enforced span is [Ttl.whole_seconds] =
+        ceil, and the boot banners print the same value, so announced and
+        enforced can never disagree. Truncation would sweep a branch the
+        announced policy promised to keep. Fail-loud mint: both fold arms are
+        closures applied once. *)
+     let ttl_frac : Prim.Ttl.t =
+       Option.fold (Prim.Ttl.of_seconds 1.5)
+         ~none:(fun () ->
+           Printf.printf "FAIL - of_seconds 1.5 mints a ttl\n%!";
+           exit 1)
+         ~some:(fun (v : Prim.Ttl.t) () -> v)
+         ()
+     in
+     let* frac = Store.session t2 (sid "fracaaa") in
+     let* (_ : model) = Store.apply frac Increment in
+     let* frac_head = Store.S.Branch.find (Store.repo t2) (branch_of "fracaaa") in
+     check "T-FRAC: the probe branch has a head" (Option.is_some frac_head);
+     let frac_date =
+       Option.fold frac_head ~none:0L
+         ~some:(fun c -> Store.S.Info.date (Store.S.Commit.info c))
+     in
+     let* frac_kept = Store.reap t2 ~ttl:ttl_frac ~now:(Int64.add frac_date 2L) in
+     let* still_frac = Store.S.Branch.mem (Store.repo t2) (branch_of "fracaaa") in
+     check "T-FRAC: age = ceil(ttl) is KEPT (a 1.5s ttl enforces 2s, never 1s)"
+       (frac_kept = 0 && still_frac);
+     let* frac_swept = Store.reap t2 ~ttl:ttl_frac ~now:(Int64.add frac_date 3L) in
+     let* frac_gone = Store.S.Branch.mem (Store.repo t2) (branch_of "fracaaa") in
+     check "T-FRAC: one second past the ceiling is swept" (frac_swept = 1 && not frac_gone);
 
      (* --- T-RACE: a commit racing the sweep is preserved (step 22) ------- *)
      (* The erased-commit shape the TAS removal exists to catch: a writer
@@ -215,6 +254,52 @@ let () =
         goes quiet its next sweep removes it. *)
      let* cleanup = Store.reap t2 ~ttl ~now:2_000_000L in
      check "T-RACE: a later quiet sweep does remove it" (cleanup = 1);
+
+     (* --- T-REDO: a swept session takes its redo- pointer with it (step 22
+        follow-up) --------------------------------------------------------- *)
+     (* redo- refs are reserved from independent sweeping (the pin above), and
+        [redo] itself clears the slot only through a live session, so once the
+        reaper owns branch removal every reaped session that undid without
+        redoing would leak one ref forever - paid for on every tick's
+        [Branch.list] and every boot's [branch_waters]. The companion removal
+        fires AFTER the won TAS: removing the slot first would erase a racing
+        winner's redo affordance (the raced arm below). *)
+     let* rs = Store.session t2 (sid "redobbb") in
+     let* (_ : model) = Store.apply rs Increment in
+     let* (_ : model) = Store.apply rs Increment in
+     let* rwl = Store.load_based rs in
+     let* rundone = Store.undo rwl in
+     check "T-REDO: undo on the probe session wins"
+       (Result.fold rundone
+          ~ok:(fun (_ : model) -> true)
+          ~error:(fun (_ : Store.undo_error) -> false));
+     let redo_bb = "redo-" ^ branch_of "redobbb" in
+     let* redo_minted = Store.S.Branch.mem (Store.repo t2) redo_bb in
+     check "T-REDO: the undo minted the redo- pointer" redo_minted;
+     (* Raced arm first: the victim wins its reprieve, and its redo slot must
+        survive with it (the forget callback commits through a second handle,
+        the T-RACE window). *)
+     let* raced_keep =
+       Store.reap
+         ~forget:(fun (_ : Prim.Session_id.t) ->
+           let* s2 = Store.session t2 (sid "redobbb") in
+           let* (_ : model) = Store.apply s2 Increment in
+           Lwt.return_unit)
+         t2 ~ttl ~now:3_000_000L
+     in
+     let* kept_branch = Store.S.Branch.mem (Store.repo t2) (branch_of "redobbb") in
+     let* kept_redo = Store.S.Branch.mem (Store.repo t2) redo_bb in
+     check "T-REDO: the raced victim keeps its branch (the T-RACE reprieve)"
+       (raced_keep = 0 && kept_branch);
+     check "T-REDO: the raced victim keeps its redo- pointer too (removal is AFTER the won TAS)"
+       kept_redo;
+     (* Quiet arm: the next sweep wins, and the pointer goes with the branch. *)
+     let* swept_redo = Store.reap t2 ~ttl ~now:4_000_000L in
+     let* bb_gone = Store.S.Branch.mem (Store.repo t2) (branch_of "redobbb") in
+     let* redo_gone = Store.S.Branch.mem (Store.repo t2) redo_bb in
+     check "T-REDO: the quiet sweep removes the stale session"
+       (swept_redo = 1 && not bb_gone);
+     check "T-REDO: its redo- pointer went with it (no leaked ref)" (not redo_gone);
 
      let* () = Store.close t2 in
 

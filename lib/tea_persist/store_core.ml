@@ -826,7 +826,7 @@ struct
       its branch, the loss side (D16). *)
   let reap ?(forget = fun (_ : Tea_core.Prim.Session_id.t) -> Lwt.return_unit)
       (t : t) ~(ttl : Tea_core.Prim.Ttl.t) ~(now : int64) : int Lwt.t =
-    let cutoff = Int64.sub now (Int64.of_float (Tea_core.Prim.Ttl.to_seconds ttl)) in
+    let cutoff = Int64.sub now (Tea_core.Prim.Ttl.whole_seconds ttl) in
     let* names = S.Branch.list t.repo in
     Lwt_list.fold_left_s
       (fun (reaped : int) (name : S.branch) ->
@@ -852,6 +852,32 @@ struct
                 in
                 let* () = forget_victim () in
                 let* removed = remove_branch () in
+                (* The won removal takes the session's redo- pointer with it:
+                   reserved from independent sweeping above, and [redo] clears
+                   the slot only through a live session, so a swept session
+                   that undid without redoing would otherwise leak one ref
+                   forever. AFTER the TAS on purpose: removing it first would
+                   erase a racing winner's redo slot (T-REDO's raced arm).
+                   And by test-and-set against the pointer value read after
+                   the win, never a bare remove: a client that persists its
+                   session id can reconnect, recreate the branch, undo and
+                   mint a FRESH pointer inside this very window, and a bare
+                   remove would delete that live affordance - the TAS fails
+                   against the fresh head instead, the safe direction. The
+                   residue is one leaked ref if the process dies between the
+                   two removals - retried never, bounded by one per crash. *)
+                let* () =
+                  if removed then
+                    let* redo_s = S.of_branch t.repo (redo_prefix ^ name) in
+                    let* redo_head = S.Head.find redo_s in
+                    Option.fold redo_head ~none:Lwt.return_unit
+                      ~some:(fun (rc : S.commit) ->
+                        let* (_ : bool) =
+                          S.Head.test_and_set redo_s ~test:(Some rc) ~set:None
+                        in
+                        Lwt.return_unit)
+                  else Lwt.return_unit
+                in
                 Lwt.return (if removed then reaped + 1 else reaped)
               else Lwt.return reaped))
       0 names

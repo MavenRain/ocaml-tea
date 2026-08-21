@@ -169,9 +169,16 @@ module Ttl : sig
   type t
 
   val of_seconds : float -> t option
-  (** [None] for a non-positive duration. *)
+  (** [None] below one second. Commit dates are whole seconds, so a
+      sub-second ttl would truncate to the sweep-everything cutoff (every
+      branch not written in the current second), not a lifetime. *)
 
   val to_seconds : t -> float
+
+  val whole_seconds : t -> int64
+  (** The ENFORCED span: [ceil] of the ttl, in whole seconds. [reap]'s
+      cutoff and the serve boot banners all read this one definition, so
+      the announced policy and the enforced one can never disagree. *)
 end
 
 module Branch_name : sig

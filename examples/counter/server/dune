@@ -1,3 +1,8 @@
 (executable
  (name main)
- (libraries tea_server tea_server_pack counter_app))
+ ; tea_core, repr and tea_persist_pack are explicit under
+ ; (implicit_transitive_deps false): the functor application's App signature
+ ; is spelled in their types, and [Tea_server_pack.Root] is an alias into
+ ; [Tea_persist_pack.Store_pack].
+ (libraries tea_core repr tea_persist_pack tea_server tea_server_pack
+   counter_app))

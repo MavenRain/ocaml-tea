@@ -119,8 +119,13 @@ val forget_into :
     keyed on the reserved [main] replica, which is never swept, so a victim
     could never match one. A sink [Error] degrades to one stderr line naming
     the session, and the sweep continues: the in-memory floor is already
-    scrubbed (duplicate side), and the journal's stale floor is dropped by the
-    boot filter at the next boot ([dropped_no_branch]). Module-level and
+    scrubbed (duplicate side), and a WATERED journal floor is dropped by the
+    boot filter at the next boot ([dropped_no_branch]). That repair does not
+    reach a bottom-water floor (the ws pump's fuel-poison mint): the filter
+    keeps those on trust before [head_water] is ever consulted, so a failed
+    Forget leaves one standing across every later boot - the named residue
+    ([Store_core.CORE.reap]'s doc states the same bound), pinned beside the
+    watered arm in [reaper_wiring_test] W5. Module-level and
     app-generic so [reaper_wiring_test] drives the same definition
     {!Make_pack.serve_pack} wires (the [Rebase.absorb] precedent); the mem
     tier ({!Tea_server.Make.serve}) writes the same closure locally, because

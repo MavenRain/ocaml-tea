@@ -161,8 +161,9 @@ end
 module Ttl = struct
   type t = float
 
-  let of_seconds s = if s > 0. then Some s else None
+  let of_seconds s = if s >= 1.0 then Some s else None
   let to_seconds t = t
+  let whole_seconds t = Int64.of_float (Float.ceil t)
 end
 
 module Branch_name = struct

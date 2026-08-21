@@ -957,8 +957,8 @@ module Make (A : Tea_core.App.APP) = struct
             Lwt.return swept
           in
           Printf.eprintf
-            "tea_server: reaper: sweeping session branches idle longer than %.0fs, every %.0fs\n%!"
-            (Tea_core.Prim.Ttl.to_seconds r.ttl)
+            "tea_server: reaper: sweeping session branches idle longer than %Lds, every %.0fs\n%!"
+            (Tea_core.Prim.Ttl.whole_seconds r.ttl)
             (Reaper.Cadence.to_seconds r.every);
           Lwt.async (fun () ->
               Reaper.loop ~sweep ~now:Store.default_now

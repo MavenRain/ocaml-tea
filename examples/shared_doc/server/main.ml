@@ -57,9 +57,10 @@ let () =
   Sys.getenv_opt "TEA_ROOT"
   |> Option.fold
        ~none:(fun () ->
-         let repo = Lwt_main.run (Server.Store.create ()) in
-         Dream.run ~interface:"localhost" ~port
-           (Dream.logger (Shared_doc_serve.handler ?client_dir repo)))
+         (* The entry point stays sink-free (roadmap step 23): [serve] creates
+            the memory repo, mounts the same handler pipeline, and applies the
+            [?rpc_once] builder to it - the counter's shape exactly. *)
+         Server.serve ~port ?client_dir ~rpc_once:Shared_doc_serve.rpc_once ())
        ~some:(fun (root : string) () ->
          (* No repo is created here: [serve_pack] opens the pack root itself
             (refusing an unusable one before it listens), and hands it back to

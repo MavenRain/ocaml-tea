@@ -164,6 +164,13 @@ let handler ?client_dir ?once ?on_taken (repo : Server.Store.t) : Dream.handler 
   in
   Server.handler ?client_dir ~rpc:(Rpc.routes_once ?on_taken once (rpc_handler repo)) repo
 
+(** The mem tier's [?rpc_once] builder, the exact mirror of {!Pack.rpc_once}
+    below: {!Tea_server.Make.serve} applies it to the store it created and
+    the mem channel it minted, so [main.ml] wires the keyed contract without
+    naming a single Dream value (roadmap step 23). *)
+let rpc_once (repo : Server.Store.t) (o : Rpc.once) : Dream.route list =
+  Rpc.routes_once o (rpc_handler repo)
+
 (** The durable tier: the same app and the same RPC handler over irmin-pack.
 
     Here rather than in [main.ml] for the reason this module exists at all, and

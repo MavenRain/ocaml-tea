@@ -1,3 +1,6 @@
 (library
  (name tea_server_pack)
- (libraries tea_core tea_safe tea_server tea_persist tea_persist_pack dream lwt lwt.unix))
+ ; [unix] is explicit, not transitive: [guard_file.ml]'s journal I/O calls
+ ; [Unix.openfile]/[lstat]/[fsync]/... directly (the tea_persist precedent).
+ (libraries tea_core tea_safe tea_server tea_persist tea_persist_pack unix
+   dream lwt lwt.unix))

@@ -255,6 +255,77 @@ let () =
            && not (String.starts_with ~prefix:"__" n))
          !probed)
 
+(* --- W5: what the boot filter can and cannot repair (step 22 follow-up) -- *)
+(* [forget_into]'s degrade story says a failed Forget append is repaired at
+   the next boot: the journal's stale floor dies as [dropped_no_branch]. That
+   holds only for floors carrying a REAL water. A bottom-water floor (the ws
+   pump's fuel-poison mint) is kept on trust by the filter BEFORE
+   [head_water] is ever consulted, so a failed Forget leaves it standing
+   across every later boot. Both arms are pinned here so the narrowed doc
+   cannot drift from the filter. *)
+let w5_guard_dir = Filename.concat parent "w5.guard"
+
+let w5_bot_replica : Replica.t =
+  Tea_core.Crdt.Ctx.replica
+    (Store.ctx_of_session (Lwt_main.run (Store.session t (sid "wfivebo"))))
+
+let () =
+  let { Tea_server_pack.ws = g5
+      ; ws_journal = j5
+      ; rpc = (_ : Durable_guard.t)
+      ; rpc_journal = rj5
+      } =
+    Tea_server_pack.open_guards ~guard_dir:w5_guard_dir
+      ~head_water:head_water_pre ~identity ~epoch:epoch0 ()
+  in
+  let must_persist (label : string) ~(replica : Replica.t)
+      ~(seq : Prim.Msg_seq.t) ~(water : Prim.Store_water.t) : unit =
+    Lwt_main.run (Durable_guard.persist g5 ~replica ~tab:tab1 ~seq ~water)
+    |> Result.fold
+         ~ok:(fun () -> ())
+         ~error:(fun (_ : Guard_sink.err) -> die label)
+  in
+  must_persist "W5: real-water persist refused" ~replica:victim_replica
+    ~seq:(seq_of 3) ~water:victim_water;
+  must_persist "W5: bottom-water persist refused" ~replica:w5_bot_replica
+    ~seq:(seq_of 1) ~water:Prim.Store_water.bottom;
+  (* Close WITHOUT any Forget having appended: the on-disk journal now holds
+     exactly the two floors a failed forget_into would leave behind. *)
+  Lwt_main.run (Option.fold j5 ~none:Lwt.return_unit ~some:Guard_file.close);
+  Lwt_main.run (Option.fold rj5 ~none:Lwt.return_unit ~some:Guard_file.close)
+
+let () =
+  (* The next boot: both floors' branches are gone (head_water finds nothing),
+     identity and epoch match. The doc's repair fires for the watered floor
+     ONLY. *)
+  let reopened =
+    Lwt_main.run
+      (Guard_file.open_ ~dir:w5_guard_dir ~cap:32768
+         ~head_water:(fun (_ : Replica.t) -> None)
+         ~identity ~epoch:epoch0)
+  in
+  Result.fold reopened
+    ~error:(fun (_ : Guard_file.open_err) -> die "W5: reopen failed")
+    ~ok:(fun
+        (( (_ : Guard_sink.t)
+         , (floors5 : Floors.t)
+         , (v : Guard_file.verdict)
+         , (_ : Guard_file.identity_outcome)
+         , (_ : Guard_file.epoch_outcome)
+         , (file5 : Guard_file.t) )) ->
+      check
+        "W5: the watered floor of a failed Forget dies at the next boot (dropped_no_branch = 1)"
+        (v.dropped_no_branch = 1);
+      check
+        "W5: the bottom-water floor SURVIVES the same boot (kept on trust, the named residue)"
+        (v.unwitnessed = 1
+        && Option.is_some
+             (Floors.find_stamped ~replica:w5_bot_replica ~tab:tab1 floors5));
+      check "W5: the survivor is exactly the bottom one (watered floor gone from the mirror)"
+        (Option.is_none
+           (Floors.find_stamped ~replica:victim_replica ~tab:tab1 floors5));
+      Lwt_main.run (Guard_file.close file5))
+
 let () =
   Lwt_main.run
     (Option.fold rpc_journal2 ~none:Lwt.return_unit ~some:Guard_file.close);

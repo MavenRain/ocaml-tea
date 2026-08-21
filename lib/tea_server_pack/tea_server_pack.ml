@@ -216,10 +216,16 @@ let open_guards ~(guard_dir : string)
     swept, so a victim could never match one and the tombstone would only grow
     that journal. An [Error] from the sink is ONE stderr line and a normal
     return, and the sweep continues: the in-memory floor is already scrubbed
-    (the duplicate side, {!Durable_guard.forget}'s contract), the journal's
-    stale floor is dropped by the boot filter at the next boot
+    (the duplicate side, {!Durable_guard.forget}'s contract), a WATERED
+    journal floor is dropped by the boot filter at the next boot
     ([dropped_no_branch]), and aborting would only leave other stale branches
-    standing until the next tick. Module-level and app-generic, shared
+    standing until the next tick. The repair is narrower than the floors it
+    covers, and the gap is named rather than rounded away: a bottom-water
+    floor (the ws pump's fuel-poison mint) is kept on trust by the filter
+    before [head_water] is ever consulted, so a failed Forget leaves it
+    standing across every later boot (reaper_wiring_test W5 pins both arms).
+    Bounded: keyed by a tab id a page load never re-mints, capped by the
+    journal's tab-LRU. Module-level and app-generic, shared
     verbatim with [reaper_wiring_test] (the [Rebase.absorb] precedent): the
     closure the test drives cannot drift from the one [serve_pack] runs. The
     mem tier ({!Tea_server.Make.serve}) writes the same three lines locally,
@@ -238,7 +244,7 @@ let forget_into (guard : Durable_guard.t) (sid : Tea_core.Prim.Session_id.t) :
         | Guard_sink.Io io -> io
       in
       Printf.eprintf
-        "tea_server_pack: reaper: forget failed for session %s (%s); its stale journal floor is dropped at the next boot\n%!"
+        "tea_server_pack: reaper: forget failed for session %s (%s); a watered journal floor is dropped at the next boot, a bottom floor survives on trust\n%!"
         (Tea_core.Prim.Session_id.to_string sid)
         reason;
       Lwt.return_unit)
@@ -509,8 +515,8 @@ module Make_pack (A : Tea_core.App.APP) = struct
       (Option.fold reaper ~none:serve
          ~some:(fun (r : Reaper.spec) () ->
            Printf.eprintf
-             "tea_server_pack: reaper: sweeping session branches idle longer than %.0fs, every %.0fs\n%!"
-             (Tea_core.Prim.Ttl.to_seconds r.ttl)
+             "tea_server_pack: reaper: sweeping session branches idle longer than %Lds, every %.0fs\n%!"
+             (Tea_core.Prim.Ttl.whole_seconds r.ttl)
              (Reaper.Cadence.to_seconds r.every);
            let sweep ~(now : int64) : int Lwt.t =
              let* swept = Store.reap ~forget:(forget_into guard) repo ~ttl:r.ttl ~now in
