@@ -92,6 +92,13 @@ val durable : ?previous:Secret.t list -> ?lifetime:float -> Secret.t -> t
     [~old_secrets]: decrypt/verify only, never encrypt, i.e. the rotation
     window. [?lifetime] defaults to {!default_lifetime}.
 
+    The session PAYLOAD is out of bounds, by build gate (R16, roadmap step
+    24): the client holds the whole cookie payload, so AEAD proves the server
+    wrote {i some} version, never the {i latest} - monotone state put there
+    rolls back on replay. The five payload accessors are member-banned
+    repo-wide by [test/sink_gate_test]'s member layer, this module included;
+    monotone state belongs on the session's Irmin branch.
+
     {b [?previous] is INERT on dream 1.0.0~alpha8, and that is an upstream
     defect rather than a wiring mistake here.} Dream's [Cipher.decrypt] walks
     the secret list recursively, and the recursive call drops its own

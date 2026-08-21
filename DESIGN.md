@@ -59,6 +59,7 @@ toolchain removes an entire tier lean-tea had to hand-write.
 | `lib/tea_server/reaper.{ml,mli}` (`Cadence` newtype + `spec` + the injected-timer `loop`: choose-not-pick, `is_sleeping` stop gates on both sides, zero sweeps before the first tick, a sweep in flight completes before the promise resolves, a rejecting sweep is fenced to one stderr line so the loop's promise never rejects) + `Store_core.reap` removal hardened to `Head.test_and_set ~test:(Some c) ~set:None` (a raced victim is kept, whole and uncounted; `?forget` still first) + `Tea_server_pack.forget_into` (ws-channel tombstone; a sink `Error` is one stderr line and the sweep continues) + `serve_pack ?reaper` (`Lwt.join` with `Dream.serve` inside the first `Lwt_main.run`, shared signal-woken stop) + `Make.serve ?reaper` (entry-point guard mint shared with the pipeline, never-stop `Lwt.async` loop) | **built, green** (roadmap step 22, D24) |
 | `(implicit_transitive_deps false)` (dune-project) + explicit deps on every stanza that leaned on transitive reach (`tea_client_run` += `tea_core vdom.base`, `tea_server` += `unix` + signature-visibility `irmin`, `tea_server_pack` += `unix`, `test/` += `unix irmin`, example stanzas' functor-signature deps) + `examples/shared_doc/server` mem tier on `Make.serve ~rpc_once` (the hand-rolled `Dream.run`/`Dream.logger` pair retired from `main.ml`, mirroring its own pack arm and the counter binary) | **built, green** (roadmap step 23, R7/R8) |
 | `test/sink_gate_test` (own zero-library stanza with `source_tree` deps; byte-blanking comment/string stripper incl. nested comments, strings-inside-comments AND char-literals-inside-comments per OCaml's lexer; any spelling of a sink occurrence flagged - qualified path, open/include/let-open, module alias, functor argument; Irmin family prefix; five audited namespaces incl. `Lwt_io`; pinned `(file, namespace)` allowlist, default-deny `file:line`, load-bearing entry self-check; exact-count anti-vacuity pins 72 `lib/` files / 24 `Unix` occurrences in `session_secret.ml`; planted RED/GREEN inline fixtures; `csrf_test` existence + >= 30 check-lines pin) | **passes** (confirmed by mutation: M1-M8 killed on predicted checks, both stripping directions; roadmap step 23) |
+| Member layer in `test/sink_gate_test` (the R16 payload family - `session_field`, `set_session_field`, `drop_session_field`, `all_session_fields`, `session_expires_at` - banned by SPELLING repo-wide in scrubbed source, whatever the qualification; a namespace allowlist entry grants no member rights, so the Dream sink modules themselves are refused the family; single member-allowlisted file = `test/session_payload_probe_test.ml`, five typed bindings pinning Dream's exports at their types, each name EXACTLY once by count; non-payload `session_id`/`session_label`/`invalidate_session` pinned legal; review round: comment-mode quoted-block arm (`ComQuo`) added to the stripper - a `"` inside `{id|...|id}` in a comment previously blanked the rest of the file, blinding BOTH passes for future files - plus the probe-wiring pin (`test/dune` must name the probe) and the probe's exact `Dream`-shape pin (12)) | **passes** (red-first: 19 predicted FAILs with the probe unallowlisted; confirmed by mutation: step-24 M1-M10 killed on predicted checks incl. the raw-bytes, prefix-compare and both comment-quoted-block directions; roadmap step 24, R16) |
 | `test/reaper_loop_test` (L1-L6: queue-backed timer, stop-wins-ties, sweep-completes-before-resolve, `Lwt.state` anti-hang assertions), `test/reaper_wiring_test` (W1/W2/W4: a real journal-backed guard on a real pack root, the Forget tombstone honored across a reopen against the pre-sweep head snapshot, the replay reading Fresh, sweep continuation past a closed sink, reserved refs never reaching the hook), `reaper_test` += T-RACE (the racing commit preserved and uncounted) + T-BOUND (the strict cutoff) | **passes** (confirmed by mutation: M1-M12, 11/11 runnable killed on their predicted checks; M11 `serve_pack` join documented weak - no native harness binds a port) |
 
 Toolchain: OCaml 5.3.0, dune 3.24, a dedicated opam switch (`irmin-tea` locally) with
@@ -692,7 +693,9 @@ nothing is lost.
 > system's only credential and the id space it protects is enumerable from disk
 > (R14); `Guard_file`'s cap eviction now evicts LIVE clients (R15, amending
 > R12); the cookie session payload is rollback-able the day anything is put in
-> it (R16); Dream's own cookie loader has two residual raises past a successful
+> it (R16 - closed by step 24: the payload accessor family is member-banned by
+> the sink gate, so nothing can be put in it without widening that gate);
+> Dream's own cookie loader has two residual raises past a successful
 > decrypt (R17); behind a TLS-terminating proxy the durable cookie ships
 > without `Secure` and without the `__Host-` prefix, and the exposure is no
 > longer bounded by process lifetime (R19); and the three durability siblings
@@ -1939,7 +1942,19 @@ Each lean-tea private-constructor primitive → an OCaml `.mli` boundary:
   (rollback restores a revoked privilege), consumed one-time tokens (rollback is
   replay), counters and quotas (rollback is a reset), consent flags. Monotone
   state belongs on the session's Irmin branch, which is server-held and
-  versioned by construction - that is the branch's whole purpose.
+  versioned by construction - that is the branch's whole purpose. Amended by
+  step 24 (roadmap row 24): non-use is now build-enforced, not accidental. The
+  sink gate's member layer bans the five payload accessor spellings repo-wide -
+  the namespace allowlist grants no member rights, so even the designated Dream
+  sink modules are refused the family - and `test/session_payload_probe_test.ml`
+  (the single member-allowlisted file) pins upstream's exports at their types,
+  so a Dream rename breaks the build instead of leaving the scan hunting dead
+  names. Arming the trap now requires deliberately widening the member
+  allowlist, and this entry is what that review must confront: monotone state
+  goes on the session's Irmin branch, never in the cookie. Residuals unchanged
+  in kind from the namespace layer: code assembled at runtime is unreachable by
+  any static scan, and the probe file itself must never grow a real payload
+  call (its exact-count pins hold it to one spelling per name).
 - **R17 (low) - Dream's cookie session loader has two raises we deliberately do
   not catch.** `Cookie.load` calls `Yojson.Basic.from_string` unguarded and
   `failwith "Bad payload"` on a non-string payload value (Dream's own source
@@ -2788,7 +2803,53 @@ Each lean-tea private-constructor primitive → an OCaml `.mli` boundary:
     accident of non-use (`session_field` and its writers have zero
     callers), backed only by the register's warning. This step puts a
     code-level guard between `Dream.set_session_field` and monotone
-    state, so no future feature can arm the trap. **Planned.**
+    state, so no future feature can arm the trap. **Done.** (A MEMBER
+    layer in `test/sink_gate_test`: the five payload accessor
+    spellings - `session_field`, `set_session_field`,
+    `drop_session_field`, `all_session_fields`, `session_expires_at`
+    - are banned repo-wide in scrubbed source, whatever the
+    qualification (qualified path, alias, `let open`, record
+    projection, labelled argument): the NAME is the violation,
+    because a wrapper laundering the name is the exact route the ban
+    closes. A file allowlisted for the `Dream` NAMESPACE gets no
+    member rights from that entry - the sink modules themselves are
+    refused the payload family. The one sanctioned file is
+    `test/session_payload_probe_test.ml`: five typed value bindings
+    that pin Dream still exports these names at these types - an
+    upstream rename stops the build, the loud alarm that keeps the
+    member scan non-vacuous - while the gate pins the probe's bytes
+    back: each banned name exactly ONCE by count, so a deleted
+    binding reads zero and fails the gate. The non-payload session
+    API (`session_id`, `session_label`, `invalidate_session`) stays
+    legal, pinned by a GREEN fixture. Red-first: 19 predicted FAILs
+    with the probe unallowlisted, both layers lighting on its real
+    bytes. Mutation sweep step-24 M1-M8 - member pass deleted,
+    member world emptied, default-deny inverted, boundary dropped,
+    whole-compare weakened to prefix, probe binding deleted,
+    planted-RED inverted, member pass on raw bytes - all killed on
+    predicted checks; the boundary-dropped mutant first SURVIVED and
+    exposed a fixture blind spot (the non-match jump consumes
+    `my_session_field` whole, so only idents the lowercase trigger
+    cannot start, like `_session_field`, ever land the scan
+    mid-ident) - fixed by extending the fixture, then killed. The
+    review round (three scoped finders, one deep adversarial pass,
+    every finding adversarially re-verified against the live bytes)
+    confirmed two more defects, both fixed in this change. One: the
+    scrubber had no quoted-block arm in comment mode - OCaml's lexer
+    tracks `{id|...|id}` blocks inside comments, so a double quote
+    within one sent the machine into a comment-string and blanked
+    everything to the file's next stray quote, a green gate over a
+    live payload call in any future file that hit the pattern; a
+    `ComQuo` state now mirrors the lexer, four fixtures pin both
+    stripping directions, and mutants M9/M10 kill the arm's deletion
+    and its wrong-mode close. Two: the probe's compile pin lived only
+    in `test/dune`'s names list, invisible to every byte-level check -
+    dropping that one token left the whole gate green while the drift
+    alarm silently died; the gate now pins the wiring itself
+    (`test/dune` must still name the probe) and the probe's full
+    typed shape (`Dream` spelled exactly twelve times), leaving an
+    adversarial comment-out review-status, like R8's arms. Full
+    sweep M1-M10: 10/10 killed.)
 25. **Browser-local backend** - the client's missing tier: a
     browser-local IndexedDB store, so a tab keeps working from
     previously loaded data and its offline edits survive the tab

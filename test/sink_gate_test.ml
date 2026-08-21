@@ -26,7 +26,22 @@
     scanner on in-string fixtures - including a planted RED fixture asserted
     at exactly its two known violations - which this file's own scan then
     proves are invisible once stripped, because this very file is inside the
-    walk and is NOT allowlisted. *)
+    walk and is NOT allowlisted.
+
+    The MEMBER layer (roadmap step 24, R16): the five Dream session-payload
+    accessor spellings are banned repo-wide in scrubbed source, whatever the
+    qualification - [Dream.set_session_field], an alias, a [let open], a
+    record projection, a labelled argument, or a bare call under an open:
+    the NAME is the violation, because a wrapper laundering the name is
+    exactly the route this layer exists to close. The (file, namespace)
+    allowlist above does NOT reach here: a file allowed to speak [Dream] is
+    still refused the payload family. The single sanctioned file is
+    [test/session_payload_probe_test.ml], whose five typed bindings pin that
+    Dream still exports these names (rename upstream = compile failure, the
+    loud drift alarm), and whose byte counts this gate pins EXACTLY (one
+    occurrence per name; a deleted binding reads zero and fails the gate).
+    The banned names live in string literals here, so this file's own scan
+    stays genuinely clean with no self-exemption. *)
 
 let failures : int ref = ref 0
 
@@ -67,14 +82,18 @@ module Strip = struct
      become spaces; newlines survive so every later line number is the
      source's own. Character literals are skipped as code too, so a
      double-quote char literal cannot open a phantom string. Quoted blocks
-     inside comments are not tracked (this tree holds exactly one - a few
-     lines up in this very comment - and it is balanced; the comment-string
-     and comment-char-literal cases the lexer does force are pinned in the
-     unit tier). *)
+     inside comments are tracked too (ComQuo), per OCaml's lexer: a double
+     quote inside one is plain content, and before the arm existed it sent
+     the machine to ComStr and blanked everything to the file's next stray
+     quote - the step-24 review's confirmed finding, a green gate over a
+     live payload call in any future file that hit the pattern. The
+     comment-string and comment-char-literal cases the lexer forces stay
+     pinned in the unit tier. *)
   type mode =
     | Code
     | Com of int
     | ComStr of int
+    | ComQuo of int * string
     | Str
     | Quo of string
 
@@ -148,6 +167,15 @@ module Strip = struct
               blank c;
               blank '*';
               go (i + 2) (Com (d + 1)))
+            else if Char.equal c '{' then
+              let id = ident_after s (i + 1) in
+              if match_at s (i + 1 + String.length id) "|" then (
+                blank c;
+                String.iter blank (id ^ "|");
+                go (i + 2 + String.length id) (ComQuo (d, id)))
+              else (
+                blank c;
+                go (i + 1) (Com d))
             else if Char.equal c '*' && match_at s (i + 1) ")" then (
               blank c;
               blank ')';
@@ -203,6 +231,18 @@ module Strip = struct
             else (
               blank c;
               go (i + 1) (ComStr d))
+          | ComQuo (d, id) ->
+            (* A quoted block inside a comment: everything to its own
+               [|id}] is comment content - a double quote in here must not
+               open a comment-string, and a close-comment in here closes
+               nothing. The close returns to [Com d], never [Code]. *)
+            if Char.equal c '|' && match_at s (i + 1) (id ^ "}") then (
+              blank c;
+              String.iter blank (id ^ "}");
+              go (i + 2 + String.length id) (Com d))
+            else (
+              blank c;
+              go (i + 1) (ComQuo (d, id)))
           | Str ->
             if Char.equal c '\\' then (
               blank c;
@@ -276,6 +316,26 @@ module Namespace = struct
     | Ns_lwt_io, (Ns_dream | Ns_irmin_family | Ns_unix | Ns_lwt_unix) -> false
 end
 
+module Member = struct
+  (* The R16 payload family: Dream's session-payload accessors, banned by
+     SPELLING repo-wide (roadmap step 24). The names are data - string
+     literals - so this file's own scan cannot see them and needs no
+     exemption. [session_id], [session_label] and [invalidate_session] are
+     deliberately NOT here: they read or end the session, never its
+     rollback-able payload. [session_expires_at] IS here: its value rides
+     the client-held payload, so a decision made on it trusts a replayable
+     byte. *)
+  let all : string list =
+    [ "session_field"
+    ; "set_session_field"
+    ; "drop_session_field"
+    ; "all_session_fields"
+    ; "session_expires_at"
+    ]
+
+  let of_ident (id : string) : string option = List.find_opt (String.equal id) all
+end
+
 module Scan = struct
   type violation =
     { file : string
@@ -328,6 +388,61 @@ module Scan = struct
     String.split_on_char '\n' scrubbed
     |> List.mapi (fun (idx : int) (l : string) ->
            line_violations ~file ~line:(idx + 1) l)
+    |> List.concat
+
+  type member_violation =
+    { m_file : string
+    ; m_line : int
+    ; m_member : string
+    }
+
+  (* The member pass (step 24, R16). Boundary rules differ from the
+     namespace pass on purpose: the previous character must not be an
+     identifier character, but a DOT is an introduction here, not an
+     exclusion - [Dream.set_session_field], [D.session_field] and a record
+     projection [r.session_field] all spell the banned name. The identifier
+     is read to its end and compared WHOLE, so [session_fields] and
+     [my_session_field] stay legal ([my_session_field] via the non-match
+     jump to its ident end; the boundary clause itself carries the idents
+     the lowercase trigger cannot start, like [_session_field], where the
+     scan steps onto the [s] mid-ident). Same thunked folds as the namespace
+     pass: [~none:] is eager, and an eager arm here would re-scan the line's
+     remainder on every hit. *)
+  let member_line_violations ~(file : string) ~(line : int) (text : string) :
+      member_violation list =
+    let rec at (i : int) (acc : member_violation list) : member_violation list =
+      Option.fold (char_at text i)
+        ~none:(fun () -> List.rev acc)
+        ~some:(fun (c : char) () ->
+          let boundary_ok =
+            Option.fold (char_at text (i - 1)) ~none:true
+              ~some:(fun (p : char) -> not (is_ident_char p))
+          in
+          if ('a' <= c && c <= 'z') && boundary_ok then
+            let rec ident_end (j : int) : int =
+              Option.fold (char_at text j) ~none:j
+                ~some:(fun (ic : char) ->
+                  if is_ident_char ic then ident_end (j + 1) else j)
+            in
+            let e = ident_end i in
+            (* [char_at] proved [i] in range; [ident_end] stops at the first
+               out-of-range index, so [i <= e <= length]. *)
+            let id = String.sub text i (e - i) in (* @total-accessor *)
+            Option.fold (Member.of_ident id)
+              ~none:(fun () -> at e acc)
+              ~some:(fun (m : string) () ->
+                at e ({ m_file = file; m_line = line; m_member = m } :: acc))
+              ()
+          else at (i + 1) acc)
+        ()
+    in
+    at 0 []
+
+  let member_violations ~(file : string) (scrubbed : string) :
+      member_violation list =
+    String.split_on_char '\n' scrubbed
+    |> List.mapi (fun (idx : int) (l : string) ->
+           member_line_violations ~file ~line:(idx + 1) l)
     |> List.concat
 end
 
@@ -398,12 +513,37 @@ module Allowlist = struct
     ; ("test/store_pack_flush_test.ml", Namespace.Ns_lwt_unix)
     ; ("test/store_pack_flush_test.ml", Namespace.Ns_unix)
     ; ("test/test_util.ml", Namespace.Ns_lwt_unix)
+      (* The R16 probe (step 24): five typed bindings against Dream, value
+         references only - the compile-time pin behind the member layer. *)
+    ; ("test/session_payload_probe_test.ml", Namespace.Ns_dream)
     ]
 
   let is_allowed (file : string) (ns : Namespace.t) : bool =
     List.exists
       (fun ((f : string), (n : Namespace.t)) ->
         String.equal f file && Namespace.equal n ns)
+      entries
+end
+
+module Member_allowlist = struct
+  (* The member layer's whole allowlist: the compile-time existence probe,
+     and nothing else. Counts are EXACT, not [>= 1]: the probe spells each
+     banned name exactly once (its typed binding), so a drifted probe -
+     binding deleted, name spelled twice, a stray mention grown - fails the
+     gate in either direction. A file allowed a NAMESPACE above gets no
+     member rights from that entry. *)
+  let entries : (string * string * int) list =
+    [ ("test/session_payload_probe_test.ml", "session_field", 1)
+    ; ("test/session_payload_probe_test.ml", "set_session_field", 1)
+    ; ("test/session_payload_probe_test.ml", "drop_session_field", 1)
+    ; ("test/session_payload_probe_test.ml", "all_session_fields", 1)
+    ; ("test/session_payload_probe_test.ml", "session_expires_at", 1)
+    ]
+
+  let is_allowed (file : string) (member : string) : bool =
+    List.exists
+      (fun ((f : string), (m : string), (_ : int)) ->
+        String.equal f file && String.equal m member)
       entries
 end
 
@@ -455,6 +595,16 @@ let () =
     (has_token "let r = \"a\" ^ Dream.target \"b\"\n" "Dream");
   check "unit: a char-literal double quote does not open a string"
     (has_token "let c = '\"' let d = Unix.getpid ()\n" "Unix");
+  check
+    "unit: a quoted block inside a comment cannot open a comment-string (code after the comment stays visible)"
+    (has_token "(* doc: {| say \"hi |} *) let u = Unix.getpid ()\n" "Unix");
+  check "unit: a quoted block inside a comment is still comment content"
+    (not (has_token "(* {| Unix.fork |} *) let a = 1\n" "Unix"));
+  check "unit: comment text after an inner quoted block is still comment"
+    (not (has_token "(* {| x |} Unix.fork is still commented *) let c = 3\n" "Unix"));
+  check
+    "unit: a close-comment inside a comment's quoted block does not end the comment"
+    (not (has_token "(* {| *) Unix.fork |} *) let b = 2\n" "Unix"));
   (* The planted RED fixture: exactly two violations, at their known lines,
      via two different introductions (qualified path; module alias). *)
   let red = "let now = Unix.gettimeofday ()\nmodule D = Dream\n" in
@@ -481,7 +631,67 @@ let () =
     (not (has_token "let y = My_unix.go and z = Dreamer.spin\n" "Unix"));
   (* DEFAULT-DENY probe, hermetic and in-process. *)
   check "unit: default-deny - an unknown (file, namespace) pair is refused"
-    (not (Allowlist.is_allowed "lib/tea_core/app.ml" Namespace.Ns_dream))
+    (not (Allowlist.is_allowed "lib/tea_core/app.ml" Namespace.Ns_dream));
+  (* Member layer (step 24, R16): the payload family by spelling. *)
+  let member_hits (s : string) : Scan.member_violation list =
+    Scan.member_violations ~file:"fixture" (Strip.scrub s)
+  in
+  let has_member (s : string) (m : string) : bool =
+    List.exists
+      (fun (v : Scan.member_violation) -> String.equal v.m_member m)
+      (member_hits s)
+  in
+  check "unit: a qualified payload write is flagged"
+    (has_member "let () = ignore (Dream.set_session_field r k v)\n"
+       "set_session_field");
+  check
+    "unit: qualified / let-open / record-projection / labelled spellings are all flagged"
+    (List.length
+       (member_hits
+          "let a r = Dream.session_field r\n\
+           let open D in drop_session_field r\n\
+           let c r = r.all_session_fields\n\
+           let d ~session_expires_at:(x : float) = x\n")
+    = 4);
+  check "unit: a comment's payload mention is blanked"
+    (not (has_member "(* set_session_field is banned *) let x = 1\n"
+            "set_session_field"));
+  check "unit: a string's payload mention is blanked"
+    (not (has_member "let s = \"set_session_field\"\n" "set_session_field"));
+  check
+    "unit: the comment quoted-block desync cannot hide a payload call (step-24 review)"
+    (has_member "(* {| \" |} *) let f r = Dream.set_session_field r\n"
+       "set_session_field");
+  check
+    "unit: an identifier merely CONTAINING a banned name is legal (whole-ident compare)"
+    (List.length
+       (member_hits
+          "let session_fields = 3 and my_session_field = 4 and session_field' = 5 and _session_field = 6\n")
+    = 0);
+  check
+    "unit: the non-payload session API stays legal (session_id, session_label, invalidate_session)"
+    (List.length
+       (member_hits
+          "let a r = Dream.session_id r\n\
+           let b r = Dream.session_label r\n\
+           let c r = Dream.invalidate_session r\n")
+    = 0);
+  (* The planted RED member fixture: exactly two, at their known lines. *)
+  let redm = "let f r = Dream.session_field r\nlet g r = r.session_expires_at\n" in
+  let vsm = member_hits redm in
+  check "unit: the planted RED member fixture yields EXACTLY its two violations"
+    (List.length vsm = 2);
+  check "unit: the planted member violations carry their exact lines and members"
+    (List.exists
+       (fun (v : Scan.member_violation) ->
+         v.m_line = 1 && String.equal v.m_member "session_field")
+       vsm
+    && List.exists
+         (fun (v : Scan.member_violation) ->
+           v.m_line = 2 && String.equal v.m_member "session_expires_at")
+         vsm);
+  check "unit: default-deny - an unknown (file, member) pair is refused"
+    (not (Member_allowlist.is_allowed "lib/tea_core/app.ml" "set_session_field"))
 
 (* ------------------------------------------------------------------ *)
 (* End-to-end tier: the real tree walk under the dune sandbox.         *)
@@ -518,11 +728,22 @@ let walked : (string * string) list =
              (display_name ~root_fs ~root_name p, read_file p)))
     roots
 
+(* Scrub once; both passes - namespace and member - read the same bytes. *)
+let scrubbed_walked : (string * string) list =
+  List.map
+    (fun ((file : string), (contents : string)) -> (file, Strip.scrub contents))
+    walked
+
 let all_violations : Scan.violation list =
   List.concat_map
-    (fun ((file : string), (contents : string)) ->
-      Scan.violations ~file (Strip.scrub contents))
-    walked
+    (fun ((file : string), (scrubbed : string)) -> Scan.violations ~file scrubbed)
+    scrubbed_walked
+
+let all_member_violations : Scan.member_violation list =
+  List.concat_map
+    (fun ((file : string), (scrubbed : string)) ->
+      Scan.member_violations ~file scrubbed)
+    scrubbed_walked
 
 let () =
   let lib_count =
@@ -595,6 +816,64 @@ let () =
      grown enum must revisit the allowlist and these checks. *)
   check "e2e: the audited namespace world is exactly the R7 four plus Lwt_io"
     (List.length Namespace.all = 5);
+  (* The member layer's gate (step 24, R16): one FAIL line per offender. *)
+  let member_offenders =
+    List.filter
+      (fun (v : Scan.member_violation) ->
+        not (Member_allowlist.is_allowed v.m_file v.m_member))
+      all_member_violations
+  in
+  List.iter
+    (fun (v : Scan.member_violation) ->
+      check
+        (Printf.sprintf
+           "e2e: %s:%d: banned payload member %s (R16: the cookie payload is rollback-able; monotone state belongs on the Irmin branch)"
+           v.m_file v.m_line v.m_member)
+        false)
+    member_offenders;
+  check
+    "e2e: zero un-allowlisted payload-member occurrences in lib/ + examples/ + test/"
+    (List.length member_offenders = 0);
+  let member_occurrences (file : string) (member : string) : int =
+    List.length
+      (List.filter
+         (fun (v : Scan.member_violation) ->
+           String.equal v.m_file file && String.equal v.m_member member)
+         all_member_violations)
+  in
+  List.iter
+    (fun ((f : string), (m : string), (n : int)) ->
+      check
+        (Printf.sprintf
+           "e2e: member allowlist entry (%s, %s) occurs EXACTLY %d time(s) (saw %d)"
+           f m n (member_occurrences f m))
+        (member_occurrences f m = n))
+    Member_allowlist.entries;
+  check "e2e: the R16 probe file is in the walk"
+    (List.exists
+       (fun ((f : string), (_ : string)) ->
+         String.equal f "test/session_payload_probe_test.ml")
+       walked);
+  (* The five typed bindings' FULL shape, not just the banned names: each
+     binding spells [Dream] for its request type, its promise type where
+     one exists, and the accessor itself. A probe degraded to bare local
+     bindings would keep the member counts at one but lose this. *)
+  let probe_dream =
+    occurrences "test/session_payload_probe_test.ml" Namespace.Ns_dream
+  in
+  check
+    (Printf.sprintf
+       "e2e: the probe spells Dream exactly 12 times - the five typed bindings' full shape (saw %d)"
+       probe_dream)
+    (probe_dream = 12);
+  check "e2e: the banned payload-member world is exactly the R16 five"
+    (List.length Member.all = 5);
+  check
+    "e2e: this gate's own member fixtures are invisible to its walk (strings scrub)"
+    (List.for_all
+       (fun (v : Scan.member_violation) ->
+         not (String.equal v.m_file "test/sink_gate_test.ml"))
+       all_member_violations);
   (* R8's arm-distinctness stays a review obligation (a textual arm pin is
      refactor-fragile and substring-unsafe - see the register); what IS
      pinned mechanically is the artifact that backs the review: the csrf
@@ -623,12 +902,22 @@ let () =
     (Printf.sprintf
        "e2e: R8's backing artifact is non-trivial (csrf_test check-lines >= 30; saw %d)"
        csrf_checks)
-    (csrf_checks >= 30)
+    (csrf_checks >= 30);
+  (* Step 24's one unpinned link, closed after review: the probe's compile
+     pin lives in test/dune's (names ...) list, which no byte-level check
+     above can see - drop that one token and every check here stays green
+     while the drift alarm silently dies. The dune file is in this stanza's
+     own source_tree, so pin the wiring itself. Token presence is the pin:
+     it catches the innocent 'temporarily disable the test' edit; an
+     adversarial comment-out stays review-status, like R8's arms. *)
+  check
+    "e2e: the probe is WIRED - test/dune names session_payload_probe_test (the compile pin cannot be silently dropped)"
+    (contains (read_file "dune") "session_payload_probe_test")
 
 let () =
   if !failures = 0 then (
     Printf.printf
-      "\nThe R7 sink boundary is mechanical: %d files walked, every sink use allowlisted (roadmap step 23).\n%!"
+      "\nThe R7 sink boundary is mechanical: %d files walked, every sink use allowlisted (roadmap step 23); the R16 payload family is member-banned, probe-pinned (step 24).\n%!"
       (List.length walked);
     exit 0)
   else (
