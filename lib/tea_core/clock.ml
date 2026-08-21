@@ -14,6 +14,8 @@ let rec seed (t : t) (d : int64) : unit =
   else if Atomic.compare_and_set t.last cur d then ()
   else seed t d
 
+let floor (t : t) : int64 = Atomic.get t.last
+
 let rec next (t : t) : stamp =
   let cur = Atomic.get t.last in
   (* Saturate at max_int rather than wrap: strict monotonicity is this

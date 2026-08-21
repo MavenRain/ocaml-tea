@@ -253,6 +253,8 @@ struct
   module Rc = Tea_client.Reconnect
   module Delivery = Tea_client.Delivery
   module Channel = Tea_client.Local_channel
+  module Store = Tea_client.Local_store.Make (A)
+  module Flow = Store.Flow (Idb)
 
   (* --- Live subscription state (one mount per page life) ------------------
 
@@ -267,16 +269,19 @@ struct
      edits made while [conn] could not send. Both are driven by pure state
      machines in [Tea_client]; everything below is the effect half. *)
 
-  (* The websocket tab's delivery identity, minted once per page load (D15) by
-     the module-level {!mint_tab}. The keyed RPC channel draws its own from the
-     same mint and must never share this one: the two channels number their
-     streams independently, so one id across both would make each channel's
-     first frame look like a replay of the other's. *)
+  (* The websocket tab's delivery identity now lives inside the boot gate
+     (D25): minted by the module-level {!mint_tab} when hydration rules out a
+     persisted record, or ADOPTED from one. The keyed RPC channel draws its
+     own from the same mint and must never share it: the two channels number
+     their streams independently, so one id across both would make each
+     channel's first frame look like a replay of the other's. *)
 
   type live =
     { mutable app : (Client.state, A.msg) Vdom_blit.app option
     ; mutable conn : (WS.t, W.timeout_id) Rc.t
-    ; mutable delivery : A.msg Delivery.t
+    ; mutable gate : Store.gate
+    ; mutable store_conn : Flow.conn option
+    ; mutable root : Js_browser.Element.t option
     ; mutable applying_remote : bool
     ; mutable intervals : (int * W.interval_id) list
     }
@@ -284,7 +289,9 @@ struct
   let live : live =
     { app = None
     ; conn = Rc.down
-    ; delivery = Delivery.v ~tab:(mint_tab ())
+    ; gate = Store.buffering
+    ; store_conn = None
+    ; root = None
     ; applying_remote = false
     ; intervals = []
     }
@@ -318,6 +325,158 @@ struct
            | Subs.Spec_every (ms', f) -> if Int.equal ms ms' then dispatch (f now)
            | Subs.Spec_store (_ : A.model -> A.msg) -> ())
 
+  (* --- The browser-local checkpoint (roadmap step 25, D25) ----------------
+
+     Fire-and-forget: persistence never gates dispatch, forward or send.
+     Every failure classifies into the closed [idb_error] surface, logs once
+     per kind, and leaves the page exactly as live as before step 25. *)
+
+  let err_name (e : Tea_client.Local_store.idb_error) : string =
+    match e with
+    | Tea_client.Local_store.Unsupported -> "Unsupported"
+    | Tea_client.Local_store.Blocked -> "Blocked"
+    | Tea_client.Local_store.Version_error -> "VersionError"
+    | Tea_client.Local_store.Quota_exceeded -> "QuotaExceededError"
+    | Tea_client.Local_store.Not_found -> "NotFoundError"
+    | Tea_client.Local_store.Other s -> s
+
+  let checkpoint_logged : string list ref = ref []
+
+  (* Once per KIND, deduplicated on the constructor: the [Other] family
+     shares one slot, so a browser that varies its error text cannot grow
+     the list past the six constructors. *)
+  let err_bucket (e : Tea_client.Local_store.idb_error) : string =
+    match e with
+    | Tea_client.Local_store.Other (_ : string) -> "Other"
+    | Tea_client.Local_store.Unsupported | Tea_client.Local_store.Blocked
+    | Tea_client.Local_store.Version_error
+    | Tea_client.Local_store.Quota_exceeded
+    | Tea_client.Local_store.Not_found ->
+      err_name e
+
+  let log_checkpoint_error (e : Tea_client.Local_store.idb_error) : unit =
+    let bucket = err_bucket e in
+    if List.exists (String.equal bucket) !checkpoint_logged then ()
+    else (
+      checkpoint_logged := bucket :: !checkpoint_logged;
+      log ("tea_client_run: local checkpoint failed (" ^ err_name e ^ ")"))
+
+  (* The record is written under the replica the queue belongs to: the
+     confirmed identity once a Hello has arrived, else the ADOPTED identity
+     still awaiting its verdict. A provisional page with nothing adopted has
+     no honest key and skips - there is nothing worth surviving yet. *)
+  let key_replica () : Tea_core.Crdt.Replica.t option =
+    if Tea_client.Identity.is_provisional () then
+      Store.unconfirmed_replica live.gate
+    else Some (Tea_client.Identity.replica ())
+
+  let checkpoint () : unit =
+    Option.iter
+      (fun (replica : Tea_core.Crdt.Replica.t) ->
+        Store.delivery live.gate
+        |> Option.iter (fun (delivery : A.msg Delivery.t) ->
+               shared_model ()
+               |> Option.iter (fun (model : A.model) ->
+                      Flow.checkpoint live.store_conn
+                        (Store.checkpoint_record ~replica ~delivery
+                           ~clock_floor:(Tea_client.Identity.clock_floor ())
+                           ~model
+                           ~now_ms:(Js_browser.Date.now ()))
+                        ~k:
+                          (Result.fold ~ok:(fun () -> ())
+                             ~error:(fun (e : Tea_client.Local_store.idb_error)
+                               ->
+                                 log_checkpoint_error e;
+                                 (* A write failure means the store no longer
+                                    tracks this page; a record that lies about
+                                    [next] costs the NEXT life its first edits
+                                    (R28). Clear it and degrade, once. *)
+                                 Flow.invalidate live.store_conn
+                                   ~k:
+                                     (Result.fold ~ok:(fun () -> ())
+                                        ~error:log_checkpoint_error))))))
+      (key_replica ())
+
+  (* Timeout-0 coalescing: a burst of updates in one task writes once. *)
+  let checkpoint_scheduled : bool ref = ref false
+
+  let schedule_checkpoint () : unit =
+    if !checkpoint_scheduled then ()
+    else (
+      checkpoint_scheduled := true;
+      let (_ : W.timeout_id) =
+        W.set_timeout window
+          (fun () ->
+            checkpoint_scheduled := false;
+            checkpoint ())
+          0
+      in
+      ())
+
+  let clear_provisional () : unit =
+    Option.iter
+      (fun (root : Js_browser.Element.t) ->
+        Js_browser.Element.remove_attribute root "data-tea-provisional")
+      live.root
+
+  (* The optimistic mirror (DESIGN §7): every locally-born msg is also sent up
+     the live socket; the server drives it through the same [update] and the
+     committed head comes back as a [Store_watch] frame.
+
+     D9: a msg born while the link is not [Up] is no longer merely "applied
+     locally and logged"  -  it goes into the outbox and is replayed on
+     reconnect. [Rc.sendable] is [Some] in the [Up] state only, deliberately
+     including CONNECTING under "buffer it": a [send] on a connecting socket
+     raises in the browser. *)
+  (* One frame, sent if the link can carry it. A send that cannot happen is not
+     an error and needs no branch: the entry is already recorded, so it stays in
+     the queue and the next reconnect replays it (D15). *)
+  let send_one ~(tab : Tea_core.Prim.Tab_id.t)
+      ((seq : Tea_core.Prim.Msg_seq.t), (msg : A.msg)) : unit =
+    Option.iter
+      (fun ws ->
+        WS.send ws
+          (Codec.up_to_json
+             (Tea_core.Wire.Apply
+                { tab = Tea_core.Prim.Tab_id.to_string tab
+                ; seq = Tea_core.Prim.Msg_seq.to_int seq
+                ; msg
+                })))
+      (Rc.sendable live.conn)
+
+  (* Record FIRST, send second. Before D15 this buffered only when the link was
+     down, so a message handed to a socket that then died was in no queue at all
+     and was lost silently. Now every shared message is recorded, and the only
+     thing the link state changes is whether the send happens now or on
+     reconnect - or, since D25, whether the gate is even live yet: a payload
+     recorded while buffering or while an adopted queue awaits its verdict is
+     withheld here and released by the flush that follows resolution. *)
+  let send_or_buffer (msg : A.msg) : unit =
+    let gate, entry = Store.record_msg msg live.gate in
+    live.gate <- gate;
+    Option.iter
+      (fun (e : Tea_core.Prim.Msg_seq.t * A.msg) ->
+        Store.delivery live.gate
+        |> Option.iter (fun (d : A.msg Delivery.t) ->
+               send_one ~tab:(Delivery.tab d) e))
+      entry;
+    schedule_checkpoint ()
+
+  (* Replay in the order the edits were made, and do NOT empty the queue: an
+     entry leaves only when the server acknowledges it. Re-sending an entry the
+     server already has is safe because the server de-duplicates above
+     [A.update] ([Tea_server.Replay_guard]) - not because of anything here.
+     [Store.replay] is [None] while the gate buffers or while an adopted queue
+     awaits its first Hello (D25), so a flush physically cannot leak an
+     unconfirmed queue. *)
+  let flush_outbox () : unit =
+    Option.iter
+      (fun
+          ((tab, entries) :
+            Tea_core.Prim.Tab_id.t * (Tea_core.Prim.Msg_seq.t * A.msg) list)
+        -> List.iter (send_one ~tab) entries)
+      (Store.replay live.gate)
+
   (* A down-frame from the server ({!Tea_core.Wire.down}). Every [Store_watch]
      leaf of the *current* subscriptions turns the resulting head into a msg;
      decode failure is loud (it would mean codec drift, thesis T3's one
@@ -345,13 +504,24 @@ struct
            announced, not the one it superseded. *)
         | Tea_client.Rebase.Resync (replica, head) ->
           Tea_client.Identity.adopt replica;
-          to_subs head
+          to_subs head;
+          (* The first Hello is the adoption verdict (D25): a matching replica
+             releases the withheld queue; a mismatch drops exactly the adopted
+             prefix and flushes what was born here. Later Hellos are [Idle]. *)
+          let gate, eff = Store.confirm ~announced:replica live.gate in
+          live.gate <- gate;
+          (match eff with
+          | Store.Idle -> ()
+          | Store.Flush | Store.Prune_and_flush -> flush_outbox ());
+          clear_provisional ();
+          schedule_checkpoint ()
         | Tea_client.Rebase.Rebased head -> to_subs head
         (* An acknowledgement touches the delivery queue and nothing else: it
            carries no model, so there is no store-watch msg to dispatch and no
            dot to mint (D15). *)
         | Tea_client.Rebase.Acked seq ->
-          live.delivery <- Delivery.ack seq live.delivery)
+          live.gate <- Store.ack seq live.gate;
+          schedule_checkpoint ())
       ~error:(fun (Codec.Decode_failed reason) ->
         log ("tea_client_run: undecodable model frame: " ^ reason))
 
@@ -362,48 +532,6 @@ struct
       else "ws://"
     in
     scheme ^ Js_browser.Location.host loc ^ Tea_core.Wire.ws_path
-
-  (* The optimistic mirror (DESIGN §7): every locally-born msg is also sent up
-     the live socket; the server drives it through the same [update] and the
-     committed head comes back as a [Store_watch] frame.
-
-     D9: a msg born while the link is not [Up] is no longer merely "applied
-     locally and logged"  -  it goes into the outbox and is replayed on
-     reconnect. [Rc.sendable] is [Some] in the [Up] state only, deliberately
-     including CONNECTING under "buffer it": a [send] on a connecting socket
-     raises in the browser. *)
-  (* One frame, sent if the link can carry it. A send that cannot happen is not
-     an error and needs no branch: the entry is already recorded, so it stays in
-     the queue and the next reconnect replays it (D15). *)
-  let send_one ((seq : Tea_core.Prim.Msg_seq.t), (msg : A.msg)) : unit =
-    Option.iter
-      (fun ws ->
-        WS.send ws
-          (Codec.up_to_json
-             (Tea_core.Wire.Apply
-                { tab = Tea_core.Prim.Tab_id.to_string (Delivery.tab live.delivery)
-                ; seq = Tea_core.Prim.Msg_seq.to_int seq
-                ; msg
-                })))
-      (Rc.sendable live.conn)
-
-  (* Record FIRST, send second. Before D15 this buffered only when the link was
-     down, so a message handed to a socket that then died was in no queue at all
-     and was lost silently. Now every shared message is recorded, and the only
-     thing the link state changes is whether the send happens now or on
-     reconnect. *)
-  let send_or_buffer (msg : A.msg) : unit =
-    Option.iter
-      (fun ((d : A.msg Delivery.t), (entry : Tea_core.Prim.Msg_seq.t * A.msg)) ->
-        live.delivery <- d;
-        send_one entry)
-      (Delivery.record msg live.delivery)
-
-  (* Replay in the order the edits were made, and do NOT empty the queue: an
-     entry leaves only when the server acknowledges it. Re-sending an entry the
-     server already has is safe because the server de-duplicates above
-     [A.update] ([Tea_server.Replay_guard]) - not because of anything here. *)
-  let flush_outbox () : unit = List.iter send_one (Delivery.unacked live.delivery)
 
   let forward (msg : A.msg) : unit =
     if not live.applying_remote then send_or_buffer msg
@@ -416,6 +544,28 @@ struct
   let mark_up (ws : WS.t) : unit =
     live.conn <- Rc.on_up ~sock:ws live.conn;
     Option.iter (fun (_ : WS.t) -> flush_outbox ()) (Rc.sendable live.conn)
+
+  (* Adoption endpoint (D25): called exactly once per page life, from the one
+     hydration-kickoff arm that ran. The gate turns live here; pending
+     payloads number after anything adopted; a stale paint rides {!to_subs},
+     so the [applying_remote] fence suppresses the echo for free. *)
+  let resolve_gate (outcome : Store.record option) : unit =
+    let confirmed =
+      if Tea_client.Identity.is_provisional () then None
+      else Some (Tea_client.Identity.replica ())
+    in
+    let { Store.gate; paint; seed } =
+      Store.resolve ~mint:mint_tab ~confirmed
+        (outcome
+        |> Option.fold ~none:Store.No_record
+             ~some:(fun (r : Store.record) -> Store.Adopt r))
+        live.gate
+    in
+    live.gate <- gate;
+    Option.iter (fun (floor : int64) -> Tea_client.Identity.clock_seed floor) seed;
+    Option.iter (fun (model : A.model) -> to_subs model) paint;
+    if Store.flushable live.gate then flush_outbox ();
+    schedule_checkpoint ()
 
   (* D8: a close is classified against the socket the machine holds, and an
      unrecognised one does nothing at all  -  a superseded socket's close event
@@ -509,6 +659,10 @@ struct
           | Channel.Local_only -> ()
           | Channel.Shared -> forward msg);
           resync (Client.shared state');
+          (* Every update - local, remote or companion-only - refreshes the
+             browser-local checkpoint; the timeout-0 flag coalesces a burst
+             into one write (D25). *)
+          schedule_checkpoint ();
           (state', cmd))
     }
 
@@ -540,14 +694,49 @@ struct
       (Prim.Title.to_string A.title);
     let app = Vdom_blit.run ~env hooked_app in
     live.app <- Some app;
+    let root = Vdom_blit.dom app in
+    live.root <- Some root;
+    (* Provisional until the first Hello (D25): a hydrated paint is honest
+       about not being server truth. Set before hydration can possibly
+       paint; cleared in the Resync arm, the earliest moment a verdict
+       exists. *)
+    Js_browser.Element.set_attribute root "data-tea-provisional" "true";
     Js_browser.Element.append_child
       (Js_browser.Document.body (W.document window))
-      (Vdom_blit.dom app);
+      root;
     resync (Client.shared (Vdom_blit.get app));
     dispatch_url app;
     W.add_event_listener window Js_browser.Event.Popstate
       (fun (_ : Js_browser.Event.t) -> dispatch_url app)
-      false
+      false;
+    (* Late checkpoints for the page's last edits: pagehide is the reliable
+       end-of-life signal, and visibilitychange catches the mobile
+       backgrounding that never fires pagehide. Both call the checkpoint
+       directly - a timeout scheduled here may never run. *)
+    W.add_event_listener window Js_browser.Event.Pagehide
+      (fun (_ : Js_browser.Event.t) -> checkpoint ())
+      false;
+    W.add_event_listener window Js_browser.Event.Visibilitychange
+      (fun (_ : Js_browser.Event.t) -> checkpoint ())
+      false;
+    (* Hydration kickoff (D25): sole-writer election, then boot and adopt.
+       Every degrade arm resolves the gate memory-only - exactly the
+       pre-step-25 page - and the mount above never waited on any of it. *)
+    if Idb.supported () && Tab_lock.supported () then
+      Tab_lock.acquire
+        ~name:
+          (Tea_client.Local_store.lock_name
+             ~title:(Prim.Title.to_string A.title))
+        ~granted:(fun (got : bool) ->
+          if got then
+            Flow.boot ~title:(Prim.Title.to_string A.title)
+              ~k:(fun
+                  ((conn : Flow.conn option), (records : Store.record list))
+                ->
+                live.store_conn <- conn;
+                resolve_gate (Store.choose records))
+          else resolve_gate None)
+    else resolve_gate None
 
   let boot () = W.set_onload window main
 end

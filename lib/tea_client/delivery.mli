@@ -42,6 +42,23 @@ val record : 'msg -> 'msg t -> ('msg t * (Tea_core.Prim.Msg_seq.t * 'msg)) optio
     the tab has stopped sending. A defined arm rather than a wraparound, and
     unreachable in a page life. *)
 
+val next_seq : 'msg t -> Tea_core.Prim.Msg_seq.t
+(** The number the next {!record} will use. A pure peek, persisted (D25) so a
+    later page life resumes numbering past every seq this one ever minted,
+    even when the queue has fully drained. *)
+
+val of_persisted :
+  tab:Tea_core.Prim.Tab_id.t ->
+  next:Tea_core.Prim.Msg_seq.t ->
+  queue:(Tea_core.Prim.Msg_seq.t * 'msg) list ->
+  'msg t option
+(** Rebuild a queue from a persisted checkpoint (step 25, D25). [queue] is
+    oldest-first, exactly {!unacked}'s order. [None] unless the seqs are
+    strictly increasing and every one is strictly below [next]: a record that
+    fails this is corrupt and is discarded whole, never partially trusted.
+    Law: [of_persisted ~tab:(tab t) ~next:(next_seq t) ~queue:(unacked t)]
+    rebuilds [t]'s observable state ([tab]/[next_seq]/[unacked] all agree). *)
+
 val ack : Tea_core.Prim.Msg_seq.t -> 'msg t -> 'msg t
 (** Cumulative: drop every entry at or below [seq]. Idempotent and total, so a
     duplicated, late or out-of-order acknowledgement is harmless, and one for a

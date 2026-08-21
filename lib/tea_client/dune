@@ -1,3 +1,8 @@
 (library
  (name tea_client)
- (libraries tea_core vdom.base))
+ (libraries
+  tea_core
+  vdom.base
+  ; [Local_store] names [Repr.*] to build its record witness; explicit under
+  ; (implicit_transitive_deps false).
+  repr))

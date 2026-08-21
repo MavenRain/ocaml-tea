@@ -22,6 +22,26 @@ let record (msg : 'msg) (t : 'msg t) : ('msg t * (Msg_seq.t * 'msg)) option =
   |> Option.map (fun (next : Msg_seq.t) ->
          ({ t with next; queue = (t.next, msg) :: t.queue }, (t.next, msg)))
 
+let next_seq (t : 'msg t) : Msg_seq.t = t.next
+
+let of_persisted ~(tab : Tea_core.Prim.Tab_id.t) ~(next : Msg_seq.t)
+    ~(queue : (Msg_seq.t * 'msg) list) : 'msg t option =
+  (* Total validation fold: outer [None] = corrupt, inner value = the last seq
+     seen ([None] before the first). Strictly increasing and strictly below
+     [next], or the whole record is refused - never partially trusted. *)
+  List.fold_left
+    (fun (acc : Msg_seq.t option option) ((n : Msg_seq.t), (_ : 'msg)) ->
+      Option.bind acc (fun (prev : Msg_seq.t option) ->
+          let increases =
+            Option.fold ~none:true
+              ~some:(fun (p : Msg_seq.t) -> Msg_seq.compare p n < 0)
+              prev
+          in
+          if increases && Msg_seq.compare n next < 0 then Some (Some n) else None))
+    (Some None) queue
+  |> Option.map (fun (_ : Msg_seq.t option) ->
+         { tab; next; queue = List.rev queue })
+
 let ack (seq : Msg_seq.t) (t : 'msg t) : 'msg t =
   { t with
     queue = List.filter (fun ((n : Msg_seq.t), (_ : 'msg)) -> Msg_seq.compare n seq > 0) t.queue

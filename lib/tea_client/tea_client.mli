@@ -21,6 +21,7 @@ module Rebase = Rebase
 module Delivery = Delivery
 module Rpc_delivery = Rpc_delivery
 module Local_channel = Local_channel
+module Local_store = Local_store
 
 (** {2 This tab's CRDT identity}
 
@@ -61,6 +62,17 @@ module Identity : sig
       replica over the page's one monotonic clock. The clock survives an
       {!adopt} - resetting it could let two dots minted either side of the
       announcement collide once the ids agree. *)
+
+  val clock_floor : unit -> int64
+  (** The page clock's current floor, a pure peek (step 25, D25): persisted
+      with each checkpoint so a later page life can {!clock_seed} strictly
+      above every stamp this one used. *)
+
+  val clock_seed : int64 -> unit
+  (** Raise the page clock's floor; it never lowers. Called once at hydration
+      with the adopted record's floor, before any local mint, so an adopted
+      replica's new dots cannot collide with the ones it minted in its
+      earlier life. *)
 end
 
 (** {2 Client command extensions}

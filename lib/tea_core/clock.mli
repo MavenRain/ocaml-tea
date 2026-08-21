@@ -22,6 +22,12 @@ val seed : t -> int64 -> unit
     each branch-head [Info] date when a store handle (re)opens, so stamps
     resume strictly above everything already in history. *)
 
+val floor : t -> int64
+(** The current floor: the last stamp minted or value seeded, [Int64.min_int]
+    before either. A pure peek - it never mints, so two consecutive reads are
+    equal. The client tier persists it (step 25, D25) so a later page life can
+    {!seed} strictly above every stamp this one used. *)
+
 val next : t -> stamp
 (** Strictly greater than every stamp minted on [t] and every value seeded
     into it; lock-free compare-and-set retry. *)

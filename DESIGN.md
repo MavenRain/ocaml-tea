@@ -61,6 +61,7 @@ toolchain removes an entire tier lean-tea had to hand-write.
 | `test/sink_gate_test` (own zero-library stanza with `source_tree` deps; byte-blanking comment/string stripper incl. nested comments, strings-inside-comments AND char-literals-inside-comments per OCaml's lexer; any spelling of a sink occurrence flagged - qualified path, open/include/let-open, module alias, functor argument; Irmin family prefix; five audited namespaces incl. `Lwt_io`; pinned `(file, namespace)` allowlist, default-deny `file:line`, load-bearing entry self-check; exact-count anti-vacuity pins 72 `lib/` files / 24 `Unix` occurrences in `session_secret.ml`; planted RED/GREEN inline fixtures; `csrf_test` existence + >= 30 check-lines pin) | **passes** (confirmed by mutation: M1-M8 killed on predicted checks, both stripping directions; roadmap step 23) |
 | Member layer in `test/sink_gate_test` (the R16 payload family - `session_field`, `set_session_field`, `drop_session_field`, `all_session_fields`, `session_expires_at` - banned by SPELLING repo-wide in scrubbed source, whatever the qualification; a namespace allowlist entry grants no member rights, so the Dream sink modules themselves are refused the family; single member-allowlisted file = `test/session_payload_probe_test.ml`, five typed bindings pinning Dream's exports at their types, each name EXACTLY once by count; non-payload `session_id`/`session_label`/`invalidate_session` pinned legal; review round: comment-mode quoted-block arm (`ComQuo`) added to the stripper - a `"` inside `{id|...|id}` in a comment previously blanked the rest of the file, blinding BOTH passes for future files - plus the probe-wiring pin (`test/dune` must name the probe) and the probe's exact `Dream`-shape pin (12)) | **passes** (red-first: 19 predicted FAILs with the probe unallowlisted; confirmed by mutation: step-24 M1-M10 killed on predicted checks incl. the raw-bytes, prefix-compare and both comment-quoted-block directions; roadmap step 24, R16) |
 | `test/reaper_loop_test` (L1-L6: queue-backed timer, stop-wins-ties, sweep-completes-before-resolve, `Lwt.state` anti-hang assertions), `test/reaper_wiring_test` (W1/W2/W4: a real journal-backed guard on a real pack root, the Forget tombstone honored across a reopen against the pre-sweep head snapshot, the replay reading Fresh, sweep continuation past a closed sink, reserved refs never reaching the hook), `reaper_test` += T-RACE (the racing commit preserved and uncounted) + T-BOUND (the strict cutoff) | **passes** (confirmed by mutation: M1-M12, 11/11 runnable killed on their predicted checks; M11 `serve_pack` join documented weak - no native harness binds a port) |
+| `Tea_client.Local_store` (record codec + boot gate + `BACKEND`/`Flow`) + `Delivery.of_persisted`/`next_seq` + `Clock.floor` + `Identity.clock_floor`/`clock_seed` + `tea_client_run` `Idb`/`Tab_lock` shells + the `data-tea-provisional` paint marker - browser-local backend (roadmap step 25, D25/R28) | **built, green; `local_store_test` passes (confirmed by mutation: MU1-MU15, 15/15 killed); 3 Playwright scenarios** |
 
 Toolchain: OCaml 5.3.0, dune 3.24, a dedicated opam switch (`irmin-tea` locally) with
 `irmin 3.11`, `dream 1.0.0~alpha8`, `repr 0.8`, `vdom 0.3`, `js_of_ocaml 6.4`.
@@ -1587,6 +1588,12 @@ Each lean-tea private-constructor primitive → an OCaml `.mli` boundary:
   operation that could keep both sides, so the server head still wins outright,
   and a `Three_way` conflict yields to it rather than stranding the tab on a
   divergent local state.
+  Step 25 (D25) stretches the same replay from `Backoff.cap_ms`-scale staleness
+  to arbitrary staleness: a persisted queue can replay days after it was
+  recorded. Under `Crdt_join` nothing changes structurally; under
+  `Last_write_wins`/`Three_way` an app's msg semantics must stay meaningful at
+  day-scale staleness - an app-author obligation this register names and does
+  not bound.
 - **R7 (med) - security boundary bypass via direct Dream/Irmin/Unix calls, and
   Proof tokens must never be serialized.** **Mitigation shipped** (`lib/tea_safe`,
   roadmap step 5): the nine primitives are enforced `.mli` boundaries. `Proof`
@@ -1880,6 +1887,12 @@ Each lean-tea private-constructor primitive → an OCaml `.mli` boundary:
   call `Dream.invalidate_session` at the auth boundary - there is no
   session-fixation defence today, and the pre-auth branch's fate is that app's
   question to answer.
+  Step 25 (D25) adds a SECOND durable artifact with an independent lifetime:
+  the browser-local IndexedDB record. Deleting or expiring the cookie does
+  nothing to it, and vice versa; an app that adds real authentication and calls
+  `Dream.invalidate_session` at its auth boundary must ALSO delete the client
+  store (`indexedDB.deleteDatabase`) at that same boundary, or a logged-out tab
+  keeps serving the prior principal's offline data (R28).
 - **R14 (med) - the session secret is the system's only credential, and the id
   space it protects is public.** Anything that reads the secret can mint a
   cookie for ANY session id, and therefore read and write any session branch
@@ -1955,6 +1968,11 @@ Each lean-tea private-constructor primitive → an OCaml `.mli` boundary:
   in kind from the namespace layer: code assembled at runtime is unreachable by
   any static scan, and the probe file itself must never grow a real payload
   call (its exact-count pins hold it to one spelling per name).
+  The step-25 (D25) browser-local record is rollback-able the same way: it can
+  be stale, from a superseded boot, or foreign to the current session, so it
+  enters `Rebase.absorb`/`reconcile` as advisory wire-equivalent input only -
+  never as ground truth, and never as the place monotone authoritative state is
+  read from (R28).
 - **R17 (low) - Dream's cookie session loader has two raises we deliberately do
   not catch.** `Cookie.load` calls `Yojson.Basic.from_string` unguarded and
   `failwith "Bad payload"` on a non-string payload value (Dream's own source
@@ -2167,6 +2185,116 @@ Each lean-tea private-constructor primitive → an OCaml `.mli` boundary:
   half-applied handler that rejects re-applies on the retry: the visible
   convergent duplicate, the family's licensed degradation direction,
   never the silent drop (T21).
+
+- **R28 (med) - a browser-local IndexedDB record is untrusted, session-keyed,
+  and outlives the cookie that names its session.** Persisting the model and
+  the edit queue (step 25) hands a same-origin script attacker nothing new: XSS
+  on this origin already reads and mutates the live `Tea_client_run` state and
+  can open its own authenticated WebSocket to originate arbitrary `Apply`
+  frames (the session cookie auto-attaches to any same-origin request). What IS
+  new is at-rest exposure to an actor with no script-execution capability at
+  all - filesystem or profile access, device theft, a shared machine - who can
+  now read a tab's model and unacked queue after the tab and the browser have
+  closed, plus a longer useful window for a caught XSS payload's take.
+  `Replay_guard` (replay_guard.mli) turns at-least-once delivery into an
+  exactly-once EFFECT by deduplicating already-consumed sequence numbers under
+  a `(replica, tab)` key; it does not, and by its own stated purpose was never
+  meant to, authenticate a NEW forged message, so a forged persisted record
+  carries exactly the authority the session cookie's holder already had.
+  Trust-local is therefore the honest posture for the record's authenticity,
+  and no checksum is added: the record is advisory input (R16 clause below), a
+  corrupt record fails `Codec.of_json` and is dropped whole at boot
+  (`decode_all`), leaving the page memory-live over the store, and the single clear-plus-put write is atomic
+  under IndexedDB's own transaction. The store is namespaced per app
+  (`tea-local:` plus the app title) and keyed by the replica id inside each
+  record, never by reading the (HttpOnly) cookie; on every `Hello` the stored
+  replica is compared against the announced one BEFORE any adopted entry is
+  flushed - the flush gate, not the paint, is the security boundary, because
+  offline the verifier never arrives - and a mismatch, the only signal
+  available since `Dream.invalidate_session` and session expiry are both silent
+  to the client, drops the adopted entries by one cumulative `Delivery.ack` and
+  the next checkpoint's clear-plus-put prunes every non-current row. Named
+  residuals, accepted: (1) a boot that starts offline on a shared machine can
+  paint, and extend, the prior session's data under the visible
+  `data-tea-provisional` marker until a first `Hello` resolves it - and under
+  `Crdt_join` a mismatch-painted model's contributions survive that resync in
+  the local join until the page reloads (the queue is pruned; only paint
+  pollution remains), where the LWW arm is overwritten outright; (2) a
+  browser that never reaches a server again keeps at most one row per replica
+  it ever held, since pruning rides on `Hello`; (3) a same-replica branch
+  reaped and recreated between page lives is indistinguishable from a resync
+  given what `Hello` carries (wire.mli), so an adopted queue replays onto the
+  recreated branch - the guard forgets toward acceptance, and the first
+  application's effects died with the branch, so this restores rather than
+  duplicates; a `Store_water`-derived epoch on `Hello` would close it and is
+  named future wire work. Amends R13: the record's lifetime is independent of
+  the cookie's, so an app that adds authentication must also delete this store
+  (`indexedDB.deleteDatabase`, client side) at its `Dream.invalidate_session`
+  boundary. Amends R16: a persisted record is rollback-able the same way a
+  replayed cookie payload is, and enters `Rebase.absorb`/`reconcile` as
+  advisory wire-equivalent input, never as ground truth. `Tea_safe` values
+  cannot transitively reach a persisted model: neither `tea_client` nor
+  `tea_client_run` names `tea_safe` in its dune stanza (unreachable under
+  `(implicit_transitive_deps false)`), and `Proof.t` has no derivable `Repr.t`
+  witness, so `model_t : model Repr.t` could not typecheck - compiler-enforced,
+  not a review convention. Honest scope note: an app author's own secret-shaped
+  data placed in their model already reaches every peer and now also the disk;
+  step 25 changes that risk's medium, not its kind, and the framework cannot
+  see into a model to guard it.
+
+  > **D25 - one advisory record, one writer, the same identity on replay.**
+  > The browser-local tier (step 25) is one IndexedDB database per app
+  > (`tea-local:` plus title, version 1, one `records` store) holding at most
+  > one record per replica: `{replica; tab; next; queue = Delivery.unacked;
+  > clock_floor; model; written_at_ms}`, encoded by a `Repr` codec derived
+  > from the app's own witnesses and written as ONE value by a clear-plus-put
+  > pair on ONE readwrite transaction, so a crash can never split the model
+  > from the queue. One writer: a page acquires `navigator.locks` exclusive,
+  > `ifAvailable`, on `tea-local-writer:` plus title BEFORE opening the
+  > database; a page that does not get the lock (second tab, or Web Locks
+  > absent) runs memory-only, exactly pre-step-25, so two live senders can
+  > never share the persisted `(replica, tab)` identity and the
+  > false-`Duplicate` silent drop is closed by construction. Same identity on
+  > replay: the adopting page resumes the persisted `tab`, `next` and queue
+  > verbatim (`Delivery.of_persisted`), so `Replay_guard` reads an
+  > already-consumed entry as `Duplicate`, acks it again and applies nothing -
+  > exactly-once effect preserved across tab death, including the crash
+  > window where an ack was applied in memory but never persisted. Hydration
+  > never gates the live path: mount and paint proceed immediately (the
+  > painted snapshot is advisory, marked `data-tea-provisional` until the
+  > first `Hello` resolves it: the head overwrites an LWW model outright,
+  > and a join keeps the painted contributions, which is convergence for
+  > the same replica and R28's named cross-session remainder. The paint
+  > reaches the app through its own `Store_watch` arm, the same one every
+  > server head uses; an app whose current subscriptions carry no store
+  > leaf receives no paint, and an LWW app can see a pre-resolution
+  > optimistic edit visually superseded until its queued payload flushes,
+  > R6's licensed direction); edits made before the store read resolves buffer as
+  > payloads in a pure gate and are numbered after the adopted queue, so
+  > nothing is renumbered and nothing can double-send; adopted entries flush
+  > only after the first `Hello` confirms the replica; every failure
+  > (`Unsupported | Blocked | Version_error | Quota_exceeded | Not_found |
+  > Other`) classifies to data, logs once, and degrades to memory-only
+  > without touching the live path. Every open connection wires
+  > `onversionchange` to close itself and `onblocked` to a bounded
+  > memory-only degrade, so a future schema bump cannot wedge against a
+  > long-lived old tab. `Clock.floor` persists with the record and re-seeds
+  > the page clock on adoption, so dots minted either side of a tab death
+  > cannot collide under the one durable replica. Not persisted, named:
+  > `Local.local` (no witness, D10) and `Rpc_delivery` (its `expect`
+  > continuation is a closure; no witness can exist). A checkpoint whose
+  > WRITE fails is not merely logged: the connection degrades and the row
+  > is cleared (`Flow.invalidate`), because a record whose checkpoints
+  > stopped landing lies about `next`, and adopting that lie costs the
+  > next life its first edits - they number into the server's
+  > already-consumed range and are deduplicated away. Best-effort residuals
+  > stay named in R28 and the roadmap row: hard-crash loss since the last
+  > checkpoint (redraw-coalesced, ack, `pagehide`/`visibilitychange`
+  > triggers) together with its mirror on the next life (edits numbered
+  > into the crash tick's consumed range are deduplicated away, bounded by
+  > the coalesce window), and crash-mid-transaction atomicity rests on the
+  > single-transaction shape as a static review invariant, not a dynamic
+  > test. Shipped.
 
 ## 11. Roadmap
 
@@ -2857,9 +2985,49 @@ Each lean-tea private-constructor primitive → an OCaml `.mli` boundary:
     edits in memory only, and the client only mirrors the server
     live). The commit clock is already hoisted (`Tea_core.Clock`,
     step 8, D7), so the store itself is the missing piece.
-    **Planned.**
+    **Done.** (D25, R28. One `tea-local:<title>` database, one `records` store,
+    at most one record per replica: `{replica; tab; next; queue; clock_floor;
+    model; written_at_ms}` under the app's own derived `Repr` codec, written as
+    one value by a clear-plus-put pair on one readwrite transaction.
+    `navigator.locks` exclusive `ifAvailable` elects the single writer before
+    the database is opened; a non-holder runs memory-only, pre-step-25 behavior
+    exactly. Adoption resumes the persisted `(tab, next, queue)` verbatim -
+    `Delivery.of_persisted` plus a pure boot gate in `Tea_client.Local_store`
+    that buffers pre-resolution edits as payloads and numbers them after the
+    adopted queue - so `Replay_guard` reads every already-consumed entry as
+    `Duplicate` and exactly-once effect survives tab death; adopted entries
+    flush only after the first `Hello` confirms the replica, a mismatch drops
+    the adopted prefix by one cumulative `Delivery.ack`, and the next
+    checkpoint prunes every non-current row. Paint is immediate and advisory
+    under `data-tea-provisional` until the first `Hello`; `Clock.floor`
+    re-seeds the page clock on adoption; every failure arm (`Unsupported |
+    Blocked | Version_error | Quota_exceeded | Not_found | Other`) degrades to
+    memory-only without touching the live path; `onversionchange` self-closes
+    and `onblocked` degrades bounded. Not persisted, named: `Local.local` (no
+    witness, D10) and `Rpc_delivery` (its `expect` continuation is a closure -
+    no witness possible; its own residual stands). New surface: `Clock.floor`,
+    `Identity.clock_floor`/`clock_seed`, `Delivery.next_seq`/`of_persisted`,
+    `Tea_client.Local_store` (record codec, gate, `BACKEND` + `Flow`), jsoo
+    `Idb`/`Tab_lock` shells, `test/fake_idb` (auto-commit and always-async
+    modeled honestly), `test/local_store_test` (42 checks; red-first: the
+    flush-gate, mismatch-drop, paint-guard and both fake-honesty checks
+    observed failing before their mechanisms landed), three Playwright
+    scenarios (persist-reload-survives with the provisional marker,
+    two-tab-second-writer-no-silent-drop, idb-absent-boot-degrade; two-tab
+    version-upgrade wedge and quota-exhaustion degrade deferred as named
+    residuals, their error arms covered natively). Crash-mid-transaction
+    atomicity is the single-transaction shape, a static review invariant. Full
+    sweep MU1-MU15: 15/15 killed. Suite 1479 checks / 58 exes.)
 
 **Completion (declared 2026-08-09).** Steps 19-25 are the completion
 set: the framework is complete when all seven read **Done**, each
 under the standing discipline (mutation-confirmed tests, the §10
 register entry closed or amended in the same change).
+
+With step 25 closed (D25, R28), all seven completion-set rows 19-25 read
+**Done** under that standing discipline - each with mutation-confirmed tests
+and its section-10 register entry closed or amended in the same change. Per the
+2026-08-09 declaration the framework is therefore **complete**: the client's
+last missing tier is built, the remaining known risks live in section 10 as
+named, accepted register entries, and further work is extension, not
+completion.

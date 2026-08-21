@@ -755,8 +755,8 @@ let () =
   in
   check
     (Printf.sprintf
-       "e2e: the walk sees the whole lib/ surface (72 files; saw %d)" lib_count)
-    (lib_count = 72);
+       "e2e: the walk sees the whole lib/ surface (78 files; saw %d)" lib_count)
+    (lib_count = 78);
   let occurrences (file : string) (ns : Namespace.t) : int =
     List.length
       (List.filter

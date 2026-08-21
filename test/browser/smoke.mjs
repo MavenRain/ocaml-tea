@@ -92,6 +92,7 @@ const PORT_ORPHAN = Number(process.env.SMOKE_PORT_ORPHAN ?? 8142)
 const PORT_ROLLBACK = Number(process.env.SMOKE_PORT_ROLLBACK ?? 8143)
 const PORT_LOST_REPLY = Number(process.env.SMOKE_PORT_LOST_REPLY ?? 8144)
 const PORT_LOST_REPLY_RESTART = Number(process.env.SMOKE_PORT_LOST_REPLY_RESTART ?? 8145)
+const PORT_LOCAL = Number(process.env.SMOKE_PORT_LOCAL ?? 8146)
 const HEADED = process.env.SMOKE_HEADED === '1'
 const WAIT_MS = Number(process.env.SMOKE_TIMEOUT_MS ?? 15000)
 
@@ -1631,6 +1632,280 @@ async function lostReplyRestartScenario(browser) {
   }
 }
 
+/* ------------------- scenarios B11-B13: the browser-local tier (step 25) */
+
+/* Step 25's three browser-only claims. Everything else about the local tier
+   is proven natively against the honest fake (test/local_store_test.ml);
+   these three pin exactly what the fake structurally cannot: a REAL reload
+   against a real IndexedDB, a REAL Web Locks election between two live
+   pages, and a REAL boot with the API deleted. */
+
+/* The app's own store, read from inside the page: the rows are the
+   observable the native Flow tests can only fake. */
+const readLocalRows = (page) =>
+  page.evaluate(
+    () =>
+      new Promise((resolve) => {
+        const req = indexedDB.open('tea-local:Counter', 1)
+        req.onerror = () => resolve(null)
+        req.onsuccess = () => {
+          const db = req.result
+          let tx
+          try {
+            tx = db.transaction('records', 'readonly')
+          } catch {
+            db.close()
+            resolve(null)
+            return
+          }
+          const all = tx.objectStore('records').getAll()
+          all.onsuccess = () => {
+            db.close()
+            resolve(all.result)
+          }
+          all.onerror = () => {
+            db.close()
+            resolve(null)
+          }
+        }
+      })
+  )
+
+const parsedRows = async (page) => ((await readLocalRows(page)) ?? []).map((s) => JSON.parse(s))
+
+/* Server truth through the context's OWN cookie jar: the SSR page renders the
+   session's count, and ctx.request shares the browser context's session, so
+   this is the server-observed count of the same branch the tabs live on. A
+   bare node fetch would mint a fresh session and always read 0. */
+const serverCount = async (ctx, base) => {
+  const html = await (await ctx.request.get(base + '/')).text()
+  const m = html.match(/class="count"[^>]*>(-?\d+)</)
+  return m ? m[1] : null
+}
+
+/* Setup-only poll (not an assertion): the scenarios below sequence page LIVES,
+   and a life must not start until the previous one's effects are on disk. */
+const until = async (label, read, want) => {
+  const deadline = Date.now() + WAIT_MS
+  const poll = async () => {
+    const v = await read()
+    if (want(v)) return v
+    if (Date.now() >= deadline)
+      throw new Error(`${label}: gave up after ${WAIT_MS}ms (last=${show(v)})`)
+    await sleep(50)
+    return poll()
+  }
+  return poll()
+}
+
+/* A closed page's writer lock releases asynchronously; the next life must not
+   contest the election until it is actually free. The watcher page is the SSR
+   page: same origin (locks are origin-scoped), no client bundle, no lock. */
+const untilWriterFree = async (ctx, base) => {
+  const w = await ctx.newPage()
+  await w.goto(`${base}/`)
+  await until(
+    'writer lock free',
+    () =>
+      w.evaluate(async () =>
+        ((await navigator.locks.query()).held ?? []).filter(
+          (l) => l.name === 'tea-local-writer:Counter'
+        ).length
+      ),
+    (n) => n === 0
+  )
+  await w.close()
+}
+
+/* B11: three page lives over one session. Life 1 is live and leaves an acked
+   checkpoint. Life 2 boots with its socket black-holed: it must paint from
+   the snapshot, stay marked provisional (no Hello can arrive), and checkpoint
+   an offline click into the queue. Life 3 is live again: the first Hello
+   confirms the adopted replica, clears the marker, and releases the queued
+   edit - asserted on the SERVER, because a dropped edit is silent
+   client-side (the roadmap acceptance, D13-class connected-proof). */
+async function persistReloadScenario(browser, base) {
+  const ctx = await browser.newContext()
+  const out = []
+  const countSel = '.counter .count'
+  const countOf = (page) => page.$eval(countSel, (el) => el.textContent)
+  const provisional = (page) => page.$('[data-tea-provisional]').then((el) => el !== null)
+  const plusOf = (page) => page.locator('.counter button').filter({ hasText: /^\+$/ })
+
+  const a = await ctx.newPage()
+  await a.goto(`${base}/app/index.html`)
+  await a.waitForSelector(countSel, { timeout: WAIT_MS })
+  await until('life 1: Hello adopted', () => provisional(a), (p) => p === false)
+  await plusOf(a).click()
+  await until(
+    'life 1: acked checkpoint written',
+    () => parsedRows(a),
+    /* Repr omits an empty list field on encode: no `queue` key IS the
+       acked-empty queue. */
+    (rows) => rows.length === 1 && Number(rows[0]?.next) === 2 && (rows[0]?.queue ?? []).length === 0
+  )
+  await a.close()
+  await untilWriterFree(ctx, base)
+
+  const b = await ctx.newPage()
+  await b.routeWebSocket(/\/ws$/, () => {})
+  await b.goto(`${base}/app/index.html`)
+  await b.waitForSelector(countSel, { timeout: WAIT_MS })
+  out.push(
+    await transition(
+      'B11: paint-from-snapshot-offline - a reload with the socket dead paints the persisted count',
+      () => countOf(b),
+      (v) => v === '1',
+      /* App.init's 0 is the true before-state of every fresh document; the
+         paint races this read, so it is supplied rather than sampled. */
+      { pre: '0' }
+    )
+  )
+  out.push(
+    check(
+      'B11: provisional-until-hello - the offline paint carries data-tea-provisional',
+      await provisional(b)
+    )
+  )
+  await plusOf(b).click()
+  await until(
+    'life 2: offline edit checkpointed',
+    () => parsedRows(b),
+    (rows) => rows.length === 1 && Number(rows[0]?.next) === 3 && (rows[0]?.queue ?? []).length === 1
+  )
+  await b.close()
+  await untilWriterFree(ctx, base)
+
+  const c = await ctx.newPage()
+  out.push(
+    await transition(
+      'B11: queued-edit-reaches-server-after-reload - the offline click lands after the next boot',
+      () => serverCount(ctx, base),
+      (v) => v === '2',
+      {
+        act: async () => {
+          await c.goto(`${base}/app/index.html`)
+          await c.waitForSelector(countSel, { timeout: WAIT_MS })
+        },
+      }
+    )
+  )
+  out.push(
+    await transition(
+      'B11: provisional-cleared-on-hello - the marker leaves when the first Hello lands',
+      () => provisional(c),
+      (v) => v === false,
+      /* Set synchronously at mount, before any async work could observe it. */
+      { pre: true }
+    )
+  )
+  await ctx.close()
+  return out
+}
+
+/* B12: two live tabs, one writer. The election is read straight off the Web
+   Locks API; liveness of the LOSER is asserted on the server, because a
+   memory-only tab that silently dropped edits would look identical in its
+   own DOM (lens-4). */
+async function twoTabWriterScenario(browser, base) {
+  const ctx = await browser.newContext()
+  const out = []
+  const countSel = '.counter .count'
+  const open = async () => {
+    const p = await ctx.newPage()
+    await p.goto(`${base}/app/index.html`)
+    await p.waitForSelector(countSel, { timeout: WAIT_MS })
+    return p
+  }
+  const a = await open()
+  const b = await open()
+  const election = await b.evaluate(async () => {
+    const held = (await navigator.locks.query()).held ?? []
+    const writers = held.filter((l) => l.name === 'tea-local-writer:Counter')
+    const acquirable = await navigator.locks.request(
+      'tea-local-writer:Counter',
+      { mode: 'exclusive', ifAvailable: true },
+      (lock) => lock !== null
+    )
+    return { writers: writers.length, acquirable }
+  })
+  out.push(
+    check(
+      'B12: second-tab-boots-memory-only - exactly one page holds the writer lock and it is not free',
+      election.writers === 1 && election.acquirable === false,
+      show(election)
+    )
+  )
+  const plusOf = (p) => p.locator('.counter button').filter({ hasText: /^\+$/ })
+  out.push(
+    await transition(
+      'B12: both-tabs-edits-reach-server-state - one click in each tab drives the server 0 -> 2',
+      () => serverCount(ctx, base),
+      (v) => v === '2',
+      {
+        act: async () => {
+          await plusOf(a).click()
+          await plusOf(b).click()
+        },
+      }
+    )
+  )
+  out.push(
+    await transition(
+      'B12: no-silent-drop-server-observed - the memory-only tab keeps landing edits (2 -> 4)',
+      () => serverCount(ctx, base),
+      (v) => v === '4',
+      {
+        act: async () => {
+          await plusOf(b).click()
+          await plusOf(b).click()
+        },
+      }
+    )
+  )
+  await ctx.close()
+  return out
+}
+
+/* B13: the API-absent degrade. IndexedDB is deleted before any page script
+   runs; the page must mount, stay fully live, and say nothing scary. */
+async function idbAbsentScenario(browser, base) {
+  const ctx = await browser.newContext()
+  await ctx.addInitScript(() => {
+    Object.defineProperty(window, 'indexedDB', { value: undefined, configurable: true })
+  })
+  const out = []
+  const errors = []
+  const page = await ctx.newPage()
+  page.on('pageerror', (e) => errors.push('pageerror: ' + String(e)))
+  page.on('console', (m) => {
+    if (m.type() === 'error') errors.push('console: ' + m.text())
+  })
+  await page.goto(`${base}/app/index.html`)
+  const mounted = await page
+    .waitForSelector('.counter .count', { timeout: WAIT_MS })
+    .then(() => true)
+    .catch(() => false)
+  out.push(check('B13: boots-without-indexeddb - the bundle mounts with the API deleted', mounted))
+  out.push(
+    await transition(
+      'B13: live-edit-flows-without-store - a click still reaches the server, 0 -> 1',
+      () => serverCount(ctx, base),
+      (v) => v === '1',
+      { act: () => page.locator('.counter button').filter({ hasText: /^\+$/ }).click() }
+    )
+  )
+  out.push(
+    check(
+      'B13: no-uncaught-console-error - the degrade is silent',
+      errors.length === 0,
+      errors.join(' | ')
+    )
+  )
+  await ctx.close()
+  return out
+}
+
 const main = async () => {
   const browser = await chromium.launch({ headless: !HEADED })
   /* A scenario that throws (a selector never appearing, a server that never
@@ -1700,6 +1975,22 @@ const main = async () => {
     /* B10 restarts its server mid-scenario, so like B4 and B8 it owns its own
        lifecycle rather than running as a withServer body. */
     const lostReplyRestart = await guarded('lost reply restart B10', () => lostReplyRestartScenario(browser))
+    /* B11-B13 share one mem-tier server, like B1-B3: contexts isolate the
+       sessions, so each scenario owns a branch, a replica and an origin-load
+       of browser storage state. */
+    const localTier = await withServer(
+      {
+        name: 'local-tier counter server',
+        exe: '_build/default/examples/counter/server/main.exe',
+        clientDir: '_build/default/examples/counter/client',
+        port: PORT_LOCAL,
+      },
+      async ({ base }) => [
+        ...(await guarded('local tier B11', () => persistReloadScenario(browser, base))),
+        ...(await guarded('local tier B12', () => twoTabWriterScenario(browser, base))),
+        ...(await guarded('local tier B13', () => idbAbsentScenario(browser, base))),
+      ]
+    )
     return [
       ...counter,
       ...sharedDoc,
@@ -1711,6 +2002,7 @@ const main = async () => {
       ...rollback,
       ...lostReply,
       ...lostReplyRestart,
+      ...localTier,
     ]
   } finally {
     await browser.close()

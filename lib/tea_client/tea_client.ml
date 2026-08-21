@@ -10,6 +10,7 @@ module Rebase = Rebase
 module Delivery = Delivery
 module Rpc_delivery = Rpc_delivery
 module Local_channel = Local_channel
+module Local_store = Local_store
 
 type 'msg Vdom.Cmd.t +=
   | After of int * 'msg
@@ -131,6 +132,9 @@ module Identity = struct
      state that the server tier would inherit. *)
   let ctx () : Tea_core.Crdt.Ctx.t =
     Tea_core.Crdt.Ctx.v ~clock ~replica:!cell
+
+  let clock_floor () : int64 = Tea_core.Clock.floor clock
+  let clock_seed (d : int64) : unit = Tea_core.Clock.seed clock d
 end
 
 module Make (A : Tea_core.App.APP) = struct
